@@ -1,0 +1,14 @@
+{
+  "communicator": [
+    {
+      "endpoint": {
+        "suite": "tcp/ip",
+        "protocol": "tcp",
+        "server_address": "10.77.77.1",
+        "port": "9999"
+      },
+      "plugins": ["cudart", "cublas", "curand", "cudnn"]
+    }
+  ],
+  "secure_application": false
+}

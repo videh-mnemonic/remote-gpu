@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "clone_root": "external",
+    "public_forks_allowed": false,
+    "push_allowed": false
+  },
+  "projects": {
+    "lupine": {
+      "url": "https://github.com/lupinemachines/lupine.git",
+      "ref": "main",
+      "resolved_commit": null,
+      "license": "Apache-2.0"
+    },
+    "cricket": {
+      "url": "https://github.com/RWTH-ACS/cricket.git",
+      "ref": "master",
+      "resolved_commit": null,
+      "license": "MIT"
+    },
+    "gvirtus": {
+      "url": "https://github.com/gvirtus/GVirtuS.git",
+      "ref": "master",
+      "resolved_commit": null,
+      "license": "Apache-2.0"
+    },
+    "modded-nanogpt": {
+      "url": "https://github.com/KellerJordan/modded-nanogpt.git",
+      "ref": "master",
+      "resolved_commit": null,
+      "license": "MIT"
+    },
+    "pytorch": {
+      "url": "https://github.com/pytorch/pytorch.git",
+      "ref": null,
+      "resolved_commit": null,
+      "license": "BSD-3-Clause"
+    },
+    "torchbench": {
+      "url": "https://github.com/pytorch/benchmark.git",
+      "ref": "main",
+      "resolved_commit": null,
+      "license": "BSD-3-Clause"
+    }
+  }
+}

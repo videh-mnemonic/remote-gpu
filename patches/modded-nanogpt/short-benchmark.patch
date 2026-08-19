@@ -1,0 +1,83 @@
+diff --git a/records/track_1_short/2024-10-14_ModernArch/train_gpt2.py b/records/track_1_short/2024-10-14_ModernArch/train_gpt2.py
+index b0c5a35..b917e97 100644
+--- a/records/track_1_short/2024-10-14_ModernArch/train_gpt2.py
++++ b/records/track_1_short/2024-10-14_ModernArch/train_gpt2.py
+@@ -317,20 +317,20 @@ class DistributedDataLoader:
+ @dataclass
+ class Hyperparameters:
+     # data hyperparams
+-    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
++    input_bin : str = os.environ.get('NANOGPT_INPUT_BIN', 'data/fineweb10B/fineweb_train_*.bin') # input .bin to train on
++    input_val_bin : str = os.environ.get('NANOGPT_INPUT_VAL_BIN', 'data/fineweb10B/fineweb_val_*.bin') # input .bin to eval validation loss on
+     # optimization hyperparams
+-    batch_size : int = 8*64 # batch size, in sequences, across all devices
+-    device_batch_size : int = 64 # batch size, in sequences, per device
+-    sequence_length : int = 1024 # sequence length, in tokens
+-    num_iterations : int = 5100 # number of iterations to run
++    batch_size : int = int(os.environ.get('NANOGPT_BATCH_SIZE', '4')) # batch size, in sequences, across all devices
++    device_batch_size : int = int(os.environ.get('NANOGPT_DEVICE_BATCH_SIZE', '4')) # batch size, in sequences, per device
++    sequence_length : int = int(os.environ.get('NANOGPT_SEQUENCE_LENGTH', '512')) # sequence length, in tokens
++    num_iterations : int = int(os.environ.get('NANOGPT_NUM_ITERATIONS', '20')) # number of iterations to run
+     learning_rate : float = 0.0036
+     warmup_iters : int = 0
+-    warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
++    warmdown_iters : int = int(os.environ.get('NANOGPT_WARMDOWN_ITERS', '10')) # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+     weight_decay : float = 0
+     # evaluation and logging hyperparams
+-    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+-    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
++    val_loss_every : int = int(os.environ.get('NANOGPT_VAL_LOSS_EVERY', '0')) # every how many steps to evaluate val loss? 0 for only at the end
++    val_tokens : int = int(os.environ.get('NANOGPT_VAL_TOKENS', '2048')) # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+ args = Hyperparameters()
+ 
+@@ -366,13 +366,18 @@ x, y = train_loader.next_batch()
+ # this originates from Karpathy's experiments.
+ num_vocab = 50304
+ model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
++print("stage: model_cpu_ready", flush=True)
+ model = model.cuda()
++print("stage: model_cuda_ready", flush=True)
+ if hasattr(config, "coordinate_descent_tuning"):
+-    config.coordinate_descent_tuning = True # suggested by @Chillee
++    config.coordinate_descent_tuning = False # avoid a long first-run autotuning phase in the bounded benchmark
+ model = torch.compile(model)
++print("stage: model_compiled", flush=True)
+ # here we wrap model into DDP container
+-model = DDP(model, device_ids=[ddp_local_rank])
+-raw_model = model.module # always contains the "raw" unwrapped model
++if ddp_world_size > 1:
++    model = DDP(model, device_ids=[ddp_local_rank])
++print("stage: model_ddp_ready", flush=True)
++raw_model = model.module if ddp_world_size > 1 else model # always contains the "raw" unwrapped model
+ ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+ 
+ # init the optimizer(s)
+@@ -380,6 +385,7 @@ optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_
+                                weight_decay=args.weight_decay, fused=True)
+ optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95)
+ optimizers = [optimizer1, optimizer2]
++print("stage: optimizers_ready", flush=True)
+ # learning rate decay scheduler (linear warmup and warmdown)
+ def get_lr(it):
+     assert it <= args.num_iterations
+@@ -446,7 +452,8 @@ for step in range(args.num_iterations + 1):
+                 _, loss = model(x_val, y_val, return_logits=False)
+                 val_loss += loss.detach()
+                 del loss
+-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
++        if ddp_world_size > 1:
++            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+         val_loss /= val_steps
+         # log val loss to console and to logfile
+         if master_process:
+@@ -457,7 +464,7 @@ for step in range(args.num_iterations + 1):
+         torch.cuda.synchronize()
+         t0 = time.time()
+ 
+-    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
++    if master_process and args.save_every > 0 and step % args.save_every == 0:
+         # stop the clock
+         torch.cuda.synchronize()
+         training_time_ms += 1000 * (time.time() - t0)

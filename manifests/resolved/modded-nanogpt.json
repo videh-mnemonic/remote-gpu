@@ -1,0 +1,12 @@
+{
+  "commit_time": "2026-08-09T15:42:15-07:00",
+  "declared_license": "MIT",
+  "license_file": "LICENSE",
+  "license_sha256": "8c8d17398ecce3dd3fcb1bb77b5d268a427f8250f364ac655c9b38df5b693f6b",
+  "name": "modded-nanogpt",
+  "push_url": "disabled://public-push-prohibited",
+  "requested_ref": "master",
+  "resolved_commit": "ecbb586296d3dac36fd206211f25d63bad4a6b35",
+  "retrieved_at": "2026-08-19T20:47:05.803946+00:00",
+  "url": "https://github.com/KellerJordan/modded-nanogpt.git"
+}

@@ -1,0 +1,22 @@
+{
+  "status": "provisional-until-native-doctor-passes",
+  "architecture": "linux-x86_64",
+  "python": "3.12",
+  "pytorch": {
+    "version": "2.12.0",
+    "wheel_index": "https://download.pytorch.org/whl/cu130",
+    "cuda_build": "13.0"
+  },
+  "cuda": {
+    "application_abi": "13.0",
+    "candidate_server_abi": "13.1-compatible"
+  },
+  "selection_reason": "Current PyTorch CUDA 13.0 wheels support Blackwell, and LUPINE publishes CUDA 13.1 client/server images.",
+  "must_verify": [
+    "Both RTX 5090 devices pass the native smoke suite",
+    "Driver 610.43.02 runs the selected CUDA container",
+    "modded-nanogpt dependencies support Blackwell or receive one common private compatibility patch",
+    "All candidates are tested against the same PyTorch wheel"
+  ]
+}
+

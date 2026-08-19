@@ -1,0 +1,20 @@
+# Public repositories are local working copies only. Never commit their Git dirs.
+/external/
+
+# Prepared datasets, container caches, and bulky/raw benchmark artifacts.
+/data/
+/results/raw/
+/results/tmp/
+
+# Local configuration and credentials.
+/config/hosts.json
+.env
+.env.*
+
+# Python/build artifacts.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+/build/
+

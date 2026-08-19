@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://private.invalid/remote-gpu/benchmark-result.schema.json",
+  "title": "Remote GPU benchmark result",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "label",
+    "mode",
+    "candidate",
+    "host",
+    "started_at",
+    "elapsed_seconds",
+    "timeout_seconds",
+    "timed_out",
+    "exit_code",
+    "command"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "label": {"type": "string", "minLength": 1},
+    "mode": {"enum": ["native", "remote-cuda", "remote-process"]},
+    "candidate": {"type": "string"},
+    "host": {"type": "string"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "elapsed_seconds": {"type": "number", "minimum": 0},
+    "timeout_seconds": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 300},
+    "timed_out": {"type": "boolean"},
+    "exit_code": {"type": "integer"},
+    "command": {"type": "array", "items": {"type": "string"}},
+    "stdout": {"type": "string"},
+    "stderr": {"type": "string"},
+    "stdout_clipped": {"type": "boolean"},
+    "stderr_clipped": {"type": "boolean"}
+  },
+  "additionalProperties": true
+}
+

@@ -1,0 +1,12 @@
+{
+  "commit_time": "2024-08-30T09:48:17+02:00",
+  "declared_license": "Apache-2.0",
+  "license_file": "LICENSE",
+  "license_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+  "name": "gvirtus",
+  "push_url": "disabled://public-push-prohibited",
+  "requested_ref": "master",
+  "resolved_commit": "18f16dc300352f4e3d6caf010ae81f43d565b036",
+  "retrieved_at": "2026-08-19T20:47:03.441152+00:00",
+  "url": "https://github.com/gvirtus/GVirtuS.git"
+}

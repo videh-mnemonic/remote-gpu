@@ -1,0 +1,12 @@
+{
+  "commit_time": "2025-09-09T14:39:47+02:00",
+  "declared_license": "MIT",
+  "license_file": "LICENSE",
+  "license_sha256": "e67e428326d6302f3b35e5b431e7e9a818d2de68907babf0e7aa578ccd90ef1d",
+  "name": "cricket",
+  "push_url": "disabled://public-push-prohibited",
+  "requested_ref": "master",
+  "resolved_commit": "5d55bd582fc7acbb2a12c45f104020566a67218a",
+  "retrieved_at": "2026-08-19T20:47:35.797961+00:00",
+  "url": "https://github.com/RWTH-ACS/cricket.git"
+}

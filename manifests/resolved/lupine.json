@@ -1,0 +1,12 @@
+{
+  "commit_time": "2026-08-19T20:21:13Z",
+  "declared_license": "Apache-2.0",
+  "license_file": "LICENSE",
+  "license_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+  "name": "lupine",
+  "push_url": "disabled://public-push-prohibited",
+  "requested_ref": "main",
+  "resolved_commit": "af5af6e9ceaab4fe5168880a9307b3e14bc771de",
+  "retrieved_at": "2026-08-19T20:47:04.181140+00:00",
+  "url": "https://github.com/lupinemachines/lupine.git"
+}

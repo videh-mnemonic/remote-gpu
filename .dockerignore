@@ -1,0 +1,6 @@
+.git
+.pytest_cache
+external
+results
+__pycache__
+*.pyc
