@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remote-gpu"
+dynamic = ["version"]
+description = "Transparent, safely attachable remote CUDA runtime"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+rgpu = "remote_gpu.cli:main"
+rgpu-rescue = "remote_gpu.rescue:main"
+
+[tool.setuptools.packages.find]
+include = ["remote_gpu*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "remote_gpu.version.__version__"}

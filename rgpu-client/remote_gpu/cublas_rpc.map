@@ -1,0 +1,12 @@
+libcublas.so.13 {
+  global:
+    cublasSgetrfBatched;
+    cublasSgelsBatched;
+    cublasDgelsBatched;
+    cublasCgelsBatched;
+    cublasZgelsBatched;
+    cublasSgeqrfBatched;
+    cublasDgeqrfBatched;
+    cublasCgeqrfBatched;
+    cublasZgeqrfBatched;
+};

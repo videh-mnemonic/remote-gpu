@@ -1,0 +1,359 @@
+cmake_minimum_required(VERSION 3.18)
+
+project(LupineProject LANGUAGES C CXX)
+
+# Sanitizers are applied only to the CPU-only *_test executables (transport,
+# decoder, ipc, checkpoint), never the nvcc-compiled driver/server. Set to a
+# -fsanitize value such as "address,undefined" or "thread"; empty disables.
+set(LUPINE_SANITIZE "" CACHE STRING
+    "Sanitizer for CPU test targets (e.g. address,undefined or thread)")
+
+function(lupine_apply_sanitizer target)
+    if (LUPINE_SANITIZE)
+        target_compile_options(${target} PRIVATE
+            -fsanitize=${LUPINE_SANITIZE} -fno-omit-frame-pointer
+            -fno-sanitize-recover=all -g)
+        target_link_options(${target} PRIVATE -fsanitize=${LUPINE_SANITIZE})
+    endif()
+endfunction()
+
+# Instrumented builds run several times slower, so give ctest more headroom.
+if (LUPINE_SANITIZE)
+    set(LUPINE_TEST_TIMEOUT_SCALE 8)
+else()
+    set(LUPINE_TEST_TIMEOUT_SCALE 1)
+endif()
+function(lupine_scaled_timeout out base)
+    math(EXPR scaled "${base} * ${LUPINE_TEST_TIMEOUT_SCALE}")
+    set(${out} ${scaled} PARENT_SCOPE)
+endfunction()
+
+if (NOT WIN32)
+    enable_language(CUDA)
+endif()
+
+set(MIN_CUDA_VERSION 11.0)
+
+find_package(CUDAToolkit REQUIRED)
+find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h REQUIRED)
+find_library(NGHTTP2_LIBRARY nghttp2 REQUIRED)
+# The server stays plaintext (front it with a TLS proxy); only the client links OpenSSL.
+find_package(OpenSSL QUIET)
+
+if (NOT CUDAToolkit_VERSION)
+    message(FATAL_ERROR "CUDA Toolkit is required but not found.")
+endif()
+
+if (CUDAToolkit_VERSION VERSION_LESS MIN_CUDA_VERSION)
+    message(FATAL_ERROR "CUDA Toolkit version must be >= ${MIN_CUDA_VERSION}. Found: ${CUDAToolkit_VERSION}")
+endif()
+
+message(STATUS "Found CUDA Toolkit version: ${CUDAToolkit_VERSION}")
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+if (NOT WIN32)
+    set(CMAKE_CUDA_STANDARD 14)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    set(CMAKE_CUDA_EXTENSIONS OFF)
+endif()
+
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/codegen
+    ${CUDAToolkit_INCLUDE_DIRS}
+    ${NGHTTP2_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lib
+)
+
+# LZ4 is vendored as a git subtree (third_party/lz4, BSD-2-Clause) so builds do
+# not depend on a system liblz4. It is built as a plain C static library to keep
+# it out of the CUDA source handling below.
+add_library(lupine_lz4 STATIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lib/lz4.c)
+set_target_properties(lupine_lz4 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# Unoptimized LZ4 compresses slower than the wire, turning compression into a
+# slowdown, so keep it optimized even when no CMAKE_BUILD_TYPE is set.
+if(NOT MSVC AND NOT CMAKE_BUILD_TYPE)
+  target_compile_options(lupine_lz4 PRIVATE -O2)
+endif()
+
+set(CLIENT_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/config.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/h2.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ipc.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cache.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/checkpoint.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/client.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/events.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/routing.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/memcpy.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/copy_pipeline.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/codegen/gen_client.cpp
+)
+
+set(SERVER_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/h2.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/checkpoint.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/server_checkpoint.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/server.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/manual_server.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/copy_pipeline.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvml_server.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ipc.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/codegen/gen_server.cpp
+)
+
+set(NVML_CLIENT_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/config.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/h2.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvml_client.cpp
+)
+
+set(CLIENT_HEADERS
+    ${CMAKE_CURRENT_SOURCE_DIR}/cache.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/checkpoint.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/client_routing.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/ipc.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/codegen/gen_client.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/memcpy.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/copy_pipeline.h
+)
+
+set(SERVER_HEADERS
+    ${CMAKE_CURRENT_SOURCE_DIR}/checkpoint_provider.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/codegen/gen_server.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/lupine_platform.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/manual_server.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/copy_pipeline.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvml_server.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/ipc.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/rpc.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/server_checkpoint.h
+)
+
+set(CLIENT_OUTPUT lupine_driver)
+set(NVML_CLIENT_OUTPUT lupine_nvml)
+set(SERVER_OUTPUT lupine_driver_server)
+
+if (NOT WIN32)
+    add_library(${CLIENT_OUTPUT} SHARED ${CLIENT_SOURCES} ${CLIENT_HEADERS})
+    target_include_directories(${CLIENT_OUTPUT} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_compile_definitions(${CLIENT_OUTPUT} PRIVATE LUPINE_RPC_CLIENT)
+    if(OpenSSL_FOUND)
+      target_compile_definitions(${CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
+      target_link_libraries(${CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    endif()
+    target_link_libraries(${CLIENT_OUTPUT} PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4)
+    target_link_options(${CLIENT_OUTPUT} PRIVATE
+        "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/client.exports"
+    )
+    set_target_properties(${CLIENT_OUTPUT} PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        OUTPUT_NAME cuda
+        VERSION 1
+        SOVERSION 1
+    )
+
+    add_library(lupine_cudart_compat SHARED
+        ${CMAKE_CURRENT_SOURCE_DIR}/cudart_compat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/cudart_prime_kernel.cu)
+    target_include_directories(lupine_cudart_compat PRIVATE
+        ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(lupine_cudart_compat PRIVATE ${CLIENT_OUTPUT})
+    set_target_properties(lupine_cudart_compat PROPERTIES
+        CUDA_RUNTIME_LIBRARY Shared
+        POSITION_INDEPENDENT_CODE ON
+        OUTPUT_NAME lupine-cudart-compat
+    )
+
+    add_library(${NVML_CLIENT_OUTPUT} SHARED ${NVML_CLIENT_SOURCES})
+    target_include_directories(${NVML_CLIENT_OUTPUT} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    if(OpenSSL_FOUND)
+      target_compile_definitions(${NVML_CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
+      target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    endif()
+    target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4)
+    target_link_options(${NVML_CLIENT_OUTPUT} PRIVATE
+        "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/nvml.exports"
+    )
+    set_target_properties(${NVML_CLIENT_OUTPUT} PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        OUTPUT_NAME nvidia-ml
+        VERSION 1
+        SOVERSION 1
+    )
+endif()
+
+add_executable(${SERVER_OUTPUT} ${SERVER_SOURCES} ${SERVER_HEADERS})
+target_include_directories(${SERVER_OUTPUT} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+target_compile_definitions(${SERVER_OUTPUT} PRIVATE
+    LUPINE_RPC_SERVER
+    LUPINE_CUDA_VERSION="${CUDAToolkit_VERSION}"
+)
+target_link_libraries(${SERVER_OUTPUT} PRIVATE CUDA::cuda_driver ${NGHTTP2_LIBRARY} lupine_lz4)
+
+if (WIN32)
+    target_link_libraries(${SERVER_OUTPUT} PRIVATE ws2_32)
+else()
+    target_link_libraries(${SERVER_OUTPUT} PRIVATE dl)
+
+    set(H2_TEST_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/h2.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/h2_test.cpp
+    )
+    add_executable(h2_test ${H2_TEST_SOURCES})
+    target_compile_definitions(h2_test PRIVATE
+        LUPINE_CUDA_VERSION="${CUDAToolkit_VERSION}"
+    )
+    target_link_libraries(h2_test PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 pthread)
+    lupine_apply_sanitizer(h2_test)
+
+    add_executable(h2_unknown_cuda_version_test ${H2_TEST_SOURCES})
+    target_compile_definitions(h2_unknown_cuda_version_test PRIVATE
+        LUPINE_H2_UNKNOWN_CUDA_VERSION_TEST
+    )
+    target_link_libraries(h2_unknown_cuda_version_test PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 pthread)
+    lupine_apply_sanitizer(h2_unknown_cuda_version_test)
+
+    add_executable(h2_protocol_mismatch_test ${H2_TEST_SOURCES})
+    target_compile_definitions(h2_protocol_mismatch_test PRIVATE
+        LUPINE_H2_PROTOCOL_MISMATCH_TEST
+    )
+    target_link_libraries(h2_protocol_mismatch_test PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 pthread)
+    lupine_apply_sanitizer(h2_protocol_mismatch_test)
+
+    enable_testing()
+    add_test(NAME h2_test COMMAND h2_test)
+    lupine_scaled_timeout(h2_timeout 30)
+    set_tests_properties(h2_test PROPERTIES TIMEOUT ${h2_timeout})
+    add_test(NAME h2_unknown_cuda_version_test COMMAND h2_unknown_cuda_version_test)
+    lupine_scaled_timeout(h2u_timeout 10)
+    set_tests_properties(h2_unknown_cuda_version_test PROPERTIES TIMEOUT ${h2u_timeout})
+    add_test(NAME h2_protocol_mismatch_test COMMAND h2_protocol_mismatch_test)
+    set_tests_properties(h2_protocol_mismatch_test PROPERTIES TIMEOUT ${h2u_timeout})
+
+    add_executable(config_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/config.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/config_test.cpp
+    )
+    add_test(NAME config_test COMMAND config_test)
+    set_tests_properties(config_test PROPERTIES TIMEOUT 10)
+
+    add_executable(checkpoint_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/checkpoint.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/checkpoint_test.cpp
+    )
+    target_link_libraries(checkpoint_test PRIVATE pthread)
+    lupine_apply_sanitizer(checkpoint_test)
+    add_test(NAME checkpoint_test COMMAND checkpoint_test)
+    lupine_scaled_timeout(ckpt_timeout 10)
+    set_tests_properties(checkpoint_test PROPERTIES TIMEOUT ${ckpt_timeout})
+
+    add_executable(events_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/events.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/events_test.cpp
+    )
+    target_link_libraries(events_test PRIVATE pthread)
+    lupine_apply_sanitizer(events_test)
+    add_test(NAME events_test COMMAND events_test)
+    lupine_scaled_timeout(events_timeout 10)
+    set_tests_properties(events_test PROPERTIES TIMEOUT ${events_timeout})
+
+    add_executable(ipc_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/ipc.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/ipc_test.cpp
+    )
+    target_link_libraries(ipc_test PRIVATE pthread)
+    lupine_apply_sanitizer(ipc_test)
+    add_test(NAME ipc_test COMMAND ipc_test)
+    lupine_scaled_timeout(ipc_timeout 10)
+    set_tests_properties(ipc_test PROPERTIES TIMEOUT ${ipc_timeout})
+
+    add_library(test_lupinecr_provider SHARED
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_checkpoint_provider.c
+    )
+    set_target_properties(test_lupinecr_provider PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "test-lupinecr-provider"
+    )
+
+    add_executable(server_checkpoint_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/checkpoint.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/server_checkpoint.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_checkpoint.cpp
+    )
+    target_link_libraries(server_checkpoint_test PRIVATE dl pthread)
+    lupine_apply_sanitizer(server_checkpoint_test)
+    add_test(
+        NAME server_checkpoint_test
+        COMMAND server_checkpoint_test $<TARGET_FILE:test_lupinecr_provider> present
+    )
+    lupine_scaled_timeout(sckpt_timeout 10)
+    set_tests_properties(server_checkpoint_test PROPERTIES TIMEOUT ${sckpt_timeout})
+    add_test(
+        NAME server_checkpoint_missing_provider_test
+        COMMAND server_checkpoint_test
+                ${CMAKE_CURRENT_BINARY_DIR}/missing-liblupinecr.so missing
+    )
+    set_tests_properties(server_checkpoint_missing_provider_test
+                         PROPERTIES TIMEOUT ${sckpt_timeout})
+
+    add_executable(server_sigterm_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_sigterm.cpp
+    )
+    target_link_libraries(server_sigterm_test PRIVATE pthread)
+    add_test(
+        NAME server_sigterm_test
+        COMMAND server_sigterm_test $<TARGET_FILE:${SERVER_OUTPUT}>
+    )
+    set_tests_properties(server_sigterm_test PROPERTIES
+        TIMEOUT 10
+        SKIP_RETURN_CODE 77
+    )
+    add_test(
+        NAME server_sigterm_provider_test
+        COMMAND server_sigterm_test
+                $<TARGET_FILE:${SERVER_OUTPUT}>
+                $<TARGET_FILE:test_lupinecr_provider>
+    )
+    set_tests_properties(server_sigterm_provider_test PROPERTIES
+        TIMEOUT 10
+        SKIP_RETURN_CODE 77
+    )
+    add_test(
+        NAME nvml_ecc_exports
+        COMMAND bash -c "nm -D \"$<TARGET_FILE:${NVML_CLIENT_OUTPUT}>\" | grep -q nvmlDeviceGetTotalEccErrors && nm -D \"$<TARGET_FILE:${NVML_CLIENT_OUTPUT}>\" | grep -q nvmlDeviceGetDetailedEccErrors && nm -D \"$<TARGET_FILE:${NVML_CLIENT_OUTPUT}>\" | grep -q nvmlDeviceGetMemoryErrorCounter"
+    )
+    set_source_files_properties(
+        ${SERVER_SOURCES}
+        PROPERTIES LANGUAGE CUDA
+    )
+endif()
+
+if (NOT WIN32)
+    target_compile_options(${SERVER_OUTPUT} PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>: --compiler-options=-fPIC,-g,-Wno-deprecated-declarations>
+    )
+
+    target_compile_options(${CLIENT_OUTPUT} PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>: -Wno-deprecated-declarations>
+    )
+
+    target_compile_options(${NVML_CLIENT_OUTPUT} PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>: -Wno-deprecated-declarations>
+    )
+
+    message(STATUS "Building client output: ${CLIENT_OUTPUT}")
+    message(STATUS "Client TLS (OpenSSL): ${OpenSSL_FOUND}")
+    message(STATUS "Building NVML client output: ${NVML_CLIENT_OUTPUT}")
+endif()
+message(STATUS "Building server output: ${SERVER_OUTPUT}")

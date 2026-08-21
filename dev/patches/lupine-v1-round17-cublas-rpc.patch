@@ -1,0 +1,600 @@
+diff --git a/client.cpp b/client.cpp
+index d0e575d..c0d3484 100644
+--- a/client.cpp
++++ b/client.cpp
+@@ -59,6 +59,7 @@
+ #include "lupine_attr_sizes.h"
+ #include "lupine_fatbin.h"
+ #include "lupine_log.h"
++#include "lupine_cublas.h"
+ #include "lupine_nccl.h"
+ #include "memcpy.h"
+ #include "rpc.h"
+@@ -307,6 +308,22 @@ extern "C" int lupine_nccl_call_on_route(
+   return 0;
+ }
+ 
++extern "C" int lupine_cublas_call_on_route(
++    int route_id, const lupine_cublas_request *request,
++    lupine_cublas_response *response) {
++  if (route_id < 0 || request == nullptr || response == nullptr) return -1;
++  conn_t *conn = lupine_thread_conn_by_index(static_cast<unsigned int>(route_id));
++  if (conn == nullptr) return -1;
++  if (rpc_write_start_request(conn, LUPINE_RPC_lupineCublasCall) < 0 ||
++      rpc_write(conn, request, sizeof(*request)) < 0 ||
++      rpc_wait_for_response(conn) < 0 ||
++      rpc_read(conn, response, sizeof(*response)) < 0 ||
++      rpc_read_end(conn) < 0) {
++    return -1;
++  }
++  return 0;
++}
++
+ extern "C" CUresult lupine_missing_driver_api_called(const char *symbol) {
+   LUPINE_LOG_ERROR("LUPINE missing Driver API called: " << symbol);
+   return CUDA_ERROR_NOT_SUPPORTED;
+@@ -3568,6 +3585,36 @@ void lupine_accept_current_context_hint(CUcontext ctx) {
+   }
+ }
+ 
++extern "C" int lupine_restore_default_context_hint() {
++  if (lupine_current_context == nullptr) {
++    CUcontext hint = lupine_default_context_hint;
++    if (hint == nullptr)
++      hint = lupine_global_default_context_hint.load(std::memory_order_relaxed);
++    if (hint != nullptr) lupine_current_context = hint;
++    LUPINE_TRACE_LOG("LUPINE restore context hint=" << hint);
++  }
++  return lupine_current_context == nullptr ? -1 : 0;
++}
++
++extern "C" int lupine_repair_current_context_device(int device) {
++  if (lupine_current_context == nullptr) return -1;
++  CUdevice virtual_device = static_cast<CUdevice>(device);
++  lupine_route route = lupine_route_for_device(&virtual_device);
++  if (route.kind == LUPINE_ROUTE_INVALID ||
++      route.kind == LUPINE_ROUTE_UNKNOWN_DEVICE)
++    return -1;
++  lupine_note_context_owner_route(lupine_current_context, route);
++  lupine_current_context_device_cache_insert(lupine_current_context,
++                                             virtual_device);
++  lupine_default_context_hint = lupine_current_context;
++  lupine_global_default_context_hint.store(lupine_current_context,
++                                           std::memory_order_relaxed);
++  LUPINE_TRACE_LOG("LUPINE repaired context owner ctx="
++                   << lupine_current_context << " device=" << device
++                   << " route=" << lupine_route_identity(route));
++  return 0;
++}
++
+ static CUresult lupine_set_remote_current_context(CUcontext ctx) {
+   lupine_route route =
+       lupine_route_for_context(ctx != nullptr ? ctx : lupine_current_context);
+@@ -3705,6 +3752,10 @@ extern "C" CUresult cuCtxGetDevice(CUdevice *device) {
+       return CUDA_ERROR_DEVICE_UNAVAILABLE;
+     }
+     CUresult result = real(device);
++    LUPINE_TRACE_LOG("LUPINE cuCtxGetDevice local ctx="
++                     << lupine_current_context << " result="
++                     << static_cast<int>(result) << " device="
++                     << (result == CUDA_SUCCESS ? *device : -1));
+     if (result == CUDA_SUCCESS) {
+       lupine_current_context_device_cache_insert(lupine_current_context,
+                                                  *device);
+@@ -3726,6 +3777,11 @@ extern "C" CUresult cuCtxGetDevice(CUdevice *device) {
+     *device = lupine_local_device_for_remote(conn, remote_device);
+     lupine_current_context_device_cache_insert(lupine_current_context, *device);
+   }
++  LUPINE_TRACE_LOG("LUPINE cuCtxGetDevice remote ctx="
++                   << lupine_current_context << " route="
++                   << lupine_route_identity(route) << " result="
++                   << static_cast<int>(return_value) << " device="
++                   << (return_value == CUDA_SUCCESS ? *device : -1));
+   return return_value;
+ }
+ 
+diff --git a/client.exports b/client.exports
+index 24e8d4d..81e982f 100644
+--- a/client.exports
++++ b/client.exports
+@@ -13,6 +13,9 @@ LUPINE_1.0 {
+     lupine_cuda_device_route_id;
+     lupine_nccl_call;
+     lupine_nccl_call_on_route;
++    lupine_cublas_call_on_route;
++    lupine_restore_default_context_hint;
++    lupine_repair_current_context_device;
+     lupine_rpc_stats_reset;
+   local:
+     *;
+diff --git a/codegen/gen_api.h b/codegen/gen_api.h
+index 0ae5bd6..42309b6 100644
+--- a/codegen/gen_api.h
++++ b/codegen/gen_api.h
+@@ -457,4 +457,5 @@
+ #define LUPINE_RPC_lupineManagedHostFlush 1450411892
+ #define LUPINE_RPC_lupineMappedHostSnapshot 1450411893
+ #define LUPINE_RPC_lupineNcclCall 1450411894
++#define LUPINE_RPC_lupineCublasCall 1450411895
+ #define LUPINE_RPC_lupineModuleGetFunctionWithLayout 368273666
+diff --git a/cudart_compat.cpp b/cudart_compat.cpp
+index b3b2189..fc866d2 100644
+--- a/cudart_compat.cpp
++++ b/cudart_compat.cpp
+@@ -6,6 +6,8 @@
+ #include <mutex>
+ 
+ extern "C" int lupine_launch_runtime_anchor_kernel();
++extern "C" int lupine_restore_default_context_hint();
++extern "C" int lupine_repair_current_context_device(int device);
+ 
+ static thread_local int lupine_runtime_device = -1;
+ 
+@@ -55,17 +57,55 @@ extern "C" int cudaGetDevice(int *device) {
+     }
+   }
+   if (lupine_runtime_device >= 0) {
++    if (context != nullptr &&
++        lupine_repair_current_context_device(lupine_runtime_device) == 0) {
++      *device = lupine_runtime_device;
++      if (debug)
++        std::fprintf(stderr,
++                     "lupine-cudart: cudaGetDevice repaired-owner=%d\n",
++                     *device);
++      return 0;
++    }
++    if (lupine_restore_default_context_hint() == 0 &&
++        cuCtxGetCurrent(&context) == CUDA_SUCCESS && context != nullptr) {
++      CUdevice current = -1;
++      if (cuCtxGetDevice(&current) == CUDA_SUCCESS) {
++        *device = static_cast<int>(current);
++        if (debug)
++          std::fprintf(stderr,
++                       "lupine-cudart: cudaGetDevice restored-hint=%d\n",
++                       *device);
++        return 0;
++      }
++    }
+     using set_device_fn = int (*)(int);
+-    static set_device_fn restore =
++    using route_fn = int (*)(int);
++    static set_device_fn real_set =
+         reinterpret_cast<set_device_fn>(dlsym(RTLD_NEXT, "cudaSetDevice"));
+-    int restore_result = restore == nullptr ? 999 : restore(lupine_runtime_device);
+-    if (restore_result != 0) return restore_result;
++    static route_fn route = reinterpret_cast<route_fn>(
++        dlsym(RTLD_DEFAULT, "lupine_cuda_device_route_id"));
++    int repair_result = 999;
++    if (real_set != nullptr) {
++      // libcudart can reject re-entering a remote primary context directly
++      // after a CUDA library clears it. Passing through a local ordinal first
++      // resets its thread-local primary-context bookkeeping.
++      if (route != nullptr && route(lupine_runtime_device) >= 0) {
++        for (int ordinal = 0; ordinal < 64; ++ordinal) {
++          if (route(ordinal) == -1) {
++            (void)real_set(ordinal);
++            break;
++          }
++          if (route(ordinal) < -1) break;
++        }
++      }
++      repair_result = real_set(lupine_runtime_device);
++    }
+     *device = lupine_runtime_device;
+     if (debug)
+       std::fprintf(stderr,
+-                   "lupine-cudart: cudaGetDevice restored-and-tracked=%d\n",
+-                   *device);
+-    return 0;
++                   "lupine-cudart: cudaGetDevice repaired=%d result=%d\n",
++                   *device, repair_result);
++    return repair_result;
+   }
+   using get_device_fn = int (*)(int *);
+   static get_device_fn real_get =
+diff --git a/lupine_cublas.h b/lupine_cublas.h
+new file mode 100644
+index 0000000..c63b8dc
+--- /dev/null
++++ b/lupine_cublas.h
+@@ -0,0 +1,84 @@
++#pragma once
++
++#include <stdint.h>
++
++enum lupine_cublas_opcode : uint32_t {
++  LUPINE_CUBLAS_CREATE = 1,
++  LUPINE_CUBLAS_DESTROY = 2,
++  LUPINE_CUBLAS_SET_STREAM = 3,
++  LUPINE_CUBLAS_SET_WORKSPACE = 4,
++  LUPINE_CUBLAS_SET_MATH_MODE = 5,
++  LUPINE_CUBLAS_SET_POINTER_MODE = 6,
++  LUPINE_CUBLAS_SGEMM = 7,
++  LUPINE_CUBLAS_GEMM_EX = 8,
++  LUPINE_CUBLAS_SGEMM_EX = 9,
++  LUPINE_CUBLAS_LT_MATMUL_DESC_CREATE = 10,
++  LUPINE_CUBLAS_LT_MATMUL_DESC_DESTROY = 11,
++  LUPINE_CUBLAS_LT_MATMUL_DESC_SET_ATTRIBUTE = 12,
++  LUPINE_CUBLAS_LT_MATRIX_LAYOUT_CREATE = 13,
++  LUPINE_CUBLAS_LT_MATRIX_LAYOUT_DESTROY = 14,
++  LUPINE_CUBLAS_LT_MATRIX_LAYOUT_SET_ATTRIBUTE = 15,
++  LUPINE_CUBLAS_LT_PREFERENCE_CREATE = 16,
++  LUPINE_CUBLAS_LT_PREFERENCE_DESTROY = 17,
++  LUPINE_CUBLAS_LT_PREFERENCE_SET_ATTRIBUTE = 18,
++  LUPINE_CUBLAS_LT_HEURISTIC = 19,
++  LUPINE_CUBLAS_LT_MATMUL = 20,
++};
++
++struct lupine_cublas_request {
++  uint32_t opcode = 0;
++  uint64_t handle = 0;
++  uint64_t stream = 0;
++  uint64_t workspace = 0;
++  uint64_t workspace_size = 0;
++  uint64_t a = 0;
++  uint64_t b = 0;
++  uint64_t c = 0;
++  uint64_t d = 0;
++  int32_t transa = 0;
++  int32_t transb = 0;
++  int32_t m = 0;
++  int32_t n = 0;
++  int32_t k = 0;
++  int32_t lda = 0;
++  int32_t ldb = 0;
++  int32_t ldc = 0;
++  int32_t value = 0;
++  float alpha = 0.0f;
++  float beta = 0.0f;
++  int32_t a_type = 0;
++  int32_t b_type = 0;
++  int32_t c_type = 0;
++  int32_t compute_type = 0;
++  int32_t algorithm = 0;
++  uint32_t scalar_size = 0;
++  uint8_t alpha_data[16] = {};
++  uint8_t beta_data[16] = {};
++  uint64_t descriptor = 0;
++  uint64_t a_descriptor = 0;
++  uint64_t b_descriptor = 0;
++  uint64_t c_descriptor = 0;
++  uint64_t d_descriptor = 0;
++  uint64_t preference = 0;
++  uint64_t rows = 0;
++  uint64_t columns = 0;
++  int64_t leading_dimension = 0;
++  int32_t attribute = 0;
++  int32_t requested_algorithms = 0;
++  uint32_t payload_size = 0;
++  uint8_t payload[128] = {};
++  uint64_t context = 0;
++};
++
++struct lupine_cublas_response {
++  int32_t status = 13;
++  int32_t value = 0;
++  uint64_t handle = 0;
++  int32_t returned_algorithms = 0;
++  uint32_t payload_size = 0;
++  uint8_t payload[768] = {};
++};
++
++extern "C" int lupine_cublas_call_on_route(
++    int route_id, const lupine_cublas_request *request,
++    lupine_cublas_response *response);
+diff --git a/manual_server.cpp b/manual_server.cpp
+index 87a9a1e..a327f9a 100644
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -46,6 +46,7 @@
+ #include "lupine_attr_sizes.h"
+ #include "lupine_fatbin.h"
+ #include "lupine_log.h"
++#include "lupine_cublas.h"
+ #include "lupine_nccl.h"
+ #include "manual_server.h"
+ #include "rpc.h"
+@@ -3841,6 +3842,278 @@ int handle_manual_lupineMappedHostSnapshot(conn_t *conn) {
+   return 0;
+ }
+ 
++int handle_manual_lupineCublasCall(conn_t *conn) {
++  lupine_cublas_request request;
++  if (rpc_read(conn, &request, sizeof(request)) < 0) return -1;
++  int request_id = rpc_read_end(conn);
++  if (request_id < 0) return -1;
++
++  CUcontext saved_context = nullptr;
++  CUresult saved_context_result = cuCtxGetCurrent(&saved_context);
++  CUcontext requested_context =
++      reinterpret_cast<CUcontext>(request.context);
++  if (requested_context != nullptr)
++    (void)cuCtxSetCurrent(requested_context);
++
++  static void *library = [] {
++    void *handle = dlopen("libcublas.so.13", RTLD_NOW | RTLD_LOCAL);
++    if (handle == nullptr) {
++      handle = dlopen(
++          "/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib/"
++          "libcublas.so.13",
++          RTLD_NOW | RTLD_LOCAL);
++    }
++    if (handle == nullptr)
++      LUPINE_LOG_ERROR("Unable to load server cuBLAS: " << dlerror());
++    return handle;
++  }();
++  auto symbol = [](const char *name) -> void * {
++    return library == nullptr ? nullptr : dlsym(library, name);
++  };
++  static void *lt_library = [] {
++    void *lt = dlopen("libcublasLt.so.13", RTLD_NOW | RTLD_LOCAL);
++    if (lt == nullptr) {
++      lt = dlopen(
++          "/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib/"
++          "libcublasLt.so.13",
++          RTLD_NOW | RTLD_LOCAL);
++    }
++    if (lt == nullptr)
++      LUPINE_LOG_ERROR("Unable to load server cuBLASLt: " << dlerror());
++    return lt;
++  }();
++  auto lt_symbol = [](const char *name) -> void * {
++    return lt_library == nullptr ? nullptr : dlsym(lt_library, name);
++  };
++
++  lupine_cublas_response response;
++  void *handle = reinterpret_cast<void *>(request.handle);
++  switch (request.opcode) {
++  case LUPINE_CUBLAS_CREATE: {
++    using function = int (*)(void **);
++    auto call = reinterpret_cast<function>(symbol("cublasCreate_v2"));
++    response.status = call == nullptr ? 13 : call(&handle);
++    response.handle = reinterpret_cast<uint64_t>(handle);
++    break;
++  }
++  case LUPINE_CUBLAS_DESTROY: {
++    using function = int (*)(void *);
++    auto call = reinterpret_cast<function>(symbol("cublasDestroy_v2"));
++    response.status = call == nullptr ? 13 : call(handle);
++    break;
++  }
++  case LUPINE_CUBLAS_SET_STREAM: {
++    using function = int (*)(void *, void *);
++    auto call = reinterpret_cast<function>(symbol("cublasSetStream_v2"));
++    response.status = call == nullptr
++                          ? 13
++                          : call(handle, reinterpret_cast<void *>(request.stream));
++    break;
++  }
++  case LUPINE_CUBLAS_SET_WORKSPACE: {
++    using function = int (*)(void *, void *, size_t);
++    auto call = reinterpret_cast<function>(symbol("cublasSetWorkspace_v2"));
++    response.status =
++        call == nullptr
++            ? 13
++            : call(handle, reinterpret_cast<void *>(request.workspace),
++                   static_cast<size_t>(request.workspace_size));
++    break;
++  }
++  case LUPINE_CUBLAS_SET_MATH_MODE: {
++    using function = int (*)(void *, int);
++    auto call = reinterpret_cast<function>(symbol("cublasSetMathMode"));
++    response.status = call == nullptr ? 13 : call(handle, request.value);
++    break;
++  }
++  case LUPINE_CUBLAS_SET_POINTER_MODE: {
++    using function = int (*)(void *, int);
++    auto call = reinterpret_cast<function>(symbol("cublasSetPointerMode_v2"));
++    response.status = call == nullptr ? 13 : call(handle, request.value);
++    break;
++  }
++  case LUPINE_CUBLAS_SGEMM: {
++    using function = int (*)(void *, int, int, int, int, int, const float *,
++                             const float *, int, const float *, int,
++                             const float *, float *, int);
++    auto call = reinterpret_cast<function>(symbol("cublasSgemm_v2"));
++    response.status =
++        call == nullptr
++            ? 13
++            : call(handle, request.transa, request.transb, request.m, request.n,
++                   request.k, &request.alpha,
++                   reinterpret_cast<const float *>(request.a), request.lda,
++                   reinterpret_cast<const float *>(request.b), request.ldb,
++                   &request.beta, reinterpret_cast<float *>(request.c),
++                   request.ldc);
++    break;
++  }
++  case LUPINE_CUBLAS_GEMM_EX: {
++    using function = int (*)(void *, int, int, int, int, int, const void *,
++                             const void *, int, int, const void *, int, int,
++                             const void *, void *, int, int, int, int);
++    auto call = reinterpret_cast<function>(symbol("cublasGemmEx"));
++    response.status =
++        call == nullptr || request.scalar_size > sizeof(request.alpha_data)
++            ? 13
++            : call(handle, request.transa, request.transb, request.m, request.n,
++                   request.k, request.alpha_data,
++                   reinterpret_cast<const void *>(request.a), request.a_type,
++                   request.lda, reinterpret_cast<const void *>(request.b),
++                   request.b_type, request.ldb, request.beta_data,
++                   reinterpret_cast<void *>(request.c), request.c_type,
++                   request.ldc, request.compute_type, request.algorithm);
++    break;
++  }
++  case LUPINE_CUBLAS_SGEMM_EX: {
++    using function = int (*)(void *, int, int, int, int, int, const float *,
++                             const void *, int, int, const void *, int, int,
++                             const float *, void *, int, int);
++    auto call = reinterpret_cast<function>(symbol("cublasSgemmEx"));
++    response.status =
++        call == nullptr
++            ? 13
++            : call(handle, request.transa, request.transb, request.m, request.n,
++                   request.k, &request.alpha,
++                   reinterpret_cast<const void *>(request.a), request.a_type,
++                   request.lda, reinterpret_cast<const void *>(request.b),
++                   request.b_type, request.ldb, &request.beta,
++                   reinterpret_cast<void *>(request.c), request.c_type,
++                   request.ldc);
++    break;
++  }
++  case LUPINE_CUBLAS_LT_MATMUL_DESC_CREATE: {
++    using function = int (*)(void **, int, int);
++    auto call = reinterpret_cast<function>(lt_symbol("cublasLtMatmulDescCreate"));
++    void *descriptor = nullptr;
++    response.status = call == nullptr
++                          ? 13
++                          : call(&descriptor, request.compute_type,
++                                 request.c_type);
++    response.handle = reinterpret_cast<uint64_t>(descriptor);
++    break;
++  }
++  case LUPINE_CUBLAS_LT_MATMUL_DESC_DESTROY:
++  case LUPINE_CUBLAS_LT_MATRIX_LAYOUT_DESTROY:
++  case LUPINE_CUBLAS_LT_PREFERENCE_DESTROY: {
++    using function = int (*)(void *);
++    const char *name = request.opcode == LUPINE_CUBLAS_LT_MATMUL_DESC_DESTROY
++                           ? "cublasLtMatmulDescDestroy"
++                       : request.opcode == LUPINE_CUBLAS_LT_MATRIX_LAYOUT_DESTROY
++                           ? "cublasLtMatrixLayoutDestroy"
++                           : "cublasLtMatmulPreferenceDestroy";
++    auto call = reinterpret_cast<function>(lt_symbol(name));
++    response.status = call == nullptr
++                          ? 13
++                          : call(reinterpret_cast<void *>(request.descriptor));
++    break;
++  }
++  case LUPINE_CUBLAS_LT_MATMUL_DESC_SET_ATTRIBUTE:
++  case LUPINE_CUBLAS_LT_MATRIX_LAYOUT_SET_ATTRIBUTE:
++  case LUPINE_CUBLAS_LT_PREFERENCE_SET_ATTRIBUTE: {
++    using function = int (*)(void *, int, const void *, size_t);
++    const char *name =
++        request.opcode == LUPINE_CUBLAS_LT_MATMUL_DESC_SET_ATTRIBUTE
++            ? "cublasLtMatmulDescSetAttribute"
++        : request.opcode == LUPINE_CUBLAS_LT_MATRIX_LAYOUT_SET_ATTRIBUTE
++            ? "cublasLtMatrixLayoutSetAttribute"
++            : "cublasLtMatmulPreferenceSetAttribute";
++    auto call = reinterpret_cast<function>(lt_symbol(name));
++    response.status =
++        call == nullptr || request.payload_size > sizeof(request.payload)
++            ? 13
++            : call(reinterpret_cast<void *>(request.descriptor),
++                   request.attribute, request.payload, request.payload_size);
++    break;
++  }
++  case LUPINE_CUBLAS_LT_MATRIX_LAYOUT_CREATE: {
++    using function = int (*)(void **, int, uint64_t, uint64_t, int64_t);
++    auto call = reinterpret_cast<function>(lt_symbol("cublasLtMatrixLayoutCreate"));
++    void *descriptor = nullptr;
++    response.status =
++        call == nullptr
++            ? 13
++            : call(&descriptor, request.a_type, request.rows, request.columns,
++                   request.leading_dimension);
++    response.handle = reinterpret_cast<uint64_t>(descriptor);
++    break;
++  }
++  case LUPINE_CUBLAS_LT_PREFERENCE_CREATE: {
++    using function = int (*)(void **);
++    auto call = reinterpret_cast<function>(lt_symbol("cublasLtMatmulPreferenceCreate"));
++    void *preference = nullptr;
++    response.status = call == nullptr ? 13 : call(&preference);
++    response.handle = reinterpret_cast<uint64_t>(preference);
++    break;
++  }
++  case LUPINE_CUBLAS_LT_HEURISTIC: {
++    using function = int (*)(void *, void *, void *, void *, void *, void *,
++                             void *, int, void *, int *);
++    auto call = reinterpret_cast<function>(
++        lt_symbol("cublasLtMatmulAlgoGetHeuristic"));
++    constexpr size_t result_size = 96;
++    alignas(16) unsigned char results[8 * result_size] = {};
++    int returned = 0;
++    response.status =
++        call == nullptr || request.requested_algorithms <= 0 ||
++                request.requested_algorithms > 8
++            ? 13
++            : call(handle, reinterpret_cast<void *>(request.descriptor),
++                   reinterpret_cast<void *>(request.a_descriptor),
++                   reinterpret_cast<void *>(request.b_descriptor),
++                   reinterpret_cast<void *>(request.c_descriptor),
++                   reinterpret_cast<void *>(request.d_descriptor),
++                   reinterpret_cast<void *>(request.preference),
++                   request.requested_algorithms, results, &returned);
++    if (response.status == 0) {
++      response.returned_algorithms = returned;
++      response.payload_size = static_cast<uint32_t>(returned * result_size);
++      memcpy(response.payload, results, response.payload_size);
++    }
++    break;
++  }
++  case LUPINE_CUBLAS_LT_MATMUL: {
++    using function = int (*)(void *, void *, const void *, const void *, void *,
++                             const void *, void *, const void *, const void *,
++                             void *, void *, void *, const void *, void *,
++                             size_t, void *);
++    auto call = reinterpret_cast<function>(lt_symbol("cublasLtMatmul"));
++    const void *algorithm = request.payload_size == 64 ? request.payload : nullptr;
++    response.status =
++        call == nullptr || request.scalar_size > sizeof(request.alpha_data)
++            ? 13
++            : call(handle, reinterpret_cast<void *>(request.descriptor),
++                   request.alpha_data,
++                   reinterpret_cast<const void *>(request.a),
++                   reinterpret_cast<void *>(request.a_descriptor),
++                   reinterpret_cast<const void *>(request.b),
++                   reinterpret_cast<void *>(request.b_descriptor),
++                   request.beta_data,
++                   reinterpret_cast<const void *>(request.c),
++                   reinterpret_cast<void *>(request.c_descriptor),
++                   reinterpret_cast<void *>(request.d),
++                   reinterpret_cast<void *>(request.d_descriptor), algorithm,
++                   reinterpret_cast<void *>(request.workspace),
++                   request.workspace_size,
++                   reinterpret_cast<void *>(request.stream));
++    break;
++  }
++  default:
++    response.status = 15;
++    break;
++  }
++  if (requested_context != nullptr) {
++    (void)cuCtxSetCurrent(requested_context);
++  } else if (saved_context_result == CUDA_SUCCESS) {
++    (void)cuCtxSetCurrent(saved_context);
++  }
++  if (rpc_write_start_response(conn, request_id) < 0 ||
++      rpc_write(conn, &response, sizeof(response)) < 0 ||
++      rpc_write_end(conn) < 0)
++    return -1;
++  return 0;
++}
++
+ int handle_manual_lupineNcclCall(conn_t *conn) {
+   lupine_nccl_request request;
+   if (rpc_read(conn, &request, sizeof(request)) < 0) return -1;
+diff --git a/manual_server.h b/manual_server.h
+index 3cc2efc..50c35fc 100644
+--- a/manual_server.h
++++ b/manual_server.h
+@@ -84,6 +84,7 @@ int handle_manual_lupineDeviceSnapshot(conn_t *conn);
+ int handle_manual_lupineManagedHostFlush(conn_t *conn);
+ int handle_manual_lupineMappedHostSnapshot(conn_t *conn);
+ int handle_manual_lupineNcclCall(conn_t *conn);
++int handle_manual_lupineCublasCall(conn_t *conn);
+ int handle_manual_cuMemcpyDtoHAsync_v2(conn_t *conn);
+ int handle_manual_cuMemHostAlloc(conn_t *conn);
+ int handle_manual_cuMemHostGetFlags(conn_t *conn);
+diff --git a/server.cpp b/server.cpp
+index f0a60c3..e8320ad 100644
+--- a/server.cpp
++++ b/server.cpp
+@@ -280,6 +280,8 @@ lupine_manual_handlers() {
+         "lupineMappedHostSnapshot"}},
+       {LUPINE_RPC_lupineNcclCall,
+        {handle_manual_lupineNcclCall, "lupineNcclCall"}},
++      {LUPINE_RPC_lupineCublasCall,
++       {handle_manual_lupineCublasCall, "lupineCublasCall"}},
+       {LUPINE_RPC_lupineDeviceSnapshot,
+        {handle_manual_lupineDeviceSnapshot, "lupineDeviceSnapshot"}},
+       {RPC_cuMemcpyDtoHAsync_v2,

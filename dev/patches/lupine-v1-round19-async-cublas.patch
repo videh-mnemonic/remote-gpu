@@ -1,0 +1,48 @@
+diff --git a/client.cpp b/client.cpp
+--- a/client.cpp
++++ b/client.cpp
+@@ -312,8 +312,21 @@ extern "C" int lupine_cublas_call_on_route(
+     int route_id, const lupine_cublas_request *request,
+     lupine_cublas_response *response) {
+   if (route_id < 0 || request == nullptr || response == nullptr) return -1;
+-  conn_t *conn = lupine_thread_conn_by_index(static_cast<unsigned int>(route_id));
++  conn_t *conn =
++      request->stream != 0
++          ? lupine_rpc_conn_for_stream(
++                reinterpret_cast<CUstream>(request->stream))
++          : lupine_thread_conn_by_index(static_cast<unsigned int>(route_id));
+   if (conn == nullptr) return -1;
++  if (request->asynchronous != 0) {
++    if (rpc_write_start_request(conn, LUPINE_RPC_lupineCublasCall) < 0 ||
++        rpc_write(conn, request, sizeof(*request)) < 0 ||
++        rpc_write_end_deferred(conn) < 0) {
++      return -1;
++    }
++    response->status = 0;
++    return 0;
++  }
+   if (rpc_write_start_request(conn, LUPINE_RPC_lupineCublasCall) < 0 ||
+       rpc_write(conn, request, sizeof(*request)) < 0 ||
+       rpc_wait_for_response(conn) < 0 ||
+diff --git a/lupine_cublas.h b/lupine_cublas.h
+--- a/lupine_cublas.h
++++ b/lupine_cublas.h
+@@ -75,6 +75,7 @@ struct lupine_cublas_request {
+   uint32_t handle_state_mask = 0;
+   int32_t math_mode = 0;
+   int32_t pointer_mode = 0;
++  uint32_t asynchronous = 0;
+   uint64_t context = 0;
+ };
+ 
+diff --git a/manual_server.cpp b/manual_server.cpp
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -4170,6 +4170,7 @@ int handle_manual_lupineCublasCall(conn_t *conn) {
+   } else if (saved_context_result == CUDA_SUCCESS) {
+     (void)cuCtxSetCurrent(saved_context);
+   }
++  if (request.asynchronous != 0) return 0;
+   if (rpc_write_start_response(conn, request_id) < 0 ||
+       rpc_write(conn, &response, sizeof(response)) < 0 ||
+       rpc_write_end(conn) < 0)

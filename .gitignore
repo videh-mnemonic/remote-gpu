@@ -1,20 +1,26 @@
 # Public repositories are local working copies only. Never commit their Git dirs.
-/external/
+/dev/external/
 
 # Prepared datasets, container caches, and bulky/raw benchmark artifacts.
 /data/
-/results/raw/
-/results/tmp/
+/dev/results/raw/
+/dev/results/tmp/
+/dev/results/inductor-*/
+/dev/generated/
+/dev/releases/
+/logs/
 
 # Local configuration and credentials.
-/config/hosts.json
+/dev/config/hosts.json
 .env
 .env.*
+!.env.example
 
 # Python/build artifacts.
 __pycache__/
 *.py[cod]
 .pytest_cache/
+*.egg-info/
 .venv/
 /build/
-
+/rgpu-client/build/

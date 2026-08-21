@@ -1,0 +1,62 @@
+diff --git a/lupine_cublas.h b/lupine_cublas.h
+index 13fe0ad..924a109 100644
+--- a/lupine_cublas.h
++++ b/lupine_cublas.h
+@@ -145,6 +145,10 @@ enum lupine_cublas_opcode : uint32_t {
+   LUPINE_CUBLAS_SGETRF_BATCHED = 140,
+   LUPINE_CUSOLVER_DN_ZSYTRF_BUFFER_SIZE = 141,
+   LUPINE_CUSOLVER_DN_ZSYTRF = 142,
++  LUPINE_CUSOLVER_DN_CSYTRF_BUFFER_SIZE = 143,
++  LUPINE_CUSOLVER_DN_CSYTRF = 144,
++  LUPINE_CUSOLVER_DN_DSYTRF_BUFFER_SIZE = 145,
++  LUPINE_CUSOLVER_DN_DSYTRF = 146,
+ };
+ 
+ struct lupine_cublas_request {
+diff --git a/manual_server.cpp b/manual_server.cpp
+index cce4028..b124752 100644
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -5227,6 +5227,41 @@ int handle_manual_lupineCublasCall(conn_t *conn) {
+                    reinterpret_cast<int *>(request.d));
+     break;
+   }
++  case LUPINE_CUSOLVER_DN_CSYTRF_BUFFER_SIZE:
++  case LUPINE_CUSOLVER_DN_DSYTRF_BUFFER_SIZE: {
++    const char *name =
++        request.opcode == LUPINE_CUSOLVER_DN_CSYTRF_BUFFER_SIZE
++            ? "cusolverDnCsytrf_bufferSize"
++            : "cusolverDnDsytrf_bufferSize";
++    using function = int (*)(void *, int, void *, int, int *);
++    auto call = reinterpret_cast<function>(solver_symbol(name));
++    int lwork = 0;
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.n, reinterpret_cast<void *>(request.a),
++                   request.lda, &lwork);
++    response.value = lwork;
++    break;
++  }
++  case LUPINE_CUSOLVER_DN_CSYTRF:
++  case LUPINE_CUSOLVER_DN_DSYTRF: {
++    const char *name = request.opcode == LUPINE_CUSOLVER_DN_CSYTRF
++                           ? "cusolverDnCsytrf"
++                           : "cusolverDnDsytrf";
++    using function = int (*)(void *, int, int, void *, int, int *, void *, int,
++                             int *);
++    auto call = reinterpret_cast<function>(solver_symbol(name));
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.transa, request.n,
++                   reinterpret_cast<void *>(request.a), request.lda,
++                   reinterpret_cast<int *>(request.b),
++                   reinterpret_cast<void *>(request.workspace), request.value,
++                   reinterpret_cast<int *>(request.d));
++    break;
++  }
+   case LUPINE_CUSOLVER_DN_XSYTRS_BUFFER_SIZE: {
+     using function = int (*)(void *, int, int64_t, int64_t, int, const void *,
+                              int64_t, const int64_t *, int, void *, int64_t,
+

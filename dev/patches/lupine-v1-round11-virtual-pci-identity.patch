@@ -1,0 +1,39 @@
+diff --git a/codegen/codegen.py b/codegen/codegen.py
+--- a/codegen/codegen.py
++++ b/codegen/codegen.py
+@@ -1759,6 +1759,16 @@ def write_client_function(f, function: Function, metadata: dict[str, Function]):
+             )
+ 
+             write_client_post_call(f, function, metadata)
++            if function.name.format() == "cuDeviceGetPCIBusId":
++                f.write("    if (return_value == CUDA_SUCCESS && pciBusId != nullptr && len > 0) {\n")
++                f.write("        const char *lupine_separator = std::strchr(pciBusId, ':');\n")
++                f.write("        if (lupine_separator != nullptr) {\n")
++                f.write("            char lupine_physical_suffix[24] = {};\n")
++                f.write("            std::snprintf(lupine_physical_suffix, sizeof(lupine_physical_suffix), \"%s\", lupine_separator);\n")
++                f.write("            const unsigned int lupine_virtual_domain = 0x1000u + static_cast<unsigned int>(lupine_route_identity(route));\n")
++                f.write("            std::snprintf(pciBusId, static_cast<std::size_t>(len), \"%08x%s\", lupine_virtual_domain, lupine_physical_suffix);\n")
++                f.write("        }\n")
++                f.write("    }\n")
+             for operation in operations:
+                 if isinstance(operation, ArrayOperation):
+                     operation.client_post_rpc_read_success(f)
+diff --git a/codegen/gen_client.cpp b/codegen/gen_client.cpp
+--- a/codegen/gen_client.cpp
++++ b/codegen/gen_client.cpp
+@@ -1252,6 +1252,15 @@ extern "C" CUresult cuDeviceGetPCIBusId(char *pciBusId, int len, CUdevice dev) {
+         rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+         rpc_read_end(conn) < 0)
+         return CUDA_ERROR_DEVICE_UNAVAILABLE;
++    if (return_value == CUDA_SUCCESS && pciBusId != nullptr && len > 0) {
++        const char *lupine_separator = std::strchr(pciBusId, ':');
++        if (lupine_separator != nullptr) {
++            char lupine_physical_suffix[24] = {};
++            std::snprintf(lupine_physical_suffix, sizeof(lupine_physical_suffix), "%s", lupine_separator);
++            const unsigned int lupine_virtual_domain = 0x1000u + static_cast<unsigned int>(lupine_route_identity(route));
++            std::snprintf(pciBusId, static_cast<std::size_t>(len), "%08x%s", lupine_virtual_domain, lupine_physical_suffix);
++        }
++    }
+     lupine_mark_host_range_clean(pciBusId, len * sizeof(char));
+     return return_value;
+ }

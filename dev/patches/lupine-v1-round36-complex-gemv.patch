@@ -1,0 +1,60 @@
+diff --git a/lupine_cublas.h b/lupine_cublas.h
+index 924a109..b421a02 100644
+--- a/lupine_cublas.h
++++ b/lupine_cublas.h
+@@ -149,6 +149,8 @@ enum lupine_cublas_opcode : uint32_t {
+   LUPINE_CUSOLVER_DN_CSYTRF = 144,
+   LUPINE_CUSOLVER_DN_DSYTRF_BUFFER_SIZE = 145,
+   LUPINE_CUSOLVER_DN_DSYTRF = 146,
++  LUPINE_CUBLAS_CGEMV = 147,
++  LUPINE_CUBLAS_ZGEMV = 148,
+ };
+ 
+ struct lupine_cublas_request {
+diff --git a/manual_server.cpp b/manual_server.cpp
+index b124752..91a93cb 100644
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -3950,6 +3950,8 @@ int handle_manual_lupineCublasCall(conn_t *conn) {
+       request.opcode == LUPINE_CUBLAS_DTRSM ||
+       request.opcode == LUPINE_CUBLAS_DGEMM_BATCHED ||
+       request.opcode == LUPINE_CUBLAS_DGEMV ||
++      request.opcode == LUPINE_CUBLAS_CGEMV ||
++      request.opcode == LUPINE_CUBLAS_ZGEMV ||
+       request.opcode == LUPINE_CUBLAS_DAXPY ||
+       request.opcode == LUPINE_CUBLAS_DCOPY ||
+       request.opcode == LUPINE_CUBLAS_DSCAL ||
+@@ -5795,6 +5797,32 @@ int handle_manual_lupineCublasCall(conn_t *conn) {
+                    beta, reinterpret_cast<double *>(request.c), request.ldc);
+     break;
+   }
++  case LUPINE_CUBLAS_CGEMV:
++  case LUPINE_CUBLAS_ZGEMV: {
++    using function = int (*)(void *, int, int, int, const void *, const void *,
++                             int, const void *, int, const void *, void *, int);
++    const bool is_double = request.opcode == LUPINE_CUBLAS_ZGEMV;
++    auto call = reinterpret_cast<function>(
++        symbol(is_double ? "cublasZgemv_v2" : "cublasCgemv_v2"));
++    alignas(16) unsigned char aligned_alpha[16] = {};
++    alignas(16) unsigned char aligned_beta[16] = {};
++    memcpy(aligned_alpha, request.alpha_data, sizeof(aligned_alpha));
++    memcpy(aligned_beta, request.beta_data, sizeof(aligned_beta));
++    const void *alpha = request.pointer_mode == 0
++                            ? static_cast<const void *>(aligned_alpha)
++                            : reinterpret_cast<const void *>(request.d);
++    const void *beta = request.pointer_mode == 0
++                           ? static_cast<const void *>(aligned_beta)
++                           : reinterpret_cast<const void *>(request.workspace);
++    response.status =
++        call == nullptr
++            ? 13
++            : call(handle, request.transa, request.m, request.n, alpha,
++                   reinterpret_cast<const void *>(request.a), request.lda,
++                   reinterpret_cast<const void *>(request.b), request.ldb,
++                   beta, reinterpret_cast<void *>(request.c), request.ldc);
++    break;
++  }
+   case LUPINE_CUBLAS_CDOTU:
+   case LUPINE_CUBLAS_CDOTC:
+   case LUPINE_CUBLAS_ZDOTU:
+

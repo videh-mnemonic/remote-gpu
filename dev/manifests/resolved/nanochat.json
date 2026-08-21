@@ -1,0 +1,12 @@
+{
+  "commit_time": "2026-07-03T22:54:57Z",
+  "declared_license": "MIT",
+  "license_file": "LICENSE",
+  "license_sha256": "42bb09f339a8af8b90d3b4969b6f6e4ba4aff3b5c614103b031fccdf71c8f772",
+  "name": "nanochat",
+  "push_url": "disabled://public-push-prohibited",
+  "requested_ref": "master",
+  "resolved_commit": "92d63d4e8bb4df75c3b71618f31ddde2378b2bcd",
+  "retrieved_at": "2026-08-19T23:54:06.344392+00:00",
+  "url": "https://github.com/karpathy/nanochat.git"
+}

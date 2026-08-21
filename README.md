@@ -1,47 +1,80 @@
-# remote-gpu
+# rgpu
 
-Private test harness for comparing open-source CUDA-over-network projects on
-`ws-5090-2` and `ws-5090-1`.
+`rgpu` lets Linux programs use an NVIDIA GPU in another machine as though it
+were local. It supports a contained `rgpu run` mode and an experimental
+host-wide mode in which ordinary `nvidia-smi` and PyTorch processes see the
+remote GPU without a wrapper.
 
-The initial OSS bake-off is complete. See
-[the compatibility findings](docs/compatibility.md) for measured results.
-LUPINE v1.0.0 is the only tested candidate that runs current PyTorch; it has a
-large nanoGPT steady-state penalty and does not support the observed NCCL/DDP
-path. Current LUPINE main has a PyTorch regression.
+> **Status:** experimental release `0.1.0`, validated on two Ubuntu
+> workstations with RTX 5090 GPUs, CUDA 13, PyTorch 2.12, Docker, NVIDIA
+> Container Toolkit, and direct 10 GbE. Do not deploy it on an untrusted
+> network.
 
-The repository objective remains evidence gathering before a new
-implementation:
+## Quick start
 
-1. Establish short native PyTorch and nanoGPT baselines.
-2. Screen LUPINE, Cricket, and GVirtuS with the same compatibility tests.
-3. Run fixed-work and fixed-time nanoGPT comparisons for viable candidates.
-4. Use selected upstream PyTorch tests and TorchBench models to measure
-   compatibility breadth.
-5. Choose what, if anything, needs to be built afterward.
+The GPU host needs a healthy NVIDIA driver, Docker with NVIDIA Container
+Toolkit, SSH access, and a user allowed to run Docker. The client needs Docker,
+Python 3.10 or newer, and key-based SSH access to the host.
 
-See [the research and validation plan](docs/research-and-validation-plan.md).
-
-## Safety and provenance
-
-Public repositories are cloned only into the ignored `external/` directory.
-Use `tools/upstreams.py`; it disables the clone's push URL and installs a
-rejecting pre-push hook. Do not create public forks or push changes upstream.
-
-Raw results and datasets are ignored. Small summaries, manifests, tests, and
-private patch files belong in this repository.
-
-## Fast start
-
-From an unrestricted shell with GPU, Docker, and network access:
+From a source checkout on the client:
 
 ```bash
-cp config/hosts.example.json config/hosts.json
-python3 tools/doctor.py --config config/hosts.json --output results/raw/doctor.json
-python3 tools/upstreams.py clone lupine
-python3 tools/upstreams.py clone modded-nanogpt
-python3 tests/smoke/pytorch_smoke.py --output results/raw/native-smoke.json
+./rgpu-client/install.sh --host USER@GPU_HOST
+rgpu status --host USER@GPU_HOST
+rgpu run --host USER@GPU_HOST -- nvidia-smi -L
+rgpu run --host USER@GPU_HOST -- python3 your_training_script.py
 ```
 
-Every benchmark command is wrapped with `tools/run_timed.py`. The hard per-run
-ceiling is 270 seconds, and the normal nanoGPT steady-state window is 180
-seconds.
+Use any compatible existing workload image without rebuilding it:
+
+```bash
+rgpu run --host USER@GPU_HOST \
+  --image YOUR_PYTORCH_IMAGE \
+  --cublas-rpc \
+  -- python3 your_training_script.py
+```
+
+To expose local and remote GPUs in one process, add `--include-local`. Local
+GPUs are listed first:
+
+```bash
+rgpu run --host USER@GPU_HOST --include-local --cublas-rpc -- \
+  python3 -c 'import torch; print(torch.cuda.device_count()); print([torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])'
+```
+
+## Host-wide attachment
+
+This changes only rgpu-owned loader configuration and libraries; it does not
+replace the NVIDIA driver, kernel modules, packages, device nodes, or the
+`nvidia-smi` executable. Attachment is journaled and rollback-safe, but it is
+still experimental. Stop local CUDA workloads before attaching.
+
+```bash
+sudo "$(command -v rgpu)" attach --host USER@GPU_HOST
+nvidia-smi
+python3 -c 'import torch; print(torch.cuda.get_device_name(0))'
+sudo "$(command -v rgpu)" detach
+```
+
+If an interrupted transaction cannot be resumed normally:
+
+```bash
+sudo "$(command -v rgpu-rescue)"
+```
+
+For architecture, artifact layout, security boundaries, compatibility,
+performance, upgrades, and troubleshooting, read the
+[deployment and engineering guide](docs/guide.md). Exact benchmark tables are
+in the [timing summary](docs/timing-summary.md).
+
+## Source layout
+
+| Directory | Contents |
+|---|---|
+| `lupine/` | Modified CUDA Driver API and NVML remoting engine |
+| `rgpu-client/` | Client package, CLI, attachment layer, and injected libraries |
+| `rgpu-host/` | Versioned GPU-server image packaging and host check |
+| `dev/` | Tests, benchmarks, reproducibility tools, and research artifacts |
+
+Build the release artifacts with `dev/tools/build_release.py`. Run the fast
+regression suite with `pytest -q`.

@@ -1,0 +1,61 @@
+diff --git a/lupine_cublas.h b/lupine_cublas.h
+--- a/lupine_cublas.h
++++ b/lupine_cublas.h
+@@ -151,6 +151,10 @@ enum lupine_cublas_opcode : uint32_t {
+   LUPINE_CUSOLVER_DN_DSYTRF = 146,
+   LUPINE_CUBLAS_CGEMV = 147,
+   LUPINE_CUBLAS_ZGEMV = 148,
++  LUPINE_CUBLAS_SGELS_BATCHED = 149,
++  LUPINE_CUBLAS_DGELS_BATCHED = 150,
++  LUPINE_CUBLAS_CGELS_BATCHED = 151,
++  LUPINE_CUBLAS_ZGELS_BATCHED = 152,
+ };
+ 
+ struct lupine_cublas_request {
+diff --git a/manual_server.cpp b/manual_server.cpp
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -3952,6 +3952,10 @@ void LupineServer::manual_cublas(const lupine_cublas_request &request,
+       request.opcode == LUPINE_CUBLAS_DGEMV ||
+       request.opcode == LUPINE_CUBLAS_CGEMV ||
+       request.opcode == LUPINE_CUBLAS_ZGEMV ||
++      request.opcode == LUPINE_CUBLAS_SGELS_BATCHED ||
++      request.opcode == LUPINE_CUBLAS_DGELS_BATCHED ||
++      request.opcode == LUPINE_CUBLAS_CGELS_BATCHED ||
++      request.opcode == LUPINE_CUBLAS_ZGELS_BATCHED ||
+       request.opcode == LUPINE_CUBLAS_DAXPY ||
+       request.opcode == LUPINE_CUBLAS_DCOPY ||
+       request.opcode == LUPINE_CUBLAS_DSCAL ||
+@@ -5594,6 +5598,32 @@ void LupineServer::manual_cublas(const lupine_cublas_request &request,
+                    reinterpret_cast<int *>(request.c), request.batch_count);
+     break;
+   }
++  case LUPINE_CUBLAS_SGELS_BATCHED:
++  case LUPINE_CUBLAS_DGELS_BATCHED:
++  case LUPINE_CUBLAS_CGELS_BATCHED:
++  case LUPINE_CUBLAS_ZGELS_BATCHED: {
++    using function = int (*)(void *, int, int, int, int, void *const *, int,
++                             void *const *, int, int *, int *, int);
++    const char *name = request.opcode == LUPINE_CUBLAS_SGELS_BATCHED
++                           ? "cublasSgelsBatched"
++                       : request.opcode == LUPINE_CUBLAS_DGELS_BATCHED
++                           ? "cublasDgelsBatched"
++                       : request.opcode == LUPINE_CUBLAS_CGELS_BATCHED
++                           ? "cublasCgelsBatched"
++                           : "cublasZgelsBatched";
++    auto call = reinterpret_cast<function>(symbol(name));
++    int info = 0;
++    response.status =
++        call == nullptr
++            ? 13
++            : call(handle, request.transa, request.m, request.n, request.k,
++                   reinterpret_cast<void *const *>(request.a), request.lda,
++                   reinterpret_cast<void *const *>(request.b), request.ldb,
++                   &info, reinterpret_cast<int *>(request.c),
++                   request.batch_count);
++    response.value = info;
++    break;
++  }
+   case LUPINE_CUBLAS_DAXPY: {
+     using function = int (*)(void *, int, const double *, const double *, int,
+                              double *, int);

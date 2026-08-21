@@ -1,0 +1,214 @@
+diff --git a/client.cpp b/client.cpp
+--- a/client.cpp
++++ b/client.cpp
+@@ -4769,6 +4769,44 @@ static CUresult lupine_resolve_launch_function_for_route(
+   return result;
+ }
+ 
++static CUresult lupine_read_packed_launch_buffer(void **extra,
++                                                 void **buffer_out,
++                                                 size_t *buffer_size_out) {
++  if (extra == nullptr || buffer_out == nullptr || buffer_size_out == nullptr) {
++    return CUDA_ERROR_INVALID_VALUE;
++  }
++
++  void *buffer = nullptr;
++  size_t buffer_size = 0;
++  bool saw_buffer = false;
++  bool saw_size = false;
++  for (size_t i = 0; i < 16; i += 2) {
++    void *key = extra[i];
++    if (key == CU_LAUNCH_PARAM_END) {
++      break;
++    }
++    if (key == CU_LAUNCH_PARAM_BUFFER_POINTER) {
++      buffer = extra[i + 1];
++      saw_buffer = true;
++    } else if (key == CU_LAUNCH_PARAM_BUFFER_SIZE) {
++      if (extra[i + 1] == nullptr) {
++        return CUDA_ERROR_INVALID_VALUE;
++      }
++      buffer_size = *reinterpret_cast<size_t *>(extra[i + 1]);
++      saw_size = true;
++    } else {
++      return CUDA_ERROR_INVALID_VALUE;
++    }
++  }
++  if (!saw_buffer || !saw_size || (buffer == nullptr && buffer_size != 0)) {
++    return CUDA_ERROR_INVALID_VALUE;
++  }
++
++  *buffer_out = buffer;
++  *buffer_size_out = buffer_size;
++  return CUDA_SUCCESS;
++}
++
+ extern "C" CUresult
+ cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
+                unsigned int gridDimZ, unsigned int blockDimX,
+@@ -4911,7 +4949,7 @@ extern "C" CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
+ #if CUDA_VERSION < 11080
+   return CUDA_ERROR_NOT_SUPPORTED;
+ #else
+-  if (extra != nullptr) {
++  if (kernelParams != nullptr && extra != nullptr) {
+     return CUDA_ERROR_NOT_SUPPORTED;
+   }
+   CUfunction requested_function = f;
+@@ -4935,6 +4973,50 @@ extern "C" CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
+                            : real(config, f, kernelParams, extra);
+   }
+ 
++  if (extra != nullptr) {
++    void *packed_buffer = nullptr;
++    size_t packed_size = 0;
++    status = lupine_read_packed_launch_buffer(extra, &packed_buffer,
++                                              &packed_size);
++    if (status != CUDA_SUCCESS) {
++      return status;
++    }
++    conn_t *conn = lupine_route_remote_conn(route);
++    CUcontext launch_context = nullptr;
++    if (lupine_current_context != nullptr &&
++        lupine_route_identity(
++            lupine_route_for_context(lupine_current_context)) ==
++            lupine_route_identity(route)) {
++      launch_context = lupine_current_context;
++    }
++    const bool packed_launch = true;
++    const bool fire_and_forget = config->numAttrs == 0;
++    LUPINE_TRACE_LOG("LUPINE cuLaunchKernelEx packed bytes=" << packed_size
++                                                             << " attrs="
++                                                             << config->numAttrs);
++    if (conn == nullptr ||
++        rpc_write_start_request(conn, RPC_cuLaunchKernelEx) < 0 ||
++        rpc_write_launch_config(conn, config) < 0 ||
++        rpc_write(conn, &f, sizeof(f)) < 0 ||
++        rpc_write(conn, &launch_context, sizeof(launch_context)) < 0 ||
++        rpc_write(conn, &packed_launch, sizeof(packed_launch)) < 0 ||
++        rpc_write(conn, &packed_size, sizeof(packed_size)) < 0 ||
++        rpc_write(conn, packed_buffer, packed_size) < 0) {
++      return CUDA_ERROR_DEVICE_UNAVAILABLE;
++    }
++    if (fire_and_forget) {
++      return rpc_write_end_deferred(conn) < 0 ? CUDA_ERROR_DEVICE_UNAVAILABLE
++                                               : CUDA_SUCCESS;
++    }
++    CUresult return_value = CUDA_ERROR_DEVICE_UNAVAILABLE;
++    if (rpc_wait_for_response(conn) < 0 ||
++        rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
++        rpc_read_end(conn) < 0) {
++      return CUDA_ERROR_DEVICE_UNAVAILABLE;
++    }
++    return return_value;
++  }
++
+   lupine_kernel_param_layout layout;
+   status = kernel_handle ? lupine_read_kernel_param_layout(
+                                reinterpret_cast<CUkernel>(f), &layout)
+@@ -5007,11 +5089,18 @@ extern "C" CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
+   // cluster dimensions) are reported from the launch itself. The server
+   // applies the same numAttrs rule when deciding whether to respond.
+   bool fire_and_forget = config->numAttrs == 0;
++  const bool packed_launch = false;
++  LUPINE_TRACE_LOG("LUPINE cuLaunchKernelEx attrs=" << config->numAttrs
++                                                     << " grid=("
++                                                     << config->gridDimX << ","
++                                                     << config->gridDimY << ","
++                                                     << config->gridDimZ << ")");
+   if (conn == nullptr ||
+       rpc_write_start_request(conn, RPC_cuLaunchKernelEx) < 0 ||
+       rpc_write_launch_config(conn, config) < 0 ||
+       rpc_write(conn, &f, sizeof(f)) < 0 ||
+       rpc_write(conn, &launch_context, sizeof(launch_context)) < 0 ||
++      rpc_write(conn, &packed_launch, sizeof(packed_launch)) < 0 ||
+       rpc_write(conn, &layout.count, sizeof(layout.count)) < 0 ||
+       rpc_write(conn, &payload_size, sizeof(payload_size)) < 0 ||
+       rpc_write_kernel_param_values(conn, layout.count, layout.sizes.data(),
+diff --git a/manual_server.cpp b/manual_server.cpp
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -2148,6 +2148,7 @@ int handle_manual_cuLaunchKernelEx(conn_t *conn) {
+   CUlaunchConfig config = {};
+   CUfunction f = nullptr;
+   CUcontext ctx = nullptr;
++  bool packed_launch = false;
+   uint32_t param_count = 0;
+   size_t payload_size = 0;
+   int request_id;
+@@ -2157,7 +2158,57 @@ int handle_manual_cuLaunchKernelEx(conn_t *conn) {
+   if (rpc_read_launch_config(conn, &config, &attributes) < 0 ||
+       rpc_read(conn, &f, sizeof(f)) < 0 ||
+       rpc_read(conn, &ctx, sizeof(ctx)) < 0 ||
+-      rpc_read(conn, &param_count, sizeof(param_count)) < 0 ||
++      rpc_read(conn, &packed_launch, sizeof(packed_launch)) < 0) {
++    return -1;
++  }
++
++  if (packed_launch) {
++    size_t packed_size = 0;
++    if (rpc_read(conn, &packed_size, sizeof(packed_size)) < 0 ||
++        packed_size > (1ULL << 30)) {
++      return -1;
++    }
++    std::vector<unsigned char> packed(packed_size);
++    if (rpc_read(conn, packed.data(), packed.size()) < 0) {
++      return -1;
++    }
++    request_id = rpc_read_end(conn);
++    if (request_id < 0) {
++      return -1;
++    }
++#if CUDA_VERSION < 11080
++    result = CUDA_ERROR_NOT_SUPPORTED;
++#else
++    if (ctx != nullptr) {
++      CUcontext previous = nullptr;
++      result = cuCtxGetCurrent(&previous);
++      if (result == CUDA_SUCCESS && previous != ctx) {
++        result = cuCtxSetCurrent(ctx);
++      }
++    } else {
++      result = CUDA_SUCCESS;
++    }
++    if (result == CUDA_SUCCESS) {
++      void *extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, packed.data(),
++                       CU_LAUNCH_PARAM_BUFFER_SIZE, &packed_size,
++                       CU_LAUNCH_PARAM_END};
++      result = cuLaunchKernelEx(&config, f, nullptr, extra);
++      LUPINE_TRACE_LOG("LUPINE server raw packed cuLaunchKernelEx bytes="
++                       << packed_size << " attrs=" << config.numAttrs
++                       << " result=" << result);
++    }
++#endif
++    if (config.numAttrs != 0) {
++      if (rpc_write_start_response(conn, request_id) < 0 ||
++          rpc_write(conn, &result, sizeof(result)) < 0 ||
++          rpc_write_end(conn) < 0) {
++        return -1;
++      }
++    }
++    return 0;
++  }
++
++  if (rpc_read(conn, &param_count, sizeof(param_count)) < 0 ||
+       rpc_read(conn, &payload_size, sizeof(payload_size)) < 0) {
+     return -1;
+   }
+diff --git a/h2.cpp b/h2.cpp
+--- a/h2.cpp
++++ b/h2.cpp
+@@ -421,11 +421,11 @@ constexpr char kLupineCompressHeader[] = "x-lupine-compress";
+ constexpr char kLupineCompressLz4[] = "lz4";
+ constexpr char kLupineCudaVersionHeader[] = "x-lupine-cuda-version";
+ constexpr char kLupineProtocolHeader[] = "x-lupine-protocol";
+-constexpr char kLupineProtocolVersion[] = "1";
++constexpr char kLupineProtocolVersion[] = "2";
+ #ifdef LUPINE_H2_PROTOCOL_MISMATCH_TEST
+ constexpr char kLupineClientProtocolVersion[] = "mismatch-test";
+ #else
+-constexpr char kLupineClientProtocolVersion[] = "1";
++constexpr char kLupineClientProtocolVersion[] = "2";
+ #endif
+ constexpr char kLupineSessionHeader[] = "x-lupine-session";
+ #ifdef LUPINE_CUDA_VERSION

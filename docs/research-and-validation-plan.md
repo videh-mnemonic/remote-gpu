@@ -1,6 +1,7 @@
 # Remote PyTorch on ws-5090-1: research and validation plan
 
-Status: initial bake-off executed; see `docs/compatibility.md`
+Status: initial bake-off, optimization, and first upstream-breadth pass executed;
+see `docs/compatibility.md` and `docs/north-star.md`
 
 Research date: 2026-08-19
 
@@ -15,13 +16,12 @@ GPU server: `ws-5090-1` (`10.77.77.1`)
 
 ## Executive recommendation (revised)
 
-Do not choose or modify a remoting implementation yet. First run a controlled
-bake-off of every plausibly viable open-source CUDA remoting project on these
-two workstations. Start with [LUPINE](https://github.com/lupinemachines/lupine),
-then Cricket, then GVirtuS if it can be made to build against a compatible CUDA
-stack without a rewrite. Record older or inaccessible projects as screened out
-with evidence instead of spending GPU time on software that cannot reach a
-PyTorch smoke test.
+The controlled OSS bake-off selected LUPINE v1 as the only current-PyTorch
+starting point, and a private latency patch brought resident compute close to
+native. Functionality now takes priority: close pinned-host memory,
+`torch.linalg.lu_factor`, and NCCL gaps, while continuing upstream PyTorch and
+real-training coverage. The exact mixed local/remote target and acceptance
+gates are maintained in `docs/north-star.md`.
 
 The primary workload is a pinned, single-GPU adaptation of
 [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt). Each viable
@@ -156,13 +156,13 @@ This is a private repository. Public dependencies and benchmark repositories
 must be cloned locally; they must never be forked on GitHub or pushed to their
 public upstreams.
 
-- Clone public repositories beneath an ignored `external/` directory.
+- Clone public repositories beneath an ignored `dev/external/` directory.
 - Immediately disable pushing in each clone by setting its push URL to an
   intentionally invalid local value. Never run `gh repo fork`.
 - Record upstream URL, exact commit, retrieval date, license, build profile,
-  and content checksum in `manifests/upstreams.lock`.
+  and content checksum in `dev/manifests/upstreams.lock`.
 - Keep local experiments in unpushed branches or detached worktrees. Store any
-  changes we need as patch files under `patches/<project>/` in this private
+  changes we need as patch files under `dev/patches/<project>/` in this private
   repository, with the upstream commit they apply to.
 - Do not add nested public `.git` directories, downloaded datasets, container
   layers, or bulky traces to this repository. Add ignore rules before cloning.
@@ -270,40 +270,24 @@ with a session ID, and prints the actual remote GPU UUID. It must detect that
 the shim loaded; accidental use of ws-5090-2's local `libcuda` is a test
 failure.
 
-### Proposed repository shape
+### Implemented repository shape
 
 ```text
 README.md
 docs/
-  research-and-validation-plan.md
-  compatibility.md
-  operations.md
-config/
-  hosts.example.yaml
-manifests/
-  upstreams.lock
-patches/
-  lupine/
-  cricket/
-  gvirtus/
-containers/
-  common-pytorch/
-  candidates/
-deploy/
-  systemd/
-bin/
-  rgpu
-tests/
-  smoke/
-  compatibility/
-  microbench/
-  workloads/
-benchmarks/
-  schema.json
-  compare.py
-results/
-  README.md
-external/                 # gitignored local public clones; never pushed
+lupine/                       # canonical integrated transport source
+rgpu-client/                  # Python CLI, interposers, client packaging
+rgpu-host/                    # GPU-host server packaging
+dev/
+  tools/
+  tests/
+  containers/
+  patches/
+  manifests/
+  config/
+  benchmarks/
+  results/
+  external/                   # gitignored public clones; never pushed
 ```
 
 Keep orchestration, tests, patch files, manifests, and small result summaries
@@ -325,7 +309,7 @@ shard, or TorchBench model trial may run for 5 min or longer.
 | Individual microbenchmark group | ≤ 2 min after warm-up. |
 | PyTorch test shard or TorchBench model | ≤ 4 min; split or reduce selectors if it exceeds the cap. |
 | Candidate build/setup | 45 min CPU-wall budget; legacy compatibility investigation gets 30 min before exclusion. |
-| Full first-pass bake-off | Target 4–6 h; stop new work at 8 h and publish partial results/blockers. |
+| Full first-pass bake-off | Target 4–6 h; stop new work at 8 h and publish partial dev/results/blockers. |
 
 Use a fast funnel:
 
@@ -385,7 +369,7 @@ comparator to answer the user's practical question and expose host variance.
 - Measure direct-link RTT, loss, TCP throughput in both directions, and CPU
   cost. Confirm traffic routes over `eno2`, not Wi-Fi, Tailscale, or another
   interface.
-- Create ignore rules, `manifests/upstreams.lock`, result schema, and scripts
+- Create ignore rules, `dev/manifests/upstreams.lock`, result schema, and scripts
   that disable push URLs before cloning any public repository locally.
 - Pin one common Python/PyTorch/CUDA profile supported natively by both RTX
   5090s. Do not change it per candidate unless incompatibility is itself the
@@ -694,9 +678,10 @@ Decision points:
   tests before broader exposure.
 - **Fairness:** no preemption, MIG, or simultaneous tenancy in the first release.
   The lease guard protects other users by refusing work, not by evicting them.
-- **No automatic two-GPU aggregation:** making both 5090s appear as one faster
-  device is not part of this goal. Cross-host distributed training is a
-  separate NCCL/network project.
+- **No single-device memory aggregation:** the two 5090 memories will not be
+  fused into one larger CUDA allocation. The north star does include standard
+  multi-device PyTorch jobs split across local and remote GPUs, first through
+  DDP/FSDP workers and later through same-process virtual device routing.
 - **No universal near-zero overhead claim:** large transfers and serialized
   fine-grained calls are physically constrained by 10 GbE and RTT.
 

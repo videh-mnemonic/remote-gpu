@@ -1,0 +1,111 @@
+diff --git a/nvml_client.cpp b/nvml_client.cpp
+index b551aa9..7c64018 100644
+--- a/nvml_client.cpp
++++ b/nvml_client.cpp
+@@ -914,13 +914,58 @@ extern "C" const char *nvmlErrorString(nvmlReturn_t result) {
+   }
+ }
+ 
++extern "C" nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v2(
++    nvmlDevice_t, unsigned int *, nvmlProcessInfo_t *);
++extern "C" nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses_v2(
++    nvmlDevice_t, unsigned int *, nvmlProcessInfo_t *);
++extern "C" nvmlReturn_t nvmlDeviceGetMPSComputeRunningProcesses_v2(
++    nvmlDevice_t, unsigned int *, nvmlProcessInfo_t *);
++
++static void install_process_export_entries(std::uintptr_t *table,
++                                           std::size_t words) {
++  // R610's 0x948-byte table uses these three slots for the compute, graphics,
++  // and MPS running-process variants. Redirect them through the public shim so
++  // synthetic remote handles are translated instead of reaching physical NVML.
++  if (words <= 215 || table[0] != 0x948) {
++    return;
++  }
++  table[213] = reinterpret_cast<std::uintptr_t>(
++      nvmlDeviceGetComputeRunningProcesses_v2);
++  table[214] = reinterpret_cast<std::uintptr_t>(
++      nvmlDeviceGetGraphicsRunningProcesses_v2);
++  table[215] = reinterpret_cast<std::uintptr_t>(
++      nvmlDeviceGetMPSComputeRunningProcesses_v2);
++}
++
+ extern "C" nvmlReturn_t nvmlInternalGetExportTable(const void **ppExportTable,
+                                                    const void *exportTableId) {
+   if (ppExportTable == nullptr || exportTableId == nullptr) {
+     return NVML_ERROR_INVALID_ARGUMENT;
+   }
++  // nvidia-smi uses this undocumented table for process-display helpers. On a
++  // mixed host those helpers are already available in the physical NVML and
++  // are process-local utilities, so preserve the driver-matched table instead
++  // of pretending that a blank table implements it.
++  using local_fn_t = nvmlReturn_t (*)(const void **, const void *);
++  auto local_fn =
++      local_nvml_function<local_fn_t>("nvmlInternalGetExportTable");
++  if (local_fn != nullptr) {
++    nvmlReturn_t result = local_fn(ppExportTable, exportTableId);
++    if (result == NVML_SUCCESS && *ppExportTable != nullptr) {
++      const auto *physical =
++          static_cast<const std::uintptr_t *>(*ppExportTable);
++      static std::uintptr_t mixed_table[0x948 / sizeof(std::uintptr_t)];
++      if (physical[0] == sizeof(mixed_table)) {
++        std::memcpy(mixed_table, physical, sizeof(mixed_table));
++        install_process_export_entries(
++            mixed_table, sizeof(mixed_table) / sizeof(mixed_table[0]));
++        *ppExportTable = mixed_table;
++      }
++    }
++    return result;
++  }
+   // The one table ID nvidia-smi asks for; this shim proxies none of the
+-  // internal entry points it holds, so the table stays empty.
++  // internal entry points it holds in remote-only mode.
+   static const unsigned char known_export_table_id[16] = {
+       0xc4, 0xfe, 0x3e, 0x6c, 0xc9, 0x8f, 0x6c, 0x4e,
+       0xa3, 0x27, 0xee, 0x69, 0x6e, 0x12, 0xf7, 0xc4};
+@@ -929,7 +974,12 @@ extern "C" nvmlReturn_t nvmlInternalGetExportTable(const void **ppExportTable,
+     *ppExportTable = nullptr;
+     return NVML_ERROR_INVALID_ARGUMENT;
+   }
+-  static void *empty_table[512] = {};
++  // The first word is the byte size of this driver-generation-specific table.
++  // Returning an all-zero blob makes nvidia-smi interpret the table as an
++  // uninitialized provider instead of falling back to public NVML APIs.
++  static std::uintptr_t empty_table[0x948 / sizeof(std::uintptr_t)] = {0x948};
++  install_process_export_entries(
++      empty_table, sizeof(empty_table) / sizeof(empty_table[0]));
+   *ppExportTable = empty_table;
+   return NVML_SUCCESS;
+ }
+@@ -1187,6 +1237,11 @@ extern "C" nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v2(
+                         infoCount, infos);
+ }
+ 
++extern "C" nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v3(
++    nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
++  return nvmlDeviceGetComputeRunningProcesses_v2(device, infoCount, infos);
++}
++
+ extern "C" nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses(
+     nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
+   return call_processes(RPC_nvmlDeviceGetGraphicsRunningProcesses, device,
+@@ -1199,6 +1254,11 @@ extern "C" nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses_v2(
+                         infoCount, infos);
+ }
+ 
++extern "C" nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses_v3(
++    nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
++  return nvmlDeviceGetGraphicsRunningProcesses_v2(device, infoCount, infos);
++}
++
+ extern "C" nvmlReturn_t nvmlDeviceGetMPSComputeRunningProcesses(
+     nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
+   return call_processes(RPC_nvmlDeviceGetMPSComputeRunningProcesses, device,
+@@ -1210,3 +1270,8 @@ extern "C" nvmlReturn_t nvmlDeviceGetMPSComputeRunningProcesses_v2(
+   return call_processes(RPC_nvmlDeviceGetMPSComputeRunningProcesses_v2, device,
+                         infoCount, infos);
+ }
++
++extern "C" nvmlReturn_t nvmlDeviceGetMPSComputeRunningProcesses_v3(
++    nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
++  return nvmlDeviceGetMPSComputeRunningProcesses_v2(device, infoCount, infos);
++}

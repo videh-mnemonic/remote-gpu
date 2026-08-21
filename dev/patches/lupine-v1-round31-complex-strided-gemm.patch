@@ -1,0 +1,54 @@
+--- a/lupine_cublas.h
++++ b/lupine_cublas.h
+@@ -135,6 +135,7 @@ enum lupine_cublas_opcode : uint32_t {
+   LUPINE_CUBLAS_DSWAP = 136,
+   LUPINE_CUBLAS_IDAMAX = 137,
+   LUPINE_CUBLAS_IDAMIN = 138,
++  LUPINE_CUBLAS_CGEMM_STRIDED_BATCHED = 139,
+ };
+ 
+ struct lupine_cublas_request {
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -3925,6 +3925,7 @@ int handle_manual_lupineCublasCall(conn_t *conn) {
+       request.opcode == LUPINE_CUBLAS_GEMM_EX ||
+       request.opcode == LUPINE_CUBLAS_SGEMM_EX ||
+       request.opcode == LUPINE_CUBLAS_GEMM_STRIDED_BATCHED_EX ||
++      request.opcode == LUPINE_CUBLAS_CGEMM_STRIDED_BATCHED ||
+       request.opcode == LUPINE_CUBLAS_ZGEMM_STRIDED_BATCHED ||
+       request.opcode == LUPINE_CUBLAS_SGETRS_BATCHED ||
+       request.opcode == LUPINE_CUBLAS_SDOT ||
+@@ -5962,6 +5963,33 @@ int handle_manual_lupineCublasCall(conn_t *conn) {
+                    request.ldc, request.stride_c, request.batch_count);
+     break;
+   }
++  case LUPINE_CUBLAS_CGEMM_STRIDED_BATCHED: {
++    using function = int (*)(void *, int, int, int, int, int, const void *,
++                             const void *, int, int64_t, const void *, int,
++                             int64_t, const void *, void *, int, int64_t, int);
++    auto call = reinterpret_cast<function>(
++        symbol("cublasCgemmStridedBatched"));
++    alignas(16) unsigned char aligned_alpha[16] = {};
++    alignas(16) unsigned char aligned_beta[16] = {};
++    memcpy(aligned_alpha, request.alpha_data, sizeof(aligned_alpha));
++    memcpy(aligned_beta, request.beta_data, sizeof(aligned_beta));
++    const void *alpha = request.pointer_mode == 0
++                            ? static_cast<const void *>(aligned_alpha)
++                            : reinterpret_cast<const void *>(request.d);
++    const void *beta = request.pointer_mode == 0
++                           ? static_cast<const void *>(aligned_beta)
++                           : reinterpret_cast<const void *>(request.workspace);
++    response.status =
++        call == nullptr
++            ? 13
++            : call(handle, request.transa, request.transb, request.m, request.n,
++                   request.k, alpha, reinterpret_cast<const void *>(request.a),
++                   request.lda, request.stride_a,
++                   reinterpret_cast<const void *>(request.b), request.ldb,
++                   request.stride_b, beta, reinterpret_cast<void *>(request.c),
++                   request.ldc, request.stride_c, request.batch_count);
++    break;
++  }
+   case LUPINE_CUBLAS_LT_MATMUL_DESC_CREATE: {
+     using function = int (*)(void **, int, int);
+     auto call = reinterpret_cast<function>(lt_symbol("cublasLtMatmulDescCreate"));

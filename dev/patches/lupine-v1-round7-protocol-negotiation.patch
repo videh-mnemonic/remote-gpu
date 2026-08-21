@@ -1,0 +1,194 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -220,6 +220,13 @@
+     target_link_libraries(h2_unknown_cuda_version_test PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 pthread)
+     lupine_apply_sanitizer(h2_unknown_cuda_version_test)
+ 
++    add_executable(h2_protocol_mismatch_test ${H2_TEST_SOURCES})
++    target_compile_definitions(h2_protocol_mismatch_test PRIVATE
++        LUPINE_H2_PROTOCOL_MISMATCH_TEST
++    )
++    target_link_libraries(h2_protocol_mismatch_test PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 pthread)
++    lupine_apply_sanitizer(h2_protocol_mismatch_test)
++
+     enable_testing()
+     add_test(NAME h2_test COMMAND h2_test)
+     lupine_scaled_timeout(h2_timeout 30)
+@@ -227,6 +234,8 @@
+     add_test(NAME h2_unknown_cuda_version_test COMMAND h2_unknown_cuda_version_test)
+     lupine_scaled_timeout(h2u_timeout 10)
+     set_tests_properties(h2_unknown_cuda_version_test PROPERTIES TIMEOUT ${h2u_timeout})
++    add_test(NAME h2_protocol_mismatch_test COMMAND h2_protocol_mismatch_test)
++    set_tests_properties(h2_protocol_mismatch_test PROPERTIES TIMEOUT ${h2u_timeout})
+ 
+     add_executable(checkpoint_test
+         ${CMAKE_CURRENT_SOURCE_DIR}/checkpoint.cpp
+--- a/h2.cpp
++++ b/h2.cpp
+@@ -66,6 +66,7 @@
+   std::string request_method;
+   std::string request_path;
+   std::string peer_cuda_version;
++  std::string peer_protocol_version;
+   std::string session_id;
+ };
+ 
+@@ -419,6 +420,13 @@
+ constexpr char kLupineCompressHeader[] = "x-lupine-compress";
+ constexpr char kLupineCompressLz4[] = "lz4";
+ constexpr char kLupineCudaVersionHeader[] = "x-lupine-cuda-version";
++constexpr char kLupineProtocolHeader[] = "x-lupine-protocol";
++constexpr char kLupineProtocolVersion[] = "1";
++#ifdef LUPINE_H2_PROTOCOL_MISMATCH_TEST
++constexpr char kLupineClientProtocolVersion[] = "mismatch-test";
++#else
++constexpr char kLupineClientProtocolVersion[] = "1";
++#endif
+ constexpr char kLupineSessionHeader[] = "x-lupine-session";
+ #ifdef LUPINE_CUDA_VERSION
+ constexpr char kLupineCudaVersion[] = LUPINE_CUDA_VERSION;
+@@ -434,8 +442,10 @@
+   return lupine_trace_stream() != nullptr;
+ }
+ 
+-int h2_submit_server_response(h2_transport *transport, bool end_stream) {
+-  std::vector<nghttp2_nv> headers = {h2_nv(":status", "200")};
++int h2_submit_server_response(h2_transport *transport, const char *status,
++                              bool end_stream) {
++  std::vector<nghttp2_nv> headers = {h2_nv(":status", status)};
++  headers.push_back(h2_nv(kLupineProtocolHeader, kLupineProtocolVersion));
+   if (kLupineCudaVersion[0] != '\0') {
+     headers.push_back(h2_nv(kLupineCudaVersionHeader, kLupineCudaVersion));
+   }
+@@ -476,10 +486,15 @@
+       frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
+     transport->stream_id = frame->hd.stream_id;
+     transport->request_received = true;
+-    transport->request_handled =
+-        transport->request_method == "HEAD" && transport->request_path == "/";
++    const bool is_probe = transport->request_method == "HEAD" &&
++                          transport->request_path == "/";
++    const bool protocol_compatible =
++        transport->peer_protocol_version == kLupineProtocolVersion;
++    transport->request_handled = is_probe || !protocol_compatible;
+     if (!transport->response_sent &&
+-        h2_submit_server_response(transport, transport->request_handled) < 0) {
++        h2_submit_server_response(transport,
++                                  protocol_compatible ? "200" : "426",
++                                  transport->request_handled) < 0) {
+       return NGHTTP2_ERR_CALLBACK_FAILURE;
+     }
+   } else if (!transport->server && frame->hd.type == NGHTTP2_HEADERS &&
+@@ -524,6 +539,10 @@
+                  memcmp(name, kLupineSessionHeader, namelen) == 0) {
+         transport->session_id.assign(reinterpret_cast<const char *>(value),
+                                      valuelen);
++      } else if (namelen == strlen(kLupineProtocolHeader) &&
++                 memcmp(name, kLupineProtocolHeader, namelen) == 0) {
++        transport->peer_protocol_version.assign(
++            reinterpret_cast<const char *>(value), valuelen);
+       }
+     }
+     return 0;
+@@ -537,6 +556,12 @@
+                                         valuelen);
+     return 0;
+   }
++  if (namelen == strlen(kLupineProtocolHeader) &&
++      memcmp(name, kLupineProtocolHeader, namelen) == 0) {
++    transport->peer_protocol_version.assign(
++        reinterpret_cast<const char *>(value), valuelen);
++    return 0;
++  }
+   if (namelen != 7 || memcmp(name, ":status", namelen) != 0) {
+     return 0;
+   }
+@@ -714,6 +739,7 @@
+         h2_nv(":scheme", "http"),
+         h2_nv(":path", "/"),
+         h2_nv(":authority", "lupine"),
++        h2_nv(kLupineProtocolHeader, kLupineClientProtocolVersion),
+     };
+     if (!probe) {
+       headers.push_back(h2_nv(kLupineCompressHeader, kLupineCompressLz4));
+@@ -910,7 +936,27 @@
+ }
+ 
+ int rpc_http2_client_init(conn_t *conn) {
+-  return h2_init_direct(conn, false, false);
++  if (h2_init_direct(conn, false, false) < 0) {
++    return -1;
++  }
++  auto *transport = static_cast<h2_transport *>(conn->http2);
++  while (!transport->response_received && !transport->transport_failed) {
++    size_t direct_bytes = 0;
++    if (h2_read_from_net(transport, nullptr, 0, &direct_bytes) < 0) {
++      return -1;
++    }
++  }
++  if (!transport->response_received || transport->response_status != 200 ||
++      transport->peer_protocol_version != kLupineClientProtocolVersion) {
++    LUPINE_LOG_ERROR("LUPINE protocol negotiation failed (client "
++                     << kLupineClientProtocolVersion << ", server "
++                     << (transport->peer_protocol_version.empty()
++                             ? "missing"
++                             : transport->peer_protocol_version)
++                     << ", HTTP status " << transport->response_status << ")");
++    return -1;
++  }
++  return 0;
+ }
+ 
+ const char *rpc_http2_client_probe(conn_t *conn) {
+--- a/h2_test.cpp
++++ b/h2_test.cpp
+@@ -56,8 +56,13 @@
+ h2_pair make_pair() {
+   h2_pair pair;
+   init_pair_sockets(&pair);
+-  require(rpc_http2_client_init(&pair.client) == 0, "client h2 init failed");
+-  require(rpc_http2_server_init(&pair.server) == 0, "server h2 init failed");
++  int client_result = -1;
++  std::thread client_init(
++      [&] { client_result = rpc_http2_client_init(&pair.client); });
++  int server_result = rpc_http2_server_init(&pair.server);
++  client_init.join();
++  require(client_result == 0, "client h2 init failed");
++  require(server_result == 0, "server h2 init failed");
+   return pair;
+ }
+ 
+@@ -227,6 +232,22 @@
+ #endif
+ }
+ 
++void test_protocol_mismatch_is_rejected() {
++  h2_pair pair;
++  init_pair_sockets(&pair);
++
++  int client_result = 0;
++  std::thread client_init(
++      [&] { client_result = rpc_http2_client_init(&pair.client); });
++  int server_result = rpc_http2_server_init(&pair.server);
++  client_init.join();
++
++  require(client_result < 0,
++          "client accepted an incompatible protocol version");
++  require(server_result > 0,
++          "server did not terminate the incompatible request");
++}
++
+ void test_fragmented_iovec() {
+   h2_pair pair = make_pair();
+   std::vector<std::string> chunks = {"alpha", "", ":", "beta", ":gamma"};
+@@ -844,7 +865,9 @@
+ } // namespace
+ 
+ int main() {
+-#ifdef LUPINE_H2_UNKNOWN_CUDA_VERSION_TEST
++#ifdef LUPINE_H2_PROTOCOL_MISMATCH_TEST
++  test_protocol_mismatch_is_rejected();
++#elif defined(LUPINE_H2_UNKNOWN_CUDA_VERSION_TEST)
+   test_head_probe_cuda_version_metadata();
+ #else
+   test_rpc_write_queue_grows();

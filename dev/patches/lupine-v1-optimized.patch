@@ -1,0 +1,1149 @@
+diff --git a/client.cpp b/client.cpp
+index a4711bc..0f48df8 100644
+--- a/client.cpp
++++ b/client.cpp
+@@ -276,6 +276,17 @@ struct lupine_kernel_attribute_key {
+   }
+ };
+ 
++struct lupine_function_attribute_key {
++  int route_id = -2;
++  CUfunction function = nullptr;
++  int attribute = 0;
++
++  bool operator==(const lupine_function_attribute_key &other) const {
++    return route_id == other.route_id && function == other.function &&
++           attribute == other.attribute;
++  }
++};
++
+ struct lupine_kernel_attribute_key_hash {
+   size_t operator()(const lupine_kernel_attribute_key &key) const {
+     size_t hash = std::hash<int>{}(key.route_id);
+@@ -289,6 +300,18 @@ struct lupine_kernel_attribute_key_hash {
+   }
+ };
+ 
++struct lupine_function_attribute_key_hash {
++  size_t operator()(const lupine_function_attribute_key &key) const {
++    size_t hash = std::hash<int>{}(key.route_id);
++    hash ^= std::hash<uintptr_t>{}(
++                reinterpret_cast<uintptr_t>(key.function)) +
++            0x9e3779b9 + (hash << 6) + (hash >> 2);
++    hash ^= std::hash<int>{}(key.attribute) + 0x9e3779b9 + (hash << 6) +
++            (hash >> 2);
++    return hash;
++  }
++};
++
+ struct lupine_param_info_key {
+   uintptr_t handle = 0;
+   size_t index = 0;
+@@ -458,6 +481,47 @@ lupine_kernel_attribute_cache() {
+   return *cache;
+ }
+ 
++static std::unordered_map<lupine_function_attribute_key, int,
++                          lupine_function_attribute_key_hash> &
++lupine_function_attribute_cache() {
++  static auto *cache = new std::unordered_map<lupine_function_attribute_key,
++                                              int,
++                                              lupine_function_attribute_key_hash>();
++  return *cache;
++}
++
++static std::mutex &lupine_function_attribute_cache_mutex() {
++  static auto *mutex = new std::mutex();
++  return *mutex;
++}
++
++extern "C" bool lupine_function_attribute_cache_lookup(
++    int route_id, CUfunction function, CUfunction_attribute attribute,
++    int *value) {
++  if (value == nullptr) {
++    return false;
++  }
++  std::lock_guard<std::mutex> lock(lupine_function_attribute_cache_mutex());
++  auto it = lupine_function_attribute_cache().find(
++      lupine_function_attribute_key{route_id, function,
++                                    static_cast<int>(attribute)});
++  if (it == lupine_function_attribute_cache().end()) {
++    return false;
++  }
++  *value = it->second;
++  return true;
++}
++
++extern "C" void lupine_function_attribute_cache_insert(
++    int route_id, CUfunction function, CUfunction_attribute attribute,
++    int value) {
++  std::lock_guard<std::mutex> lock(lupine_function_attribute_cache_mutex());
++  lupine_function_attribute_cache().insert_or_assign(
++      lupine_function_attribute_key{route_id, function,
++                                    static_cast<int>(attribute)},
++      value);
++}
++
+ static libcuckoo::cuckoohash_map<lupine_param_info_key, lupine_param_info_value,
+                                  lupine_param_info_key_hash> &
+ lupine_param_info_cache() {
+@@ -2334,6 +2398,8 @@ extern "C" CUresult cuKernelGetAttribute(int *pi, CUfunction_attribute attrib,
+ 
+ extern "C" void lupine_invalidate_kernel_attribute_cache() {
+   lupine_kernel_attribute_cache().clear();
++  std::lock_guard<std::mutex> lock(lupine_function_attribute_cache_mutex());
++  lupine_function_attribute_cache().clear();
+ }
+ 
+ extern "C" void lupine_kernel_attribute_cache_erase(int route_id,
+@@ -2343,6 +2409,21 @@ extern "C" void lupine_kernel_attribute_cache_erase(int route_id,
+       lupine_kernel_attribute_key{route_id, kernel, attrib, dev});
+ }
+ 
++extern "C" bool lupine_kernel_attribute_cache_matches(
++    int route_id, CUkernel kernel, int attrib, int dev, int value) {
++  int cached = 0;
++  return lupine_kernel_attribute_cache().find(
++             lupine_kernel_attribute_key{route_id, kernel, attrib, dev},
++             cached) &&
++         cached == value;
++}
++
++extern "C" void lupine_kernel_attribute_cache_store(
++    int route_id, CUkernel kernel, int attrib, int dev, int value) {
++  lupine_kernel_attribute_cache().insert_or_assign(
++      lupine_kernel_attribute_key{route_id, kernel, attrib, dev}, value);
++}
++
+ static CUresult lupine_cuOccupancy_cached(int *numBlocks, CUfunction func,
+                                           int blockSize, size_t dynamicSMemSize,
+                                           unsigned int flags, bool with_flags) {
+@@ -2928,12 +3009,17 @@ static CUresult lupine_error_string_lookup(int rpc_op, const char *symbol,
+     return CUDA_SUCCESS;
+   }
+ 
+-  // Forward every other code to the server's driver. The result is held in a
+-  // per-thread buffer so the returned pointer stays valid until this thread's
+-  // next lookup; a length past any real driver string means a desynced stream.
+-  thread_local std::string name_result;
+-  thread_local std::string description_result;
+-  std::string &result = want_name ? name_result : description_result;
++  // Forward each other code to the server's driver once per thread. CUDA
++  // promises static lifetime for the returned pointer; unordered_map keeps
++  // references and pointers to its elements valid across rehashes.
++  thread_local std::unordered_map<int, std::string> name_results;
++  thread_local std::unordered_map<int, std::string> description_results;
++  auto &results = want_name ? name_results : description_results;
++  auto cached = results.find(static_cast<int>(error));
++  if (cached != results.end()) {
++    *pStr = cached->second.c_str();
++    return CUDA_SUCCESS;
++  }
+ 
+   constexpr uint32_t kMaxLength = 4096;
+   conn_t *conn = lupine_route_remote_conn(route);
+@@ -2953,8 +3039,8 @@ static CUresult lupine_error_string_lookup(int rpc_op, const char *symbol,
+   if (return_value != CUDA_SUCCESS) {
+     return return_value;
+   }
+-  result = std::move(text);
+-  *pStr = result.c_str();
++  auto inserted = results.emplace(static_cast<int>(error), std::move(text));
++  *pStr = inserted.first->second.c_str();
+   return CUDA_SUCCESS;
+ }
+ 
+@@ -3899,17 +3985,15 @@ extern "C" CUresult cuStreamWaitEvent(CUstream hStream, CUevent hEvent,
+                            : real(hStream, hEvent, Flags);
+   }
+   conn_t *conn = lupine_route_remote_conn(route);
+-  CUresult result = CUDA_ERROR_DEVICE_UNAVAILABLE;
+   if (conn == nullptr ||
+       rpc_write_start_request(conn, RPC_cuStreamWaitEvent) < 0 ||
+       rpc_write(conn, &hStream, sizeof(hStream)) < 0 ||
+       rpc_write(conn, &hEvent, sizeof(hEvent)) < 0 ||
+       rpc_write(conn, &Flags, sizeof(Flags)) < 0 ||
+-      rpc_wait_for_response(conn) < 0 ||
+-      rpc_read(conn, &result, sizeof(result)) < 0 || rpc_read_end(conn) < 0) {
++      rpc_write_end_deferred(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+-  return result;
++  return CUDA_SUCCESS;
+ }
+ 
+ #ifdef cuStreamWaitEvent_ptsz
+@@ -3934,7 +4018,7 @@ extern "C" CUresult cuEventRecord(CUevent hEvent, CUstream hStream) {
+   if (conn == nullptr || rpc_write_start_request(conn, RPC_cuEventRecord) < 0 ||
+       rpc_write(conn, &hEvent, sizeof(hEvent)) < 0 ||
+       rpc_write(conn, &hStream, sizeof(hStream)) < 0 ||
+-      rpc_write_end(conn) < 0) {
++      rpc_write_end_deferred(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   return CUDA_SUCCESS;
+@@ -3964,7 +4048,8 @@ extern "C" CUresult cuEventRecordWithFlags(CUevent hEvent, CUstream hStream,
+       rpc_write_start_request(conn, RPC_cuEventRecordWithFlags) < 0 ||
+       rpc_write(conn, &hEvent, sizeof(hEvent)) < 0 ||
+       rpc_write(conn, &hStream, sizeof(hStream)) < 0 ||
+-      rpc_write(conn, &flags, sizeof(flags)) < 0 || rpc_write_end(conn) < 0) {
++      rpc_write(conn, &flags, sizeof(flags)) < 0 ||
++      rpc_write_end_deferred(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   return CUDA_SUCCESS;
+@@ -4526,6 +4611,8 @@ extern "C" void lupine_invalidate_function_caches() {
+   lupine_kernel_function_cache().clear();
+   lupine_occupancy_cache().clear();
+   lupine_kernel_attribute_cache().clear();
++  std::lock_guard<std::mutex> lock(lupine_function_attribute_cache_mutex());
++  lupine_function_attribute_cache().clear();
+ }
+ 
+ static CUresult lupine_resolve_launch_function_for_route(
+@@ -4674,7 +4761,7 @@ cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
+       rpc_write(conn, &payload_size, sizeof(payload_size)) < 0 ||
+       rpc_write_kernel_param_values(conn, layout.count, layout.sizes.data(),
+                                     rpc_params.data()) < 0 ||
+-      rpc_write_end(conn) < 0) {
++      rpc_write_end_deferred(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   if (sync_after_launch) {
+@@ -4799,7 +4886,7 @@ extern "C" CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   if (fire_and_forget) {
+-    if (rpc_write_end(conn) < 0) {
++    if (rpc_write_end_deferred(conn) < 0) {
+       return CUDA_ERROR_DEVICE_UNAVAILABLE;
+     }
+   } else {
+@@ -5035,7 +5122,7 @@ extern "C" CUresult cuMemcpyDtoHAsync_v2(void *dstHost, CUdeviceptr srcDevice,
+       rpc_write(conn, &srcDevice, sizeof(srcDevice)) < 0 ||
+       rpc_write(conn, &ByteCount, sizeof(ByteCount)) < 0 ||
+       rpc_write(conn, &hStream, sizeof(hStream)) < 0 ||
+-      rpc_write_end(conn) < 0) {
++      rpc_write_end_deferred(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   return CUDA_SUCCESS;
+diff --git a/codegen/codegen.py b/codegen/codegen.py
+index 93d713e..19f2d70 100644
+--- a/codegen/codegen.py
++++ b/codegen/codegen.py
+@@ -821,6 +821,7 @@ def write_client_post_call(f, function: Function, metadata: FunctionAnnotationMe
+         f.write("    if (return_value == CUDA_SUCCESS && dptr != nullptr) lupine_note_deviceptr_allocation_route(*dptr, bytesize, route);\n")
+     if function.name.format() == "cuMemFreeAsync":
+         f.write("    if (return_value == CUDA_SUCCESS) lupine_forget_deviceptr_owner(dptr);\n")
++        f.write("    if (return_value == CUDA_SUCCESS) lupine_invalidate_pointer_attribute_cache();\n")
+     if function.name.format() == "cuStreamDestroy_v2":
+         f.write("    if (return_value == CUDA_SUCCESS) lupine_forget_stream_owner(hStream);\n")
+     # Record the global's size so offset pointers into it route by range.
+@@ -838,10 +839,20 @@ def write_client_post_call(f, function: Function, metadata: FunctionAnnotationMe
+         "cuDevicePrimaryCtxReset_v2",
+     }:
+         f.write("    if (return_value == CUDA_SUCCESS) lupine_invalidate_current_context_cache();\n")
++    if function.name.format() in {
++        "cuCtxDestroy_v2",
++        "cuMemAddressFree",
++        "cuMemMap",
++        "cuMemUnmap",
++        "cuMemSetAccess",
++    }:
++        f.write("    if (return_value == CUDA_SUCCESS) lupine_invalidate_pointer_attribute_cache();\n")
+     if function.name.format() in KERNEL_PARAM_LAYOUT_INVALIDATORS:
+         f.write("    if (return_value == CUDA_SUCCESS) lupine_invalidate_function_caches();\n")
+     if function.name.format() == "cuKernelSetAttribute":
+-        f.write("    if (return_value == CUDA_SUCCESS) lupine_kernel_attribute_cache_erase(lupine_route_identity(route), kernel, (int)attrib, (int)dev);\n")
++        f.write("    if (return_value == CUDA_SUCCESS) lupine_kernel_attribute_cache_store(lupine_route_identity(route), kernel, (int)attrib, (int)dev, val);\n")
++    if function.name.format() == "cuFuncGetAttribute":
++        f.write("    if (return_value == CUDA_SUCCESS) lupine_function_attribute_cache_insert(lupine_route_identity(route), hfunc_rpc, attrib, *pi);\n")
+     if function.name.format() == "cuFuncSetAttribute":
+         f.write("    if (return_value == CUDA_SUCCESS) lupine_invalidate_kernel_attribute_cache();\n")
+     if function.name.format() == "cuModuleGetFunction":
+@@ -1334,8 +1345,13 @@ def main():
+             'extern "C" void lupine_invalidate_current_context_cache();\n'
+             'extern "C" void lupine_forget_destroyed_context(CUcontext ctx);\n'
+             'extern "C" void lupine_invalidate_function_caches();\n'
++            'extern "C" void lupine_invalidate_pointer_attribute_cache();\n'
++            'extern "C" bool lupine_function_attribute_cache_lookup(int route_id, CUfunction function, CUfunction_attribute attribute, int *value);\n'
++            'extern "C" void lupine_function_attribute_cache_insert(int route_id, CUfunction function, CUfunction_attribute attribute, int value);\n'
+             'extern "C" void lupine_invalidate_kernel_attribute_cache();\n'
+             'extern "C" void lupine_kernel_attribute_cache_erase(int route_id, CUkernel kernel, int attrib, int dev);\n'
++            'extern "C" bool lupine_kernel_attribute_cache_matches(int route_id, CUkernel kernel, int attrib, int dev, int value);\n'
++            'extern "C" void lupine_kernel_attribute_cache_store(int route_id, CUkernel kernel, int attrib, int dev, int value);\n'
+             'extern "C" CUresult lupine_flush_dirty_host_pages_to_server();\n\n'
+             'extern "C" int lupine_read_deferred_dtoh_copies(conn_t *conn);\n'
+             'extern "C" int lupine_forward_remote_stdout(conn_t *conn);\n'
+@@ -1446,6 +1462,8 @@ def main():
+                             )
+                         )
+                     )
++                if function.name.format() == "cuKernelSetAttribute":
++                    f.write("    if (lupine_kernel_attribute_cache_matches(lupine_route_identity(route), kernel, (int)attrib, (int)dev, val)) return CUDA_SUCCESS;\n")
+             if metadata.cross_server_copy is not None:
+                 copy = metadata.cross_server_copy
+                 stream_arg = (
+@@ -1514,6 +1532,10 @@ def main():
+                 ):
+                     f.write(operation.client_declaration())
+ 
++            if function.name.format() == "cuFuncGetAttribute":
++                f.write("    if (pi == nullptr) return CUDA_ERROR_INVALID_VALUE;\n")
++                f.write("    if (lupine_function_attribute_cache_lookup(lupine_route_identity(route), hfunc_rpc, attrib, pi)) return CUDA_SUCCESS;\n")
++
+             # compute the strlen's for null-terminated operations.
+             for operation in operations:
+                 if isinstance(operation, NullTerminatedOperation):
+@@ -1557,7 +1579,7 @@ def main():
+                 )
+                 for operation in operations:
+                     write_client_rpc_write(f, operation, metadata)
+-                f.write("        rpc_write_end(conn) < 0) {\n")
++                f.write("        rpc_write_end_deferred(conn) < 0) {\n")
+                 f.write("        return {r};\n".format(r=error_return))
+                 f.write("    }\n")
+                 post_call = io.StringIO()
+diff --git a/codegen/gen_client.cpp b/codegen/gen_client.cpp
+index 2b9ee63..bc6b1a9 100644
+--- a/codegen/gen_client.cpp
++++ b/codegen/gen_client.cpp
+@@ -75,10 +75,21 @@ lupine_cuMemcpyDtoD_via_client(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
+ extern "C" void lupine_invalidate_current_context_cache();
+ extern "C" void lupine_forget_destroyed_context(CUcontext ctx);
+ extern "C" void lupine_invalidate_function_caches();
++extern "C" void lupine_invalidate_pointer_attribute_cache();
++extern "C" bool lupine_function_attribute_cache_lookup(
++    int route_id, CUfunction function, CUfunction_attribute attribute,
++    int *value);
++extern "C" void lupine_function_attribute_cache_insert(
++    int route_id, CUfunction function, CUfunction_attribute attribute,
++    int value);
+ extern "C" void lupine_invalidate_kernel_attribute_cache();
+ extern "C" void lupine_kernel_attribute_cache_erase(int route_id,
+                                                     CUkernel kernel, int attrib,
+                                                     int dev);
++extern "C" bool lupine_kernel_attribute_cache_matches(
++    int route_id, CUkernel kernel, int attrib, int dev, int value);
++extern "C" void lupine_kernel_attribute_cache_store(
++    int route_id, CUkernel kernel, int attrib, int dev, int value);
+ extern "C" CUresult lupine_flush_dirty_host_pages_to_server();
+ 
+ extern "C" int lupine_read_deferred_dtoh_copies(conn_t *conn);
+@@ -100,6 +111,19 @@ CUresult cuDriverGetVersion(int *driverVersion) {
+     }
+     return return_value;
+   }
++  static thread_local std::unordered_map<int, int> remote_version_cache;
++  int route_id = lupine_route_identity(route);
++  auto cached = remote_version_cache.find(route_id);
++  if (cached != remote_version_cache.end()) {
++    if (driverVersion == nullptr) {
++      return CUDA_ERROR_INVALID_VALUE;
++    }
++    *driverVersion = cached->second;
++    const char *override_version = getenv("LUPINE_DRIVER_VERSION_OVERRIDE");
++    if (override_version != nullptr)
++      *driverVersion = atoi(override_version);
++    return CUDA_SUCCESS;
++  }
+   conn_t *conn = lupine_route_remote_conn(route);
+   if (conn == nullptr ||
+       rpc_write_start_request(conn, RPC_cuDriverGetVersion) < 0 ||
+@@ -109,6 +133,7 @@ CUresult cuDriverGetVersion(int *driverVersion) {
+       rpc_read_end(conn) < 0)
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   if (driverVersion != nullptr) {
++    remote_version_cache.insert_or_assign(route_id, *driverVersion);
+     const char *override_version = getenv("LUPINE_DRIVER_VERSION_OVERRIDE");
+     if (override_version != nullptr)
+       *driverVersion = atoi(override_version);
+@@ -356,6 +381,8 @@ CUresult cuCtxDestroy_v2(CUcontext ctx) {
+       lupine_forget_destroyed_context(ctx);
+     if (return_value == CUDA_SUCCESS)
+       lupine_invalidate_current_context_cache();
++    if (return_value == CUDA_SUCCESS)
++      lupine_invalidate_pointer_attribute_cache();
+     return return_value;
+   }
+   conn_t *conn = lupine_route_remote_conn(route);
+@@ -370,6 +397,8 @@ CUresult cuCtxDestroy_v2(CUcontext ctx) {
+     lupine_forget_destroyed_context(ctx);
+   if (return_value == CUDA_SUCCESS)
+     lupine_invalidate_current_context_cache();
++  if (return_value == CUDA_SUCCESS)
++    lupine_invalidate_pointer_attribute_cache();
+   return return_value;
+ }
+ 
+@@ -855,7 +884,7 @@ CUresult cuLibraryUnload(CUlibrary library) {
+   if (conn == nullptr ||
+       rpc_write_start_request(conn, RPC_cuLibraryUnload) < 0 ||
+       rpc_write(conn, &library, sizeof(CUlibrary)) < 0 ||
+-      rpc_write_end(conn) < 0) {
++      rpc_write_end_deferred(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   return_value = CUDA_SUCCESS;
+@@ -1004,14 +1033,19 @@ CUresult cuKernelSetAttribute(CUfunction_attribute attrib, int val,
+   lupine_route route = lupine_route_for_device(&dev);
+   if (route.kind == LUPINE_ROUTE_UNKNOWN_DEVICE)
+     return CUDA_ERROR_INVALID_DEVICE;
++  const int route_id = lupine_route_identity(route);
++  if (lupine_kernel_attribute_cache_matches(route_id, kernel, (int)attrib,
++                                            (int)dev, val)) {
++    return CUDA_SUCCESS;
++  }
+   CUresult return_value;
+   using real_fn_t = CUresult (*)(CUfunction_attribute, int, CUkernel, CUdevice);
+   if (lupine_call_local_cuda_if_routed<real_fn_t>(route, "cuKernelSetAttribute",
+                                                   &return_value, attrib, val,
+                                                   kernel, dev)) {
+     if (return_value == CUDA_SUCCESS)
+-      lupine_kernel_attribute_cache_erase(lupine_route_identity(route), kernel,
+-                                          (int)attrib, (int)dev);
++      lupine_kernel_attribute_cache_store(route_id, kernel, (int)attrib,
++                                          (int)dev, val);
+     return return_value;
+   }
+   conn_t *conn = lupine_route_remote_conn(route);
+@@ -1026,8 +1060,8 @@ CUresult cuKernelSetAttribute(CUfunction_attribute attrib, int val,
+       rpc_read_end(conn) < 0)
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   if (return_value == CUDA_SUCCESS)
+-    lupine_kernel_attribute_cache_erase(lupine_route_identity(route), kernel,
+-                                        (int)attrib, (int)dev);
++    lupine_kernel_attribute_cache_store(route_id, kernel, (int)attrib,
++                                        (int)dev, val);
+   return return_value;
+ }
+ 
+@@ -1579,7 +1613,7 @@ CUresult cuMemcpyDtoDAsync_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
+       rpc_write(conn, &srcDevice, sizeof(CUdeviceptr)) < 0 ||
+       rpc_write(conn, &ByteCount, sizeof(size_t)) < 0 ||
+       rpc_write(conn, &hStream, sizeof(CUstream)) < 0 ||
+-      rpc_write_end(conn) < 0) {
++      rpc_write_end_deferred(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   return CUDA_SUCCESS;
+@@ -1741,7 +1775,7 @@ CUresult cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc, size_t N,
+       rpc_write(conn, &uc, sizeof(unsigned char)) < 0 ||
+       rpc_write(conn, &N, sizeof(size_t)) < 0 ||
+       rpc_write(conn, &hStream, sizeof(CUstream)) < 0 ||
+-      rpc_write_end(conn) < 0) {
++      rpc_write_end_deferred(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   return CUDA_SUCCESS;
+@@ -1764,7 +1798,7 @@ CUresult cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short us, size_t N,
+       rpc_write(conn, &us, sizeof(unsigned short)) < 0 ||
+       rpc_write(conn, &N, sizeof(size_t)) < 0 ||
+       rpc_write(conn, &hStream, sizeof(CUstream)) < 0 ||
+-      rpc_write_end(conn) < 0) {
++      rpc_write_end_deferred(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   return CUDA_SUCCESS;
+@@ -1787,7 +1821,7 @@ CUresult cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui, size_t N,
+       rpc_write(conn, &ui, sizeof(unsigned int)) < 0 ||
+       rpc_write(conn, &N, sizeof(size_t)) < 0 ||
+       rpc_write(conn, &hStream, sizeof(CUstream)) < 0 ||
+-      rpc_write_end(conn) < 0) {
++      rpc_write_end_deferred(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   return CUDA_SUCCESS;
+@@ -1814,7 +1848,7 @@ CUresult cuMemsetD2D8Async(CUdeviceptr dstDevice, size_t dstPitch,
+       rpc_write(conn, &Width, sizeof(size_t)) < 0 ||
+       rpc_write(conn, &Height, sizeof(size_t)) < 0 ||
+       rpc_write(conn, &hStream, sizeof(CUstream)) < 0 ||
+-      rpc_write_end(conn) < 0) {
++      rpc_write_end_deferred(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   return CUDA_SUCCESS;
+@@ -1841,7 +1875,7 @@ CUresult cuMemsetD2D16Async(CUdeviceptr dstDevice, size_t dstPitch,
+       rpc_write(conn, &Width, sizeof(size_t)) < 0 ||
+       rpc_write(conn, &Height, sizeof(size_t)) < 0 ||
+       rpc_write(conn, &hStream, sizeof(CUstream)) < 0 ||
+-      rpc_write_end(conn) < 0) {
++      rpc_write_end_deferred(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   return CUDA_SUCCESS;
+@@ -1868,7 +1902,7 @@ CUresult cuMemsetD2D32Async(CUdeviceptr dstDevice, size_t dstPitch,
+       rpc_write(conn, &Width, sizeof(size_t)) < 0 ||
+       rpc_write(conn, &Height, sizeof(size_t)) < 0 ||
+       rpc_write(conn, &hStream, sizeof(CUstream)) < 0 ||
+-      rpc_write_end(conn) < 0) {
++      rpc_write_end_deferred(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   return CUDA_SUCCESS;
+@@ -2229,6 +2263,8 @@ CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
+   using real_fn_t = CUresult (*)(CUdeviceptr, size_t);
+   if (lupine_call_local_cuda_if_routed<real_fn_t>(route, "cuMemAddressFree",
+                                                   &return_value, ptr, size)) {
++    if (return_value == CUDA_SUCCESS)
++      lupine_invalidate_pointer_attribute_cache();
+     return return_value;
+   }
+   conn_t *conn = lupine_route_remote_conn(route);
+@@ -2240,6 +2276,8 @@ CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
+       rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+       rpc_read_end(conn) < 0)
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
++  if (return_value == CUDA_SUCCESS)
++    lupine_invalidate_pointer_attribute_cache();
+   return return_value;
+ }
+ 
+@@ -2296,6 +2334,8 @@ CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
+                    unsigned long long);
+   if (lupine_call_local_cuda_if_routed<real_fn_t>(
+           route, "cuMemMap", &return_value, ptr, size, offset, handle, flags)) {
++    if (return_value == CUDA_SUCCESS)
++      lupine_invalidate_pointer_attribute_cache();
+     return return_value;
+   }
+   conn_t *conn = lupine_route_remote_conn(route);
+@@ -2309,6 +2349,8 @@ CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
+       rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+       rpc_read_end(conn) < 0)
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
++  if (return_value == CUDA_SUCCESS)
++    lupine_invalidate_pointer_attribute_cache();
+   return return_value;
+ }
+ 
+@@ -2343,6 +2385,8 @@ CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) {
+   using real_fn_t = CUresult (*)(CUdeviceptr, size_t);
+   if (lupine_call_local_cuda_if_routed<real_fn_t>(route, "cuMemUnmap",
+                                                   &return_value, ptr, size)) {
++    if (return_value == CUDA_SUCCESS)
++      lupine_invalidate_pointer_attribute_cache();
+     return return_value;
+   }
+   conn_t *conn = lupine_route_remote_conn(route);
+@@ -2353,6 +2397,8 @@ CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) {
+       rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+       rpc_read_end(conn) < 0)
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
++  if (return_value == CUDA_SUCCESS)
++    lupine_invalidate_pointer_attribute_cache();
+   return return_value;
+ }
+ 
+@@ -2364,6 +2410,8 @@ CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size,
+       CUresult (*)(CUdeviceptr, size_t, const CUmemAccessDesc *, size_t);
+   if (lupine_call_local_cuda_if_routed<real_fn_t>(
+           route, "cuMemSetAccess", &return_value, ptr, size, desc, count)) {
++    if (return_value == CUDA_SUCCESS)
++      lupine_invalidate_pointer_attribute_cache();
+     return return_value;
+   }
+   conn_t *conn = lupine_route_remote_conn(route);
+@@ -2380,6 +2428,8 @@ CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size,
+       rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+       rpc_read_end(conn) < 0)
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
++  if (return_value == CUDA_SUCCESS)
++    lupine_invalidate_pointer_attribute_cache();
+   return return_value;
+ }
+ 
+@@ -2464,8 +2514,10 @@ CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream) {
+   using real_fn_t = CUresult (*)(CUdeviceptr, CUstream);
+   if (lupine_call_local_cuda_if_routed<real_fn_t>(
+           route, "cuMemFreeAsync", &return_value, dptr, hStream)) {
+-    if (return_value == CUDA_SUCCESS)
++    if (return_value == CUDA_SUCCESS) {
+       lupine_forget_deviceptr_owner(dptr);
++      lupine_invalidate_pointer_attribute_cache();
++    }
+     return return_value;
+   }
+   conn_t *conn = lupine_route_remote_conn(route);
+@@ -2477,8 +2529,10 @@ CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream) {
+       rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+       rpc_read_end(conn) < 0)
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+-  if (return_value == CUDA_SUCCESS)
++  if (return_value == CUDA_SUCCESS) {
+     lupine_forget_deviceptr_owner(dptr);
++    lupine_invalidate_pointer_attribute_cache();
++  }
+   return return_value;
+ }
+ 
+@@ -3558,6 +3612,9 @@ CUresult cuStreamBatchMemOp_v2(CUstream stream, unsigned int count,
+ 
+ CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
+                             CUfunction hfunc) {
++  if (pi == nullptr) {
++    return CUDA_ERROR_INVALID_VALUE;
++  }
+   lupine_route route = lupine_route_for_function(hfunc);
+   CUresult return_value;
+   using real_fn_t = CUresult (*)(int *, CUfunction_attribute, CUfunction);
+@@ -3567,6 +3624,11 @@ CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
+   }
+   conn_t *conn = lupine_route_remote_conn(route);
+   CUfunction hfunc_rpc = lupine_translate_private_function_for_rpc(hfunc);
++  const int route_id = lupine_route_identity(route);
++  if (lupine_function_attribute_cache_lookup(route_id, hfunc_rpc, attrib,
++                                             pi)) {
++    return CUDA_SUCCESS;
++  }
+   if (conn == nullptr ||
+       rpc_write_start_request(conn, RPC_cuFuncGetAttribute) < 0 ||
+       rpc_write(conn, pi, sizeof(int)) < 0 ||
+@@ -3576,6 +3638,9 @@ CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
+       rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+       rpc_read_end(conn) < 0)
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
++  if (return_value == CUDA_SUCCESS) {
++    lupine_function_attribute_cache_insert(route_id, hfunc_rpc, attrib, *pi);
++  }
+   return return_value;
+ }
+ 
+diff --git a/copy_pipeline.cpp b/copy_pipeline.cpp
+index d2fae2c..3cef3f1 100644
+--- a/copy_pipeline.cpp
++++ b/copy_pipeline.cpp
+@@ -103,7 +103,8 @@ extern "C" CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice,
+       (ByteCount != 0 && rpc_write_payload(conn, srcHost, ByteCount) < 0)) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+-  return rpc_write_end(conn) < 0 ? CUDA_ERROR_DEVICE_UNAVAILABLE : CUDA_SUCCESS;
++  return rpc_write_end_deferred(conn) < 0 ? CUDA_ERROR_DEVICE_UNAVAILABLE
++                                          : CUDA_SUCCESS;
+ }
+ 
+ #ifdef cuMemcpyHtoDAsync
+diff --git a/h2_test.cpp b/h2_test.cpp
+index 92e2022..f30e3ef 100644
+--- a/h2_test.cpp
++++ b/h2_test.cpp
+@@ -714,6 +714,79 @@ void test_rpc_write_queue_grows() {
+   require(received == values, "large queue payload mismatch");
+ }
+ 
++void read_raw_rpc_request(conn_t *conn, int *id, uint64_t *lane, int *op,
++                          int *payload) {
++  require(rpc_http2_read(conn, id, sizeof(*id)) ==
++              static_cast<int>(sizeof(*id)),
++          "deferred request id read failed");
++  require(rpc_http2_read(conn, lane, sizeof(*lane)) ==
++              static_cast<int>(sizeof(*lane)),
++          "deferred lane read failed");
++  require(rpc_http2_read(conn, op, sizeof(*op)) ==
++              static_cast<int>(sizeof(*op)),
++          "deferred op read failed");
++  require(rpc_http2_read(conn, payload, sizeof(*payload)) ==
++              static_cast<int>(sizeof(*payload)),
++          "deferred payload read failed");
++}
++
++void test_deferred_rpc_progress_and_ordering() {
++  h2_pair pair = make_pair();
++  exchange_settings(&pair);
++
++  std::array<int, 3> ids{};
++  std::array<uint64_t, 3> lanes{};
++  std::array<int, 3> ops{};
++  std::array<int, 3> payloads{};
++  std::thread reader([&] {
++    for (size_t i = 0; i < ids.size(); ++i) {
++      read_raw_rpc_request(&pair.server, &ids[i], &lanes[i], &ops[i],
++                           &payloads[i]);
++    }
++  });
++
++  for (int i = 0; i < 3; ++i) {
++    int payload = 41 + i;
++    require(rpc_write_start_request(&pair.client, 101 + i) == 0,
++            "deferred request start failed");
++    require(rpc_write(&pair.client, &payload, sizeof(payload)) == 0,
++            "deferred payload write failed");
++    if (i != 2) {
++      require(rpc_write_end_deferred(&pair.client) > 0,
++              "deferred request end failed");
++    } else {
++      // A normal request must flush all earlier deferred bytes before itself.
++      require(rpc_write_end(&pair.client) > 0,
++              "ordering flush request end failed");
++    }
++  }
++  reader.join();
++  require(ops == std::array<int, 3>{101, 102, 103},
++          "deferred request order mismatch");
++  require(payloads == std::array<int, 3>{41, 42, 43},
++          "deferred request payload mismatch");
++
++  // A lone async request must make progress without a later synchronous call.
++  int lone_id = 0;
++  uint64_t lone_lane = 0;
++  int lone_op = 0;
++  int lone_payload = 0;
++  std::thread lone_reader([&] {
++    read_raw_rpc_request(&pair.server, &lone_id, &lone_lane, &lone_op,
++                         &lone_payload);
++  });
++  int payload = 77;
++  require(rpc_write_start_request(&pair.client, 177) == 0,
++          "lone deferred request start failed");
++  require(rpc_write(&pair.client, &payload, sizeof(payload)) == 0,
++          "lone deferred payload write failed");
++  require(rpc_write_end_deferred(&pair.client) > 0,
++          "lone deferred request end failed");
++  lone_reader.join();
++  require(lone_op == 177 && lone_payload == 77,
++          "lone deferred request did not progress");
++}
++
+ void test_rpc_lz4_payload_round_trip() {
+   h2_pair pair = make_pair();
+   init_rpc_write(&pair.client);
+@@ -775,6 +848,7 @@ int main() {
+   test_head_probe_cuda_version_metadata();
+ #else
+   test_rpc_write_queue_grows();
++  test_deferred_rpc_progress_and_ordering();
+   test_rpc_lz4_payload_round_trip();
+   test_client_to_server();
+   test_server_receives_session_id();
+diff --git a/manual_server.cpp b/manual_server.cpp
+index 1c4fc0d..caea144 100644
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -3109,7 +3109,6 @@ int handle_manual_cuLaunchHostFunc(conn_t *conn) {
+   CUhostFn fn = nullptr;
+   void *userData = nullptr;
+   CUresult result = CUDA_ERROR_INVALID_VALUE;
+-
+   if (rpc_read(conn, &stream, sizeof(stream)) < 0 ||
+       rpc_read(conn, &fn, sizeof(fn)) < 0 ||
+       rpc_read(conn, &userData, sizeof(userData)) < 0) {
+@@ -3243,7 +3242,6 @@ int handle_manual_cuStreamWaitEvent(conn_t *conn) {
+   CUstream stream = nullptr;
+   CUevent event = nullptr;
+   unsigned int flags = 0;
+-  CUresult result = CUDA_ERROR_INVALID_VALUE;
+ 
+   if (rpc_read(conn, &stream, sizeof(stream)) < 0 ||
+       rpc_read(conn, &event, sizeof(event)) < 0 ||
+@@ -3260,11 +3258,7 @@ int handle_manual_cuStreamWaitEvent(conn_t *conn) {
+     lupine_stream_capture_resource_map().insert(stream, event_resources);
+   }
+ 
+-  result = cuStreamWaitEvent(stream, event, flags);
+-  if (rpc_write_start_response(conn, request_id) < 0 ||
+-      rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
+-    return -1;
+-  }
++  cuStreamWaitEvent(stream, event, flags);
+   return 0;
+ }
+ 
+diff --git a/memcpy.cpp b/memcpy.cpp
+index fdf33b0..5741cd9 100644
+--- a/memcpy.cpp
++++ b/memcpy.cpp
+@@ -11,6 +11,7 @@
+ #include <sys/syscall.h>
+ #include <sys/uio.h>
+ #include <unistd.h>
++#include <unordered_map>
+ #include <vector>
+ 
+ #include <cuda.h>
+@@ -23,6 +24,13 @@
+ #include "third_party/libcuckoo/libcuckoo/cuckoohash_map.hh"
+ 
+ static void lupine_pointer_attribute_cache_clear();
++static void lupine_single_pointer_attribute_cache_clear();
++static bool lupine_pointer_attribute_cache_lookup_single(
++    CUdeviceptr ptr, CUpointer_attribute attribute, void *data,
++    size_t value_size);
++static void lupine_pointer_attribute_cache_insert_single(
++    CUdeviceptr ptr, CUpointer_attribute attribute, const void *data,
++    size_t value_size);
+ #include "rpc.h"
+ 
+ extern int rpc_size();
+@@ -2197,6 +2205,19 @@ extern "C" CUresult cuPointerGetAttribute(void *data,
+   }
+   conn_t *conn = lupine_route_remote_conn(route);
+   CUresult return_value;
++  if (lupine_pointer_attribute_cache_lookup_single(
++          query_ptr, attribute, value, value_size)) {
++    memcpy(data, value, value_size);
++    if (managed_alias && attribute == CU_POINTER_ATTRIBUTE_HOST_POINTER) {
++      void *host = reinterpret_cast<void *>(ptr);
++      memcpy(data, &host, sizeof(host));
++    } else if (managed_alias &&
++               attribute == CU_POINTER_ATTRIBUTE_IS_MANAGED) {
++      int is_managed = 1;
++      memcpy(data, &is_managed, sizeof(is_managed));
++    }
++    return CUDA_SUCCESS;
++  }
+   if (rpc_write_start_request(conn, RPC_cuPointerGetAttribute) < 0 ||
+       rpc_write(conn, &attribute, sizeof(attribute)) < 0 ||
+       rpc_write(conn, &query_ptr, sizeof(query_ptr)) < 0 ||
+@@ -2208,6 +2229,8 @@ extern "C" CUresult cuPointerGetAttribute(void *data,
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   if (return_value == CUDA_SUCCESS) {
++    lupine_pointer_attribute_cache_insert_single(query_ptr, attribute, value,
++                                                 value_size);
+     memcpy(data, value, value_size);
+     if (managed_alias && attribute == CU_POINTER_ATTRIBUTE_HOST_POINTER) {
+       void *host = reinterpret_cast<void *>(ptr);
+@@ -2264,6 +2287,9 @@ extern "C" CUresult cuPointerSetAttribute(const void *value,
+       rpc_read_end(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
++  if (return_value == CUDA_SUCCESS) {
++    lupine_pointer_attribute_cache_clear();
++  }
+   return return_value;
+ }
+ 
+@@ -2304,6 +2330,79 @@ lupine_pointer_attribute_cache() {
+ 
+ static void lupine_pointer_attribute_cache_clear() {
+   lupine_pointer_attribute_cache().clear();
++  lupine_single_pointer_attribute_cache_clear();
++}
++
++extern "C" void lupine_invalidate_pointer_attribute_cache() {
++  lupine_pointer_attribute_cache_clear();
++}
++
++struct lupine_single_pointer_attribute_key {
++  CUdeviceptr ptr = 0;
++  int attribute = 0;
++
++  bool operator==(const lupine_single_pointer_attribute_key &other) const {
++    return ptr == other.ptr && attribute == other.attribute;
++  }
++};
++
++struct lupine_single_pointer_attribute_key_hash {
++  size_t operator()(const lupine_single_pointer_attribute_key &key) const {
++    size_t hash = std::hash<CUdeviceptr>{}(key.ptr);
++    hash ^= std::hash<int>{}(key.attribute) + 0x9e3779b9 + (hash << 6) +
++            (hash >> 2);
++    return hash;
++  }
++};
++
++static std::unordered_map<lupine_single_pointer_attribute_key,
++                          std::vector<unsigned char>,
++                          lupine_single_pointer_attribute_key_hash> &
++lupine_single_pointer_attribute_cache() {
++  static auto *cache = new std::unordered_map<
++      lupine_single_pointer_attribute_key, std::vector<unsigned char>,
++      lupine_single_pointer_attribute_key_hash>();
++  return *cache;
++}
++
++static std::mutex &lupine_single_pointer_attribute_cache_mutex() {
++  static auto *mutex = new std::mutex();
++  return *mutex;
++}
++
++static void lupine_single_pointer_attribute_cache_clear() {
++  std::lock_guard<std::mutex> lock(
++      lupine_single_pointer_attribute_cache_mutex());
++  lupine_single_pointer_attribute_cache().clear();
++}
++
++static bool lupine_pointer_attribute_cache_lookup_single(
++    CUdeviceptr ptr, CUpointer_attribute attribute, void *data,
++    size_t value_size) {
++  const lupine_single_pointer_attribute_key key{
++      ptr, static_cast<int>(attribute)};
++  std::lock_guard<std::mutex> lock(
++      lupine_single_pointer_attribute_cache_mutex());
++  auto it = lupine_single_pointer_attribute_cache().find(key);
++  if (it == lupine_single_pointer_attribute_cache().end() ||
++      it->second.size() != value_size) {
++    return false;
++  }
++  memcpy(data, it->second.data(), value_size);
++  return true;
++}
++
++static void lupine_pointer_attribute_cache_insert_single(
++    CUdeviceptr ptr, CUpointer_attribute attribute, const void *data,
++    size_t value_size) {
++  const lupine_single_pointer_attribute_key key{
++      ptr, static_cast<int>(attribute)};
++  std::vector<unsigned char> value(value_size);
++  memcpy(value.data(), data, value_size);
++  std::lock_guard<std::mutex> lock(
++      lupine_single_pointer_attribute_cache_mutex());
++  lupine_single_pointer_attribute_cache().insert_or_assign(key,
++                                                           std::move(value));
+ }
+ 
+ extern "C" CUresult cuPointerGetAttributes(unsigned int numAttributes,
+diff --git a/rpc.cpp b/rpc.cpp
+index 35cb6f9..c3720b7 100644
+--- a/rpc.cpp
++++ b/rpc.cpp
+@@ -6,6 +6,7 @@
+ #include <cstdlib>
+ #include <functional>
+ #include <iostream>
++#include <new>
+ #include <string.h>
+ #include <thread>
+ #include <vector>
+@@ -81,6 +82,130 @@ lupine_socket_t lupine_tcp_connect(const char *host, const char *port) {
+ 
+ extern void rpc_http2_destroy(conn_t *conn);
+ 
++namespace {
++
++// Fire-and-forget CUDA calls are often only a few dozen bytes. Sending every
++// one as a separate HTTP/2 write costs more than the GPU operation itself.
++// The background sender gives adjacent calls a very small coalescing window;
++// synchronous calls flush this buffer before writing their own request.
++struct rpc_deferred_write_state {
++  conn_t *conn = nullptr;
++  pthread_cond_t cond{};
++  pthread_t thread{};
++  bool thread_started = false;
++  bool stop = false;
++  std::vector<unsigned char> bytes;
++};
++
++static long rpc_deferred_coalesce_ns() {
++  static const long value = [] {
++    constexpr long kDefaultUs = 5;
++    constexpr long kMaxUs = 10000;
++    const char *raw = getenv("LUPINE_RPC_COALESCE_US");
++    if (raw == nullptr || *raw == '\0') {
++      return kDefaultUs * 1000;
++    }
++    char *end = nullptr;
++    long us = strtol(raw, &end, 10);
++    return end != raw && *end == '\0' && us >= 0 && us <= kMaxUs
++               ? us * 1000
++               : kDefaultUs * 1000;
++  }();
++  return value;
++}
++
++static int rpc_flush_deferred_locked(conn_t *conn) {
++  auto *state = static_cast<rpc_deferred_write_state *>(
++      conn == nullptr ? nullptr : conn->deferred_write_state);
++  if (state == nullptr || state->bytes.empty()) {
++    return 0;
++  }
++  rpc_write_entry entry = {{state->bytes.data(), state->bytes.size()}, 0};
++  int result = rpc_http2_writev(conn, &entry, 1);
++  state->bytes.clear();
++  return result;
++}
++
++static void *rpc_deferred_sender(void *opaque) {
++  auto *state = static_cast<rpc_deferred_write_state *>(opaque);
++  conn_t *conn = state->conn;
++  if (pthread_mutex_lock(&conn->write_mutex) != 0) {
++    return nullptr;
++  }
++  while (!state->stop) {
++    while (!state->stop && state->bytes.empty()) {
++      pthread_cond_wait(&state->cond, &conn->write_mutex);
++    }
++    if (state->stop) {
++      break;
++    }
++
++    timespec deadline{};
++    clock_gettime(CLOCK_REALTIME, &deadline);
++    deadline.tv_nsec += rpc_deferred_coalesce_ns();
++    if (deadline.tv_nsec >= 1000000000L) {
++      deadline.tv_sec += 1;
++      deadline.tv_nsec -= 1000000000L;
++    }
++    // The fixed deadline bounds dispatch latency while allowing producers to
++    // append more requests whenever timedwait releases write_mutex.
++    int wait_result = 0;
++    while (!state->stop && wait_result == 0) {
++      wait_result =
++          pthread_cond_timedwait(&state->cond, &conn->write_mutex, &deadline);
++    }
++    if (!state->stop && !conn->closed) {
++      rpc_flush_deferred_locked(conn);
++    }
++  }
++  pthread_mutex_unlock(&conn->write_mutex);
++  return nullptr;
++}
++
++static rpc_deferred_write_state *rpc_get_deferred_state_locked(conn_t *conn) {
++  auto *state = static_cast<rpc_deferred_write_state *>(
++      conn->deferred_write_state);
++  if (state != nullptr) {
++    return state;
++  }
++  state = new (std::nothrow) rpc_deferred_write_state();
++  if (state == nullptr || pthread_cond_init(&state->cond, nullptr) != 0) {
++    delete state;
++    return nullptr;
++  }
++  state->conn = conn;
++  conn->deferred_write_state = state;
++  if (pthread_create(&state->thread, nullptr, rpc_deferred_sender, state) != 0) {
++    conn->deferred_write_state = nullptr;
++    pthread_cond_destroy(&state->cond);
++    delete state;
++    return nullptr;
++  }
++  state->thread_started = true;
++  return state;
++}
++
++static void rpc_deferred_state_destroy(conn_t *conn) {
++  auto *state = static_cast<rpc_deferred_write_state *>(
++      conn == nullptr ? nullptr : conn->deferred_write_state);
++  if (state == nullptr) {
++    return;
++  }
++  pthread_mutex_lock(&conn->write_mutex);
++  state->stop = true;
++  state->bytes.clear();
++  pthread_cond_signal(&state->cond);
++  pthread_mutex_unlock(&conn->write_mutex);
++  if (state->thread_started) {
++    pthread_join(state->thread, nullptr);
++  }
++  pthread_cond_destroy(&state->cond);
++  delete state;
++  conn->deferred_write_state = nullptr;
++}
++
++} // namespace
++
+ static int rpc_write_queue_reserve(conn_t *conn, int capacity) {
+   if (conn == nullptr || capacity < 0) {
+     return -1;
+@@ -144,6 +269,7 @@ void rpc_conn_destroy(conn_t *conn) {
+   if (conn == nullptr) {
+     return;
+   }
++  rpc_deferred_state_destroy(conn);
+   rpc_http2_destroy(conn);
+   rpc_write_queue_free(conn);
+   pthread_mutex_destroy(&conn->read_mutex);
+@@ -171,7 +297,10 @@ int rpc_write_lane_termination(conn_t *conn, uint64_t lane_id) {
+     conn->write_queue[0] = {{&conn->write_id, sizeof(conn->write_id)}, 0};
+     conn->write_queue[1] = {{&lane_id, sizeof(lane_id)}, 0};
+     conn->write_queue[2] = {{&conn->write_op, sizeof(conn->write_op)}, 0};
+-    result = rpc_http2_writev(conn, conn->write_queue, conn->write_queue_count);
++    if (rpc_flush_deferred_locked(conn) == 0) {
++      result =
++          rpc_http2_writev(conn, conn->write_queue, conn->write_queue_count);
++    }
+   }
+   pthread_mutex_unlock(&conn->write_mutex);
+   pthread_mutex_unlock(&conn->call_mutex);
+@@ -1021,7 +1150,66 @@ int rpc_write_end(conn_t *conn) {
+     conn->write_queue[1] = {{&conn->write_lane_id, sizeof(conn->write_lane_id)},
+                             0};
+     conn->write_queue[2] = {{&conn->write_op, sizeof(conn->write_op)}, 0};
+-    result = rpc_http2_writev(conn, conn->write_queue, conn->write_queue_count);
++    if (rpc_flush_deferred_locked(conn) == 0) {
++      result =
++          rpc_http2_writev(conn, conn->write_queue, conn->write_queue_count);
++    }
++  }
++  pthread_mutex_unlock(&conn->write_mutex);
++  if (request) {
++    pthread_mutex_unlock(&conn->call_mutex);
++  }
++  return result == 0 ? write_id : -1;
++}
++
++// Queue an owned copy of a fire-and-forget request for the short-lived sender
++// batch. Framed payloads are sent immediately: copying a large transfer would
++// add both memory bandwidth and latency, defeating the purpose of this path.
++int rpc_write_end_deferred(conn_t *conn) {
++  bool request = conn->write_op != -1;
++  if (conn->closed) {
++    pthread_mutex_unlock(&conn->write_mutex);
++    if (request) {
++      pthread_mutex_unlock(&conn->call_mutex);
++    }
++    return -1;
++  }
++  int write_id = conn->write_id;
++  int result = -1;
++  if (conn->write_queue_count >= 3) {
++    conn->write_queue[0] = {{&conn->write_id, sizeof(conn->write_id)}, 0};
++    conn->write_queue[1] = {{&conn->write_lane_id, sizeof(conn->write_lane_id)},
++                            0};
++    conn->write_queue[2] = {{&conn->write_op, sizeof(conn->write_op)}, 0};
++
++    bool framed = false;
++    size_t total = 0;
++    for (int i = 0; i < conn->write_queue_count; ++i) {
++      framed = framed || conn->write_queue[i].framed != 0;
++      total += conn->write_queue[i].iov.iov_len;
++    }
++    auto *state = framed ? nullptr : rpc_get_deferred_state_locked(conn);
++    if (state != nullptr) {
++      try {
++        state->bytes.reserve(state->bytes.size() + total);
++        for (int i = 0; i < conn->write_queue_count; ++i) {
++          if (conn->write_queue[i].iov.iov_len == 0) {
++            continue;
++          }
++          const auto *begin = static_cast<const unsigned char *>(
++              conn->write_queue[i].iov.iov_base);
++          state->bytes.insert(state->bytes.end(), begin,
++                              begin + conn->write_queue[i].iov.iov_len);
++        }
++        pthread_cond_signal(&state->cond);
++        result = 0;
++      } catch (const std::bad_alloc &) {
++        result = -1;
++      }
++    } else if (rpc_flush_deferred_locked(conn) == 0) {
++      result =
++          rpc_http2_writev(conn, conn->write_queue, conn->write_queue_count);
++    }
+   }
+   pthread_mutex_unlock(&conn->write_mutex);
+   if (request) {
+diff --git a/rpc.h b/rpc.h
+index abac08c..3d3d7b8 100644
+--- a/rpc.h
++++ b/rpc.h
+@@ -69,6 +69,9 @@ struct conn_t {
+   rpc_write_entry *write_queue;
+   int write_queue_count;
+   int write_queue_capacity;
++  // Opaque client-side state for coalescing adjacent fire-and-forget RPCs.
++  // Kept indirect so conn_t remains trivially destructible.
++  void *deferred_write_state;
+   int local_request_parity;
+   int logical_index;
+   int closed;
+@@ -91,6 +94,7 @@ extern int rpc_write_iovecs(conn_t *conn, const struct iovec *iovecs,
+                             size_t count);
+ extern int rpc_write_framed(conn_t *conn, const void *data, const size_t size);
+ extern int rpc_write_end(conn_t *conn);
++extern int rpc_write_end_deferred(conn_t *conn);
+ extern int rpc_write_lane_termination(conn_t *conn, uint64_t lane_id);
+ extern void rpc_write_queue_free(conn_t *conn);
+ extern void rpc_conn_destroy(conn_t *conn);

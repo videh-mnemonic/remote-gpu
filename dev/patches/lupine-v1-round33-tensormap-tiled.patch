@@ -1,0 +1,198 @@
+diff --git a/client.cpp b/client.cpp
+index 4b2f768..f699193 100644
+--- a/client.cpp
++++ b/client.cpp
+@@ -61,6 +61,7 @@
+ #include "lupine_log.h"
+ #include "lupine_cublas.h"
+ #include "lupine_nccl.h"
++#include "lupine_tensormap.h"
+ #include "memcpy.h"
+ #include "rpc.h"
+ #include "third_party/libcuckoo/libcuckoo/cuckoohash_map.hh"
+@@ -8974,6 +8975,69 @@ close_connection:
+   return nullptr;
+ }
+ 
++extern "C" CUresult cuTensorMapEncodeTiled(
++    CUtensorMap *tensorMap, CUtensorMapDataType tensorDataType,
++    cuuint32_t tensorRank, void *globalAddress, const cuuint64_t *globalDim,
++    const cuuint64_t *globalStrides, const cuuint32_t *boxDim,
++    const cuuint32_t *elementStrides, CUtensorMapInterleave interleave,
++    CUtensorMapSwizzle swizzle, CUtensorMapL2promotion l2Promotion,
++    CUtensorMapFloatOOBfill oobFill) {
++  if (tensorMap == nullptr || globalDim == nullptr || boxDim == nullptr ||
++      elementStrides == nullptr || tensorRank < 1 ||
++      tensorRank > LUPINE_TENSOR_MAP_MAX_RANK ||
++      (tensorRank > 1 && globalStrides == nullptr)) {
++    return CUDA_ERROR_INVALID_VALUE;
++  }
++
++  lupine_route route = globalAddress == nullptr
++                           ? lupine_route_for_default()
++                           : lupine_route_for_deviceptr(
++                                 reinterpret_cast<CUdeviceptr>(globalAddress));
++  CUresult result;
++  using real_fn_t = CUresult (*)(
++      CUtensorMap *, CUtensorMapDataType, cuuint32_t, void *,
++      const cuuint64_t *, const cuuint64_t *, const cuuint32_t *,
++      const cuuint32_t *, CUtensorMapInterleave, CUtensorMapSwizzle,
++      CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
++  if (lupine_call_local_cuda_if_routed<real_fn_t>(
++          route, "cuTensorMapEncodeTiled", &result, tensorMap, tensorDataType,
++          tensorRank, globalAddress, globalDim, globalStrides, boxDim,
++          elementStrides, interleave, swizzle, l2Promotion, oobFill)) {
++    return result;
++  }
++
++  lupine_tensormap_tiled_request request{};
++  request.data_type = static_cast<std::uint32_t>(tensorDataType);
++  request.rank = tensorRank;
++  request.global_address =
++      static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(globalAddress));
++  std::copy_n(globalDim, tensorRank, request.global_dim);
++  if (tensorRank > 1) {
++    std::copy_n(globalStrides, tensorRank - 1, request.global_strides);
++  }
++  std::copy_n(boxDim, tensorRank, request.box_dim);
++  std::copy_n(elementStrides, tensorRank, request.element_strides);
++  request.interleave = static_cast<std::uint32_t>(interleave);
++  request.swizzle = static_cast<std::uint32_t>(swizzle);
++  request.l2_promotion = static_cast<std::uint32_t>(l2Promotion);
++  request.oob_fill = static_cast<std::uint32_t>(oobFill);
++
++  CUtensorMap encoded{};
++  conn_t *conn = lupine_route_remote_conn(route);
++  if (conn == nullptr ||
++      rpc_write_start_request(conn, RPC_cuTensorMapEncodeTiled) < 0 ||
++      rpc_write(conn, &request, sizeof(request)) < 0 ||
++      rpc_wait_for_response(conn) < 0 ||
++      rpc_read(conn, &encoded, sizeof(encoded)) < 0 ||
++      rpc_read(conn, &result, sizeof(result)) < 0 || rpc_read_end(conn) < 0) {
++    return CUDA_ERROR_DEVICE_UNAVAILABLE;
++  }
++  if (result == CUDA_SUCCESS) {
++    *tensorMap = encoded;
++  }
++  return result;
++}
++
+ int rpc_open() {
+   if (pthread_mutex_lock(&conn_mutex) < 0)
+     return -1;
+@@ -9317,6 +9381,7 @@ lupine_manual_function_map() {
+       {"cuMemExportToShareableHandle", (void *)cuMemExportToShareableHandle},
+       {"cuMemImportFromShareableHandle",
+        (void *)cuMemImportFromShareableHandle},
++      {"cuTensorMapEncodeTiled", (void *)cuTensorMapEncodeTiled},
+       {"cuMemPoolExportToShareableHandle",
+        (void *)cuMemPoolExportToShareableHandle},
+       {"cuMemPoolImportFromShareableHandle",
+diff --git a/lupine_tensormap.h b/lupine_tensormap.h
+new file mode 100644
+index 0000000..d3623a0
+--- /dev/null
++++ b/lupine_tensormap.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include <cstdint>
++
++// CUDA tensor maps currently support at most five dimensions. Keep this wire
++// format independent of CUDA's enum ABI and zero-fill unused array entries so
++// client and server can safely evolve together.
++static constexpr std::uint32_t LUPINE_TENSOR_MAP_MAX_RANK = 5;
++
++struct lupine_tensormap_tiled_request {
++  std::uint32_t data_type;
++  std::uint32_t rank;
++  std::uint64_t global_address;
++  std::uint64_t global_dim[LUPINE_TENSOR_MAP_MAX_RANK];
++  std::uint64_t global_strides[LUPINE_TENSOR_MAP_MAX_RANK];
++  std::uint32_t box_dim[LUPINE_TENSOR_MAP_MAX_RANK];
++  std::uint32_t element_strides[LUPINE_TENSOR_MAP_MAX_RANK];
++  std::uint32_t interleave;
++  std::uint32_t swizzle;
++  std::uint32_t l2_promotion;
++  std::uint32_t oob_fill;
++};
+diff --git a/manual_server.cpp b/manual_server.cpp
+index 2b7f8fa..f2a8fee 100644
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -48,6 +48,7 @@
+ #include "lupine_log.h"
+ #include "lupine_cublas.h"
+ #include "lupine_nccl.h"
++#include "lupine_tensormap.h"
+ #include "manual_server.h"
+ #include "rpc.h"
+ 
+@@ -6776,6 +6777,41 @@ int handle_manual_cuMemHostGetFlags(conn_t *conn) {
+   return 0;
+ }
+ 
++int handle_manual_cuTensorMapEncodeTiled(conn_t *conn) {
++  lupine_tensormap_tiled_request request{};
++  if (rpc_read(conn, &request, sizeof(request)) < 0) {
++    return -1;
++  }
++  int request_id = rpc_read_end(conn);
++  if (request_id < 0) {
++    return -1;
++  }
++
++  CUtensorMap tensor_map{};
++  CUresult result = CUDA_ERROR_INVALID_VALUE;
++  if (request.rank >= 1 && request.rank <= LUPINE_TENSOR_MAP_MAX_RANK) {
++    result = cuTensorMapEncodeTiled(
++        &tensor_map, static_cast<CUtensorMapDataType>(request.data_type),
++        request.rank, reinterpret_cast<void *>(request.global_address),
++        request.global_dim,
++        request.rank > 1 ? request.global_strides : nullptr, request.box_dim,
++        request.element_strides,
++        static_cast<CUtensorMapInterleave>(request.interleave),
++        static_cast<CUtensorMapSwizzle>(request.swizzle),
++        static_cast<CUtensorMapL2promotion>(request.l2_promotion),
++        static_cast<CUtensorMapFloatOOBfill>(request.oob_fill));
++  }
++
++  // Always send the fixed-size descriptor. The client only exposes it when
++  // CUDA reports success, while fixed framing keeps failure responses robust.
++  if (rpc_write_start_response(conn, request_id) < 0 ||
++      rpc_write(conn, &tensor_map, sizeof(tensor_map)) < 0 ||
++      rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
++    return -1;
++  }
++  return 0;
++}
++
+ int handle_manual_cuCtxSynchronize(conn_t *conn) {
+   int request_id = rpc_read_end(conn);
+   if (request_id < 0) {
+diff --git a/manual_server.h b/manual_server.h
+index 50c35fc..6bbeddf 100644
+--- a/manual_server.h
++++ b/manual_server.h
+@@ -37,6 +37,7 @@ int handle_manual_cuMemcpy2D_v2(conn_t *conn);
+ int handle_manual_cuMemcpy2DUnaligned_v2(conn_t *conn);
+ int handle_manual_cuMemcpy2DAsync_v2(conn_t *conn);
+ int handle_manual_cuMemcpyAtoH_v2(conn_t *conn);
++int handle_manual_cuTensorMapEncodeTiled(conn_t *conn);
+ int handle_manual_cuGraphAddMemAllocNode(conn_t *conn);
+ int handle_manual_cuGraphAddMemFreeNode(conn_t *conn);
+ int handle_manual_cuDeviceGetGraphMemAttribute(conn_t *conn);
+diff --git a/server.cpp b/server.cpp
+index e8320ad..6292fe5 100644
+--- a/server.cpp
++++ b/server.cpp
+@@ -164,6 +164,8 @@ lupine_manual_handlers() {
+        {handle_manual_cuMemcpy2DAsync_v2, "cuMemcpy2DAsync_v2"}},
+       {RPC_cuMemcpyDtoH_v2, {handle_manual_cuMemcpyDtoH_v2, "cuMemcpyDtoH_v2"}},
+       {RPC_cuMemcpyAtoH_v2, {handle_manual_cuMemcpyAtoH_v2, "cuMemcpyAtoH_v2"}},
++      {RPC_cuTensorMapEncodeTiled,
++       {handle_manual_cuTensorMapEncodeTiled, "cuTensorMapEncodeTiled"}},
+       {RPC_cuMemHostAlloc, {handle_manual_cuMemHostAlloc, "cuMemHostAlloc"}},
+       {RPC_cuMemHostGetFlags,
+        {handle_manual_cuMemHostGetFlags, "cuMemHostGetFlags"}},
+

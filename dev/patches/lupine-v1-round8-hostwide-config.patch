@@ -1,0 +1,218 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -79,6 +79,7 @@
+ endif()
+ 
+ set(CLIENT_SOURCES
++    ${CMAKE_CURRENT_SOURCE_DIR}/config.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/h2.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
+@@ -108,6 +109,7 @@
+ )
+ 
+ set(NVML_CLIENT_SOURCES
++    ${CMAKE_CURRENT_SOURCE_DIR}/config.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/h2.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
+@@ -237,6 +239,13 @@
+     add_test(NAME h2_protocol_mismatch_test COMMAND h2_protocol_mismatch_test)
+     set_tests_properties(h2_protocol_mismatch_test PROPERTIES TIMEOUT ${h2u_timeout})
+ 
++    add_executable(config_test
++        ${CMAKE_CURRENT_SOURCE_DIR}/config.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/config_test.cpp
++    )
++    add_test(NAME config_test COMMAND config_test)
++    set_tests_properties(config_test PROPERTIES TIMEOUT 10)
++
+     add_executable(checkpoint_test
+         ${CMAKE_CURRENT_SOURCE_DIR}/checkpoint.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/checkpoint_test.cpp
+--- a/client.cpp
++++ b/client.cpp
+@@ -50,6 +50,7 @@
+ #include "cache.h"
+ #include "checkpoint.h"
+ #include "client_routing.h"
++#include "config.h"
+ #include "codegen/gen_api.h"
+ #include "codegen/gen_client.h"
+ #include "events.h"
+@@ -8536,8 +8537,11 @@
+     return 0;
+   }
+ 
+-  char *server_ips = getenv("LUPINE_SERVER");
+-  if (server_ips == NULL) {
++  std::string server_configuration = lupine_server_configuration();
++  if (server_configuration.empty()) {
++    LUPINE_LOG_ERROR(
++        "No remote endpoints configured (set LUPINE_SERVER or create "
++        "/etc/rgpu/endpoints)");
+     if (pthread_mutex_unlock(&conn_mutex) < 0)
+       return -1;
+     return -1;
+@@ -8545,7 +8549,7 @@
+ 
+   lupine_server_endpoints().clear();
+ 
+-  char *server_ip = strdup(server_ips);
++  char *server_ip = strdup(server_configuration.c_str());
+   char *server_ip_cursor = server_ip;
+   char *token;
+   while ((token = strsep(&server_ip_cursor, ","))) {
+--- a/nvml_client.cpp
++++ b/nvml_client.cpp
+@@ -24,6 +24,7 @@
+ #include <vector>
+ 
+ #include "codegen/gen_api.h"
++#include "config.h"
+ #include "lupine_log.h"
+ #include "rpc.h"
+ 
+@@ -140,14 +141,16 @@
+     return 0;
+   }
+ 
+-  char *servers_env = getenv("LUPINE_SERVER");
+-  if (servers_env == nullptr) {
+-    LUPINE_LOG_ERROR("LUPINE_SERVER environment variable not set");
++  std::string server_configuration = lupine_server_configuration();
++  if (server_configuration.empty()) {
++    LUPINE_LOG_ERROR(
++        "No remote endpoints configured (set LUPINE_SERVER or create "
++        "/etc/rgpu/endpoints)");
+     pthread_mutex_unlock(&conn_mutex);
+     return -1;
+   }
+ 
+-  char *servers = strdup(servers_env);
++  char *servers = strdup(server_configuration.c_str());
+   if (servers == nullptr) {
+     pthread_mutex_unlock(&conn_mutex);
+     return -1;
+--- /dev/null
++++ b/config.h
+@@ -0,0 +1,11 @@
++#ifndef LUPINE_CONFIG_H
++#define LUPINE_CONFIG_H
++
++#include <string>
++
++// Resolve the remote endpoint list without requiring per-process environment
++// setup. LUPINE_SERVER remains the explicit override; otherwise the first
++// non-empty line of LUPINE_SERVER_FILE (default /etc/rgpu/endpoints) is used.
++std::string lupine_server_configuration();
++
++#endif
+--- /dev/null
++++ b/config.cpp
+@@ -0,0 +1,48 @@
++#include "config.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cstdlib>
++#include <fstream>
++#include <string>
++
++namespace {
++
++constexpr const char *kDefaultServerFile = "/etc/rgpu/endpoints";
++constexpr size_t kMaxServerConfigurationBytes = 4096;
++
++void trim(std::string *value) {
++  auto whitespace = [](unsigned char byte) { return std::isspace(byte) != 0; };
++  value->erase(value->begin(),
++               std::find_if_not(value->begin(), value->end(), whitespace));
++  value->erase(
++      std::find_if_not(value->rbegin(), value->rend(), whitespace).base(),
++      value->end());
++}
++
++} // namespace
++
++std::string lupine_server_configuration() {
++  const char *environment = std::getenv("LUPINE_SERVER");
++  if (environment != nullptr && environment[0] != '\0') {
++    return environment;
++  }
++
++  const char *override_path = std::getenv("LUPINE_SERVER_FILE");
++  const char *path =
++      override_path != nullptr && override_path[0] != '\0'
++          ? override_path
++          : kDefaultServerFile;
++  std::ifstream stream(path);
++  std::string line;
++  while (std::getline(stream, line)) {
++    if (line.size() > kMaxServerConfigurationBytes) {
++      return {};
++    }
++    trim(&line);
++    if (!line.empty() && line[0] != '#') {
++      return line;
++    }
++  }
++  return {};
++}
+--- /dev/null
++++ b/config_test.cpp
+@@ -0,0 +1,54 @@
++#include "config.h"
++
++#include <cstdlib>
++#include <fstream>
++#include <iostream>
++#include <string>
++#include <unistd.h>
++
++namespace {
++
++void require(bool condition, const char *message) {
++  if (!condition) {
++    std::cerr << message << std::endl;
++    std::exit(1);
++  }
++}
++
++std::string temporary_path() {
++  char path[] = "/tmp/lupine-config-test.XXXXXX";
++  int fd = mkstemp(path);
++  require(fd >= 0, "mkstemp failed");
++  close(fd);
++  return path;
++}
++
++} // namespace
++
++int main() {
++  const std::string path = temporary_path();
++  setenv("LUPINE_SERVER_FILE", path.c_str(), 1);
++
++  setenv("LUPINE_SERVER", "environment:14833", 1);
++  require(lupine_server_configuration() == "environment:14833",
++          "environment override was not preferred");
++
++  unsetenv("LUPINE_SERVER");
++  {
++    std::ofstream output(path);
++    output << "# generated by rgpu attach\n\n  10.77.77.1:14833  \n";
++  }
++  require(lupine_server_configuration() == "10.77.77.1:14833",
++          "endpoint file was not read and trimmed");
++
++  {
++    std::ofstream output(path);
++    output << std::string(4097, 'x') << '\n';
++  }
++  require(lupine_server_configuration().empty(),
++          "oversized endpoint configuration was accepted");
++
++  unlink(path.c_str());
++  std::cout << "config_test: PASS" << std::endl;
++  return 0;
++}

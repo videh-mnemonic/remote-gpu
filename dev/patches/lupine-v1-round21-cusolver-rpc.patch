@@ -1,0 +1,113 @@
+diff --git a/lupine_cublas.h b/lupine_cublas.h
+index 2aec92d..b7f91ad 100644
+--- a/lupine_cublas.h
++++ b/lupine_cublas.h
+@@ -24,6 +24,12 @@ enum lupine_cublas_opcode : uint32_t {
+   LUPINE_CUBLAS_LT_HEURISTIC = 19,
+   LUPINE_CUBLAS_LT_MATMUL = 20,
+   LUPINE_CUBLAS_GEMM_STRIDED_BATCHED_EX = 21,
++  LUPINE_CUSOLVER_DN_CREATE = 22,
++  LUPINE_CUSOLVER_DN_DESTROY = 23,
++  LUPINE_CUSOLVER_DN_SET_STREAM = 24,
++  LUPINE_CUSOLVER_DN_SGETRF_BUFFER_SIZE = 25,
++  LUPINE_CUSOLVER_DN_SGETRF = 26,
++  LUPINE_CUSOLVER_DN_SGETRS = 27,
+ };
+ 
+ struct lupine_cublas_request {
+diff --git a/manual_server.cpp b/manual_server.cpp
+index 6ee1033..d50aa92 100644
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -3886,6 +3886,21 @@ static void handle_lupineCublasCall(conn_t *conn) {
+   auto lt_symbol = [](const char *name) -> void * {
+     return lt_library == nullptr ? nullptr : dlsym(lt_library, name);
+   };
++  static void *solver_library = [] {
++    void *solver = dlopen("libcusolver.so.12", RTLD_NOW | RTLD_LOCAL);
++    if (solver == nullptr) {
++      solver = dlopen(
++          "/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib/"
++          "libcusolver.so.12",
++          RTLD_NOW | RTLD_LOCAL);
++    }
++    if (solver == nullptr)
++      LUPINE_LOG_ERROR("Unable to load server cuSOLVER: " << dlerror());
++    return solver;
++  }();
++  auto solver_symbol = [](const char *name) -> void * {
++    return solver_library == nullptr ? nullptr : dlsym(solver_library, name);
++  };
+ 
+   lupine_cublas_response response;
+   void *handle = reinterpret_cast<void *>(request.handle);
+@@ -3931,6 +3946,69 @@ static void handle_lupineCublasCall(conn_t *conn) {
+     response.status = handle_state_status;
+   } else {
+   switch (request.opcode) {
++  case LUPINE_CUSOLVER_DN_CREATE: {
++    using function = int (*)(void **);
++    auto call = reinterpret_cast<function>(solver_symbol("cusolverDnCreate"));
++    response.status = call == nullptr ? 7 : call(&handle);
++    response.handle = reinterpret_cast<uint64_t>(handle);
++    break;
++  }
++  case LUPINE_CUSOLVER_DN_DESTROY: {
++    using function = int (*)(void *);
++    auto call = reinterpret_cast<function>(solver_symbol("cusolverDnDestroy"));
++    response.status = call == nullptr ? 7 : call(handle);
++    break;
++  }
++  case LUPINE_CUSOLVER_DN_SET_STREAM: {
++    using function = int (*)(void *, void *);
++    auto call = reinterpret_cast<function>(solver_symbol("cusolverDnSetStream"));
++    response.status = call == nullptr
++                          ? 7
++                          : call(handle, reinterpret_cast<void *>(request.d));
++    break;
++  }
++  case LUPINE_CUSOLVER_DN_SGETRF_BUFFER_SIZE: {
++    using function = int (*)(void *, int, int, float *, int, int *);
++    auto call = reinterpret_cast<function>(
++        solver_symbol("cusolverDnSgetrf_bufferSize"));
++    int workspace_elements = 0;
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.m, request.n,
++                   reinterpret_cast<float *>(request.a), request.lda,
++                   &workspace_elements);
++    response.value = workspace_elements;
++    break;
++  }
++  case LUPINE_CUSOLVER_DN_SGETRF: {
++    using function = int (*)(void *, int, int, float *, int, float *, int *,
++                             int *);
++    auto call = reinterpret_cast<function>(solver_symbol("cusolverDnSgetrf"));
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.m, request.n,
++                   reinterpret_cast<float *>(request.a), request.lda,
++                   reinterpret_cast<float *>(request.workspace),
++                   reinterpret_cast<int *>(request.b),
++                   reinterpret_cast<int *>(request.c));
++    break;
++  }
++  case LUPINE_CUSOLVER_DN_SGETRS: {
++    using function = int (*)(void *, int, int, int, const float *, int,
++                             const int *, float *, int, int *);
++    auto call = reinterpret_cast<function>(solver_symbol("cusolverDnSgetrs"));
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.transa, request.n, request.k,
++                   reinterpret_cast<const float *>(request.a), request.lda,
++                   reinterpret_cast<const int *>(request.b),
++                   reinterpret_cast<float *>(request.c), request.ldb,
++                   reinterpret_cast<int *>(request.d));
++    break;
++  }
+   case LUPINE_CUBLAS_CREATE: {
+     using function = int (*)(void **);
+     auto call = reinterpret_cast<function>(symbol("cublasCreate_v2"));

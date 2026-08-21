@@ -1,0 +1,130 @@
+--- a/rpc.cpp
++++ b/rpc.cpp
+@@ -95,9 +95,31 @@
+   bool thread_started = false;
+   bool stop = false;
+   std::vector<unsigned char> bytes;
++  uint64_t pending_requests = 0;
++  uint64_t batches = 0;
++  uint64_t requests = 0;
++  uint64_t payload_bytes = 0;
++  uint64_t timer_batches = 0;
++  uint64_t synchronous_batches = 0;
++  uint64_t single_request_batches = 0;
++  uint64_t max_requests_per_batch = 0;
+ };
+ 
+-static long rpc_deferred_coalesce_ns() {
++static const char *rpc_batch_stats_path() {
++  static const char *path = getenv("LUPINE_RPC_BATCH_STATS");
++  return path;
++}
++
++static bool rpc_deferred_adaptive() {
++  static const bool value = [] {
++    const char *raw = getenv("LUPINE_RPC_COALESCE_US");
++    return raw == nullptr || *raw == '\0' || strcmp(raw, "adaptive") == 0 ||
++           strcmp(raw, "auto") == 0;
++  }();
++  return value;
++}
++
++static long rpc_deferred_fixed_coalesce_ns() {
+   static const long value = [] {
+     constexpr long kDefaultUs = 5;
+     constexpr long kMaxUs = 10000;
+@@ -114,7 +136,27 @@
+   return value;
+ }
+ 
+-static int rpc_flush_deferred_locked(conn_t *conn) {
++static long
++rpc_deferred_coalesce_ns(const rpc_deferred_write_state *state) {
++  constexpr long kShortWindowNs = 5000;
++  constexpr long kDenseWindowNs = 10000;
++  constexpr uint64_t kObservationBatches = 128;
++  constexpr uint64_t kSyncPercentThreshold = 30;
++  if (!rpc_deferred_adaptive()) {
++    return rpc_deferred_fixed_coalesce_ns();
++  }
++  // Synchronous calls already flush queued work and are latency-sensitive.
++  // Expand only for sustained timer-driven streams, where waiting briefly
++  // replaces transport writes without delaying a caller awaiting a response.
++  if (state->batches < kObservationBatches ||
++      state->synchronous_batches * 100 >=
++          state->batches * kSyncPercentThreshold) {
++    return kShortWindowNs;
++  }
++  return kDenseWindowNs;
++}
++
++static int rpc_flush_deferred_locked(conn_t *conn, bool timer_flush = false) {
+   auto *state = static_cast<rpc_deferred_write_state *>(
+       conn == nullptr ? nullptr : conn->deferred_write_state);
+   if (state == nullptr || state->bytes.empty()) {
+@@ -122,7 +164,16 @@
+   }
+   rpc_write_entry entry = {{state->bytes.data(), state->bytes.size()}, 0};
+   int result = rpc_http2_writev(conn, &entry, 1);
++  ++state->batches;
++  state->requests += state->pending_requests;
++  state->payload_bytes += state->bytes.size();
++  state->timer_batches += timer_flush ? 1 : 0;
++  state->synchronous_batches += timer_flush ? 0 : 1;
++  state->single_request_batches += state->pending_requests == 1 ? 1 : 0;
++  state->max_requests_per_batch =
++      std::max(state->max_requests_per_batch, state->pending_requests);
+   state->bytes.clear();
++  state->pending_requests = 0;
+   return result;
+ }
+ 
+@@ -142,7 +193,7 @@
+ 
+     timespec deadline{};
+     clock_gettime(CLOCK_REALTIME, &deadline);
+-    deadline.tv_nsec += rpc_deferred_coalesce_ns();
++    deadline.tv_nsec += rpc_deferred_coalesce_ns(state);
+     if (deadline.tv_nsec >= 1000000000L) {
+       deadline.tv_sec += 1;
+       deadline.tv_nsec -= 1000000000L;
+@@ -155,7 +206,7 @@
+           pthread_cond_timedwait(&state->cond, &conn->write_mutex, &deadline);
+     }
+     if (!state->stop && !conn->closed) {
+-      rpc_flush_deferred_locked(conn);
++      rpc_flush_deferred_locked(conn, true);
+     }
+   }
+   pthread_mutex_unlock(&conn->write_mutex);
+@@ -199,6 +250,22 @@
+   if (state->thread_started) {
+     pthread_join(state->thread, nullptr);
+   }
++  if (rpc_batch_stats_path() != nullptr) {
++    FILE *stats = fopen(rpc_batch_stats_path(), "w");
++    if (stats != nullptr) {
++      fprintf(stats, "batches\t%llu\nrequests\t%llu\npayload_bytes\t%llu\n"
++                     "timer_batches\t%llu\nsynchronous_batches\t%llu\n"
++                     "single_request_batches\t%llu\nmax_requests_per_batch\t%llu\n",
++              (unsigned long long)state->batches,
++              (unsigned long long)state->requests,
++              (unsigned long long)state->payload_bytes,
++              (unsigned long long)state->timer_batches,
++              (unsigned long long)state->synchronous_batches,
++              (unsigned long long)state->single_request_batches,
++              (unsigned long long)state->max_requests_per_batch);
++      fclose(stats);
++    }
++  }
+   pthread_cond_destroy(&state->cond);
+   delete state;
+   conn->deferred_write_state = nullptr;
+@@ -1201,6 +1268,7 @@
+           state->bytes.insert(state->bytes.end(), begin,
+                               begin + conn->write_queue[i].iov.iov_len);
+         }
++        ++state->pending_requests;
+         pthread_cond_signal(&state->cond);
+         result = 0;
+       } catch (const std::bad_alloc &) {

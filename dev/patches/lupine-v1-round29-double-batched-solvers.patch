@@ -1,0 +1,82 @@
+--- a/lupine_cublas.h
++++ b/lupine_cublas.h
+@@ -129,6 +129,10 @@
+   LUPINE_CUSOLVER_DN_DGESVD = 124,
+   LUPINE_CUSOLVER_DN_DSYEVD_BUFFER_SIZE = 125,
+   LUPINE_CUSOLVER_DN_DSYEVD = 126,
++  LUPINE_CUSOLVER_DN_DPOTRF_BATCHED = 127,
++  LUPINE_CUSOLVER_DN_DPOTRS_BATCHED = 128,
++  LUPINE_CUSOLVER_DN_DSYEVJ_BATCHED_BUFFER_SIZE = 129,
++  LUPINE_CUSOLVER_DN_DSYEVJ_BATCHED = 130,
+ };
+ 
+ struct lupine_cublas_request {
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -5003,6 +5003,66 @@
+                    reinterpret_cast<int *>(request.c));
+     break;
+   }
++  case LUPINE_CUSOLVER_DN_DPOTRF_BATCHED: {
++    using function = int (*)(void *, int, int, double **, int, int *, int);
++    auto call = reinterpret_cast<function>(
++        solver_symbol("cusolverDnDpotrfBatched"));
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.transa, request.n,
++                   reinterpret_cast<double **>(request.a), request.lda,
++                   reinterpret_cast<int *>(request.b), request.batch_count);
++    break;
++  }
++  case LUPINE_CUSOLVER_DN_DPOTRS_BATCHED: {
++    using function = int (*)(void *, int, int, int, const double **, int,
++                             double **, int, int *, int);
++    auto call = reinterpret_cast<function>(
++        solver_symbol("cusolverDnDpotrsBatched"));
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.transa, request.n, request.k,
++                   reinterpret_cast<const double **>(request.a), request.lda,
++                   reinterpret_cast<double **>(request.b), request.ldb,
++                   reinterpret_cast<int *>(request.c), request.batch_count);
++    break;
++  }
++  case LUPINE_CUSOLVER_DN_DSYEVJ_BATCHED_BUFFER_SIZE: {
++    using function = int (*)(void *, int, int, int, const double *, int,
++                             const double *, int *, void *, int);
++    auto call = reinterpret_cast<function>(
++        solver_symbol("cusolverDnDsyevjBatched_bufferSize"));
++    int lwork = 0;
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.transa, request.transb, request.n,
++                   reinterpret_cast<const double *>(request.a), request.lda,
++                   reinterpret_cast<const double *>(request.b), &lwork,
++                   reinterpret_cast<void *>(request.descriptor),
++                   request.batch_count);
++    response.value = lwork;
++    break;
++  }
++  case LUPINE_CUSOLVER_DN_DSYEVJ_BATCHED: {
++    using function = int (*)(void *, int, int, int, double *, int, double *,
++                             double *, int, int *, void *, int);
++    auto call = reinterpret_cast<function>(
++        solver_symbol("cusolverDnDsyevjBatched"));
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.transa, request.transb, request.n,
++                   reinterpret_cast<double *>(request.a), request.lda,
++                   reinterpret_cast<double *>(request.b),
++                   reinterpret_cast<double *>(request.workspace), request.value,
++                   reinterpret_cast<int *>(request.c),
++                   reinterpret_cast<void *>(request.descriptor),
++                   request.batch_count);
++    break;
++  }
+   case LUPINE_CUSOLVER_DN_SORMQR_BUFFER_SIZE: {
+     using function = int (*)(void *, int, int, int, int, int, const float *,
+                              int, const float *, const float *, int, int *);

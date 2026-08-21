@@ -1,0 +1,12 @@
+{
+  "commit_time": "2026-08-18T05:12:40-07:00",
+  "declared_license": "BSD-3-Clause",
+  "license_file": "LICENSE",
+  "license_sha256": "e19722ba0a7237bc1c3382fef69c8387f7adbcc51e21f0610d3c87d737999503",
+  "name": "torchbench",
+  "push_url": "disabled://public-push-prohibited",
+  "requested_ref": "main",
+  "resolved_commit": "560fcbde3d4439c390ecb0b9be59e4f3cf82f33a",
+  "retrieved_at": "2026-08-19T23:49:28.781514+00:00",
+  "url": "https://github.com/pytorch/benchmark.git"
+}

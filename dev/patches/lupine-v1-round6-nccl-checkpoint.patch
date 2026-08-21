@@ -1,0 +1,119 @@
+--- a/codegen/annotations.h
++++ b/codegen/annotations.h
+@@ -3666,7 +3666,7 @@
+ /**
+  * @param stream SEND_ONLY
+  * @param count SEND_ONLY
+- * @param paramArray SEND_RECV
++ * @param paramArray SEND_RECV LENGTH:count
+  * @param flags SEND_ONLY
+  */
+ CUresult cuStreamBatchMemOp_v2(CUstream stream, unsigned int count,
+--- a/codegen/gen_client.cpp
++++ b/codegen/gen_client.cpp
+@@ -3407,10 +3407,10 @@
+         rpc_write_start_request(conn, RPC_cuStreamBatchMemOp_v2) < 0 ||
+         rpc_write(conn, &stream, sizeof(CUstream)) < 0 ||
+         rpc_write(conn, &count, sizeof(unsigned int)) < 0 ||
+-        rpc_write(conn, paramArray, sizeof(CUstreamBatchMemOpParams)) < 0 ||
++        rpc_write(conn, paramArray, count * sizeof(CUstreamBatchMemOpParams)) < 0 ||
+         rpc_write(conn, &flags, sizeof(unsigned int)) < 0 ||
+         rpc_wait_for_response(conn) < 0 ||
+-        rpc_read(conn, paramArray, sizeof(CUstreamBatchMemOpParams)) < 0 ||
++        rpc_read(conn, paramArray, count * sizeof(CUstreamBatchMemOpParams)) < 0 ||
+         rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+         rpc_read_end(conn) < 0)
+         return CUDA_ERROR_DEVICE_UNAVAILABLE;
+--- a/codegen/gen_server.cpp
++++ b/codegen/gen_server.cpp
+@@ -4974,25 +4974,26 @@
+ {
+     CUstream stream;
+     unsigned int count;
+-    CUstreamBatchMemOpParams paramArray;
++    std::vector<CUstreamBatchMemOpParams> paramArray;
+     unsigned int flags;
+     int request_id;
+     CUresult lupine_intercept_result;
+-    if (
+-        rpc_read(conn, &stream, sizeof(CUstream)) < 0 ||
+-        rpc_read(conn, &count, sizeof(unsigned int)) < 0 ||
+-        rpc_read(conn, &paramArray, sizeof(CUstreamBatchMemOpParams)) < 0 ||
+-        rpc_read(conn, &flags, sizeof(unsigned int)) < 0 ||
+-        false)
++    if (rpc_read(conn, &stream, sizeof(CUstream)) < 0 ||
++        rpc_read(conn, &count, sizeof(unsigned int)) < 0)
++        goto ERROR_0;
++    paramArray.resize(count);
++    if (rpc_read(conn, paramArray.data(),
++                 count * sizeof(CUstreamBatchMemOpParams)) < 0 ||
++        rpc_read(conn, &flags, sizeof(unsigned int)) < 0)
+         goto ERROR_0;
+ 
+     request_id = rpc_read_end(conn);
+     if (request_id < 0)
+         goto ERROR_0;
+-    lupine_intercept_result = cuStreamBatchMemOp_v2(stream, count, &paramArray, flags);
++    lupine_intercept_result = cuStreamBatchMemOp_v2(stream, count, paramArray.data(), flags);
+ 
+     if (rpc_write_start_response(conn, request_id) < 0 ||
+-        rpc_write(conn, &paramArray, sizeof(CUstreamBatchMemOpParams)) < 0 ||
++        rpc_write(conn, paramArray.data(), count * sizeof(CUstreamBatchMemOpParams)) < 0 ||
+         rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
+         rpc_write_end(conn) < 0)
+         goto ERROR_0;
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -3585,6 +3585,31 @@
+   return 0;
+ }
+ 
++int handle_manual_cuMemcpyAsync(conn_t *conn) {
++  CUdeviceptr dst = 0;
++  CUdeviceptr src = 0;
++  size_t byte_count = 0;
++  CUstream stream = nullptr;
++  if (rpc_read(conn, &dst, sizeof(dst)) < 0 ||
++      rpc_read(conn, &src, sizeof(src)) < 0 ||
++      rpc_read(conn, &byte_count, sizeof(byte_count)) < 0 ||
++      rpc_read(conn, &stream, sizeof(stream)) < 0) {
++    return -1;
++  }
++  int request_id = rpc_read_end(conn);
++  if (request_id < 0) {
++    return -1;
++  }
++  // The client classifies pageable/pinned host addresses before choosing this
++  // RPC, so this remaining path is a same-server device-to-device copy.
++  CUresult result = cuMemcpyAsync(dst, src, byte_count, stream);
++  if (rpc_write_start_response(conn, request_id) < 0 ||
++      rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
++    return -1;
++  }
++  return 0;
++}
++
+ int handle_manual_cuMemcpyHtoDAsync_v2(conn_t *conn) {
+   CUdeviceptr dstDevice = 0;
+   size_t byteCount = 0;
+--- a/manual_server.h
++++ b/manual_server.h
+@@ -78,6 +78,7 @@
+ int handle_manual_cuGraphInstantiateWithParams(conn_t *conn);
+ int handle_manual_cuGraphExecDestroy(conn_t *conn);
+ int handle_manual_cuGraphDestroy(conn_t *conn);
++int handle_manual_cuMemcpyAsync(conn_t *conn);
+ int handle_manual_cuMemcpyHtoDAsync_v2(conn_t *conn);
+ int handle_manual_lupineDeviceSnapshot(conn_t *conn);
+ int handle_manual_lupineManagedHostFlush(conn_t *conn);
+--- a/server.cpp
++++ b/server.cpp
+@@ -268,6 +268,8 @@
+       {RPC_cuGraphExecDestroy,
+        {handle_manual_cuGraphExecDestroy, "cuGraphExecDestroy"}},
+       {RPC_cuGraphDestroy, {handle_manual_cuGraphDestroy, "cuGraphDestroy"}},
++      {RPC_cuMemcpyAsync,
++       {handle_manual_cuMemcpyAsync, "cuMemcpyAsync"}},
+       {RPC_cuMemcpyHtoD_v2, {handle_manual_cuMemcpyHtoD_v2, "cuMemcpyHtoD_v2"}},
+       {RPC_cuMemcpyHtoDAsync_v2,
+        {handle_manual_cuMemcpyHtoDAsync_v2, "cuMemcpyHtoDAsync_v2"}},

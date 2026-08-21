@@ -1,0 +1,92 @@
+--- a/memcpy.cpp
++++ b/memcpy.cpp
+@@ -821,6 +821,27 @@
+          lupine_mutable_host_allocations_locked().end();
+ }
+ 
++// Ordinary pinned buffers have distinct client and server virtual addresses.
++// Pointer attributes must be queried against the server's pinned mirror, but
++// host-pointer answers retain the address visible to the application.
++static bool lupine_translate_pinned_host_ptr(CUdeviceptr ptr,
++                                             CUdeviceptr *translated) {
++  void *host = reinterpret_cast<void *>(ptr);
++  std::lock_guard<std::mutex> lock(lupine_host_allocation_mutex());
++  auto it = lupine_find_host_allocation_locked(host);
++  if (it == lupine_mutable_host_allocations_locked().end() ||
++      it->second.managed || it->second.local_cuda ||
++      it->second.server_host_ptr == 0) {
++    return false;
++  }
++  uintptr_t base = reinterpret_cast<uintptr_t>(it->first);
++  uintptr_t address = reinterpret_cast<uintptr_t>(host);
++  if (translated != nullptr) {
++    *translated = it->second.server_host_ptr + (address - base);
++  }
++  return true;
++}
++
+ static bool lupine_managed_host_alias_base(CUdeviceptr ptr,
+                                            CUdeviceptr *alias_base) {
+   void *host = reinterpret_cast<void *>(ptr);
+@@ -1519,7 +1540,12 @@
+       lupine_remote_cuMemFreeHost(remote_host, route);
+       return CUDA_ERROR_OUT_OF_MEMORY;
+     }
+-    if (!lupine_enable_dirty_tracking_locked(ptr, &inserted.first->second)) {
++    // Ordinary pinned staging buffers must remain writable by kernel syscalls
++    // such as read(2).  Page-protection dirty tracking is only needed when the
++    // application explicitly requests a device-visible host mapping; explicit
++    // H2D/D2H APIs already carry staging-buffer contents over their copy path.
++    if (lupine_host_flags_request_mapping(Flags) &&
++        !lupine_enable_dirty_tracking_locked(ptr, &inserted.first->second)) {
+       allocations.erase(inserted.first);
+       munmap(ptr, storage_size);
+       lupine_remote_cuMemFreeHost(remote_host, route);
+@@ -2196,6 +2222,8 @@
+ 
+   CUdeviceptr query_ptr = ptr;
+   bool managed_alias = lupine_translate_managed_host_ptr(ptr, &query_ptr);
++  bool pinned_host_alias =
++      !managed_alias && lupine_translate_pinned_host_ptr(ptr, &query_ptr);
+   lupine_route route = lupine_route_for_deviceptr(query_ptr);
+   if (lupine_route_is_local(route)) {
+     using real_fn_t = CUresult (*)(void *, CUpointer_attribute, CUdeviceptr);
+@@ -2208,7 +2236,8 @@
+   if (lupine_pointer_attribute_cache_lookup_single(
+           query_ptr, attribute, value, value_size)) {
+     memcpy(data, value, value_size);
+-    if (managed_alias && attribute == CU_POINTER_ATTRIBUTE_HOST_POINTER) {
++    if ((managed_alias || pinned_host_alias) &&
++        attribute == CU_POINTER_ATTRIBUTE_HOST_POINTER) {
+       void *host = reinterpret_cast<void *>(ptr);
+       memcpy(data, &host, sizeof(host));
+     } else if (managed_alias &&
+@@ -2232,7 +2261,8 @@
+     lupine_pointer_attribute_cache_insert_single(query_ptr, attribute, value,
+                                                  value_size);
+     memcpy(data, value, value_size);
+-    if (managed_alias && attribute == CU_POINTER_ATTRIBUTE_HOST_POINTER) {
++    if ((managed_alias || pinned_host_alias) &&
++        attribute == CU_POINTER_ATTRIBUTE_HOST_POINTER) {
+       void *host = reinterpret_cast<void *>(ptr);
+       memcpy(data, &host, sizeof(host));
+     } else if (managed_alias && attribute == CU_POINTER_ATTRIBUTE_IS_MANAGED) {
+@@ -2421,6 +2451,8 @@
+ 
+   CUdeviceptr query_ptr = ptr;
+   bool managed_alias = lupine_translate_managed_host_ptr(ptr, &query_ptr);
++  bool pinned_host_alias =
++      !managed_alias && lupine_translate_pinned_host_ptr(ptr, &query_ptr);
+   lupine_route route = lupine_route_for_deviceptr(query_ptr);
+   if (lupine_route_is_local(route)) {
+     using real_fn_t =
+@@ -2556,7 +2588,8 @@
+         return CUDA_ERROR_INVALID_VALUE;
+       }
+       memcpy(data[i], values[i].data(), values[i].size());
+-      if (managed_alias && attributes[i] == CU_POINTER_ATTRIBUTE_HOST_POINTER) {
++      if ((managed_alias || pinned_host_alias) &&
++          attributes[i] == CU_POINTER_ATTRIBUTE_HOST_POINTER) {
+         void *host = reinterpret_cast<void *>(ptr);
+         memcpy(data[i], &host, sizeof(host));
+       } else if (managed_alias &&

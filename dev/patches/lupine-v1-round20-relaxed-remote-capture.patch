@@ -1,0 +1,13 @@
+diff --git a/manual_server.cpp b/manual_server.cpp
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -3462,7 +3462,8 @@ int handle_manual_cuStreamBeginCapture(conn_t *conn) {
+   if (result == CUDA_SUCCESS) {
+     result = !resources->has_capture_scratch()
+                  ? CUDA_ERROR_OUT_OF_MEMORY
+-                 : cuStreamBeginCapture_v2(stream, mode);
++                 : cuStreamBeginCapture_v2(
++                       stream, CU_STREAM_CAPTURE_MODE_RELAXED);
+   }
+   if (rpc_write_start_response(conn, request_id) < 0 ||
+       rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {

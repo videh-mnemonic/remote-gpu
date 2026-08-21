@@ -1,0 +1,44 @@
+diff --git a/lupine_cublas.h b/lupine_cublas.h
+index 79c4925..a195e98 100644
+--- a/lupine_cublas.h
++++ b/lupine_cublas.h
+@@ -159,6 +159,9 @@ enum lupine_cublas_opcode : uint32_t {
+   LUPINE_CUBLAS_DGEQRF_BATCHED = 154,
+   LUPINE_CUBLAS_CGEQRF_BATCHED = 155,
+   LUPINE_CUBLAS_ZGEQRF_BATCHED = 156,
++  LUPINE_CUSOLVER_DN_SPOTRF_BATCHED = 157,
++  LUPINE_CUSOLVER_DN_CPOTRF_BATCHED = 158,
++  LUPINE_CUSOLVER_DN_ZPOTRF_BATCHED = 159,
+ };
+ 
+ struct lupine_cublas_request {
+diff --git a/manual_server.cpp b/manual_server.cpp
+index 31a0597..bafc4ad 100644
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -5036,6 +5036,25 @@ int handle_manual_lupineCublasCall(conn_t *conn) {
+                    reinterpret_cast<int *>(request.b), request.batch_count);
+     break;
+   }
++  case LUPINE_CUSOLVER_DN_SPOTRF_BATCHED:
++  case LUPINE_CUSOLVER_DN_CPOTRF_BATCHED:
++  case LUPINE_CUSOLVER_DN_ZPOTRF_BATCHED: {
++    using function = int (*)(void *, int, int, void **, int, int *, int);
++    const char *symbol =
++        request.opcode == LUPINE_CUSOLVER_DN_SPOTRF_BATCHED
++            ? "cusolverDnSpotrfBatched"
++            : request.opcode == LUPINE_CUSOLVER_DN_CPOTRF_BATCHED
++                  ? "cusolverDnCpotrfBatched"
++                  : "cusolverDnZpotrfBatched";
++    auto call = reinterpret_cast<function>(solver_symbol(symbol));
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.transa, request.n,
++                   reinterpret_cast<void **>(request.a), request.lda,
++                   reinterpret_cast<int *>(request.b), request.batch_count);
++    break;
++  }
+   case LUPINE_CUSOLVER_DN_DPOTRS_BATCHED: {
+     using function = int (*)(void *, int, int, int, const double **, int,
+                              double **, int, int *, int);

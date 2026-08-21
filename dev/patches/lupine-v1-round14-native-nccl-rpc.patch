@@ -1,0 +1,563 @@
+diff --git a/client.cpp b/client.cpp
+index 58b7ba8..249af48 100644
+--- a/client.cpp
++++ b/client.cpp
+@@ -1,6 +1,7 @@
+ #include <algorithm>
+ #include <arpa/inet.h>
+ #include <atomic>
++#include <climits>
+ #include <cstdint>
+ #include <cstring>
+ #include <cuda.h>
+@@ -58,6 +59,7 @@
+ #include "lupine_attr_sizes.h"
+ #include "lupine_fatbin.h"
+ #include "lupine_log.h"
++#include "lupine_nccl.h"
+ #include "memcpy.h"
+ #include "rpc.h"
+ #include "third_party/libcuckoo/libcuckoo/cuckoohash_map.hh"
+@@ -271,6 +273,24 @@ extern "C" CUresult lupine_unsupported_driver_api() {
+   return CUDA_ERROR_NOT_SUPPORTED;
+ }
+ 
++extern "C" int lupine_nccl_call(const lupine_nccl_request *request,
++                                 lupine_nccl_response *response) {
++  if (request == nullptr || response == nullptr) return -1;
++  conn_t *conn = request->stream != 0
++                     ? lupine_rpc_conn_for_stream(
++                           reinterpret_cast<CUstream>(request->stream))
++                     : lupine_rpc_conn_for_current_context();
++  if (conn == nullptr) return -1;
++  if (rpc_write_start_request(conn, LUPINE_RPC_lupineNcclCall) < 0 ||
++      rpc_write(conn, request, sizeof(*request)) < 0 ||
++      rpc_wait_for_response(conn) < 0 ||
++      rpc_read(conn, response, sizeof(*response)) < 0 ||
++      rpc_read_end(conn) < 0) {
++    return -1;
++  }
++  return 0;
++}
++
+ extern "C" CUresult lupine_missing_driver_api_called(const char *symbol) {
+   LUPINE_LOG_ERROR("LUPINE missing Driver API called: " << symbol);
+   return CUDA_ERROR_NOT_SUPPORTED;
+@@ -5689,8 +5709,26 @@ extern "C" CUresult cuMemcpy3D(const CUDA_MEMCPY3D *pCopy) {
+ 
+ extern "C" CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src,
+                                   size_t ByteCount, CUstream hStream) {
+-  bool dst_is_host = lupine_is_local_address(reinterpret_cast<void *>(dst));
+-  bool src_is_host = lupine_is_local_address(reinterpret_cast<void *>(src));
++  // The execution route is definitive for CUDA's untyped UVA copy API. Let
++  // the native driver classify both pointers when the stream/current context
++  // is local; this also covers NCCL's VMM allocations, which are not created
++  // through cuMemAlloc and therefore are absent from the allocation registry.
++  lupine_route execution_route =
++      hStream != nullptr ? lupine_route_for_stream(hStream)
++                         : lupine_route_for_current_context();
++  if (lupine_route_is_local(execution_route)) {
++    using real_fn_t = CUresult (*)(CUdeviceptr, CUdeviceptr, size_t, CUstream);
++    auto real = lupine_real_cuda_fn<real_fn_t>("cuMemcpyAsync");
++    return real == nullptr ? CUDA_ERROR_DEVICE_UNAVAILABLE
++                           : real(dst, src, ByteCount, hStream);
++  }
++  // Recent NVIDIA drivers reserve GPU UVA ranges in the process page tables,
++  // so mincore() alone can misclassify a valid device allocation as host
++  // memory. Ownership recorded at allocation time is authoritative.
++  bool dst_is_host = !lupine_deviceptr_is_tracked(dst) &&
++                     lupine_is_local_address(reinterpret_cast<void *>(dst));
++  bool src_is_host = !lupine_deviceptr_is_tracked(src) &&
++                     lupine_is_local_address(reinterpret_cast<void *>(src));
+ 
+   if (dst_is_host && !src_is_host) {
+     return cuMemcpyDtoHAsync_v2(reinterpret_cast<void *>(dst), src, ByteCount,
+@@ -8194,6 +8232,59 @@ extern "C" CUresult cuGetExportTable(const void **ppExportTable,
+     *ppExportTable = lupine_get_context_checks_table();
+     return CUDA_SUCCESS;
+   }
++  // Unknown private tables contain driver function pointers whose arguments
++  // include process-local CUDA handles. A native consumer on a local route
++  // must receive the real driver's table. Known runtime tables above remain
++  // interposed because libcudart uses them even for mixed device routing.
++  {
++    using real_fn_t = CUresult (*)(const void **, const CUuuid *);
++    CUresult local_result = CUDA_ERROR_DEVICE_UNAVAILABLE;
++    lupine_route route = lupine_route_for_current_context();
++    bool rank_route_selected = false;
++    // CUDA math libraries cache these opaque tables process-wide.  torchrun
++    // commonly imports CUDA while device 0 is current and only then selects
++    // LOCAL_RANK.  Prefer that rank's eventual device so a remote rank does
++    // not retain a native cuBLAS table and later pass remote addresses to it.
++    // Public driver entry points remain dynamically routed and mixed-device
++    // applications without LOCAL_RANK retain the current-context behavior.
++    const char *local_rank_value = getenv("LOCAL_RANK");
++    if (local_rank_value != nullptr && local_rank_value[0] != '\0') {
++      char *end = nullptr;
++      long local_rank = strtol(local_rank_value, &end, 10);
++      if (end != local_rank_value && *end == '\0' && local_rank >= 0 &&
++          local_rank <= INT_MAX) {
++        CUdevice rank_device = static_cast<CUdevice>(local_rank);
++        lupine_route rank_route = lupine_route_for_device(&rank_device);
++        if (lupine_route_identity(rank_route) != -2) {
++          route = rank_route;
++          rank_route_selected = true;
++        }
++      }
++    }
++    if (!rank_route_selected && !lupine_route_is_local(route)) {
++      using current_fn_t = CUresult (*)(CUcontext *);
++      auto current = lupine_real_cuda_fn<current_fn_t>("cuCtxGetCurrent");
++      CUcontext actual = nullptr;
++      if (current != nullptr && current(&actual) == CUDA_SUCCESS &&
++          actual != nullptr) {
++        route = lupine_route_for_context(actual);
++      }
++    }
++    // This cuBLAS runtime table participates in the interposed context/TLS
++    // machinery even for a local rank. Returning the native table while the
++    // known runtime tables above are proxied creates a split internal state.
++    // Its small used surface is implemented by the generated private-table
++    // stubs, which then call the normally routed public Driver API.
++    static constexpr unsigned char CUBLAS_RUNTIME_UUID[16] = {
++        0x21, 0x31, 0x8c, 0x60, 0x97, 0x14, 0x32, 0x48,
++        0x8c, 0xa6, 0x41, 0xff, 0x73, 0x24, 0xc8, 0xf2};
++    if (!lupine_uuid_equals(pExportTableId, CUBLAS_RUNTIME_UUID) &&
++        lupine_call_local_cuda_if_routed<real_fn_t>(
++            route, "cuGetExportTable", &local_result, ppExportTable,
++            pExportTableId)) {
++      return local_result;
++    }
++  }
+   {
+     const void *private_table =
+         lupine_remote_private_export_table(pExportTableId);
+@@ -8344,14 +8435,25 @@ LUPINE_DEFINE_UNSUPPORTED_STUB(cuDevSmResourceSplit)
+ LUPINE_DEFINE_UNSUPPORTED_STUB(cuDeviceGetHostAtomicCapabilities)
+ LUPINE_DEFINE_UNSUPPORTED_STUB(cuDeviceGetP2PAtomicCapabilities)
+ 
+-// NCCL probes ordinary cudaMalloc allocations with this VMM-only API while
+-// selecting transport paths. CUDA_ERROR_NOT_SUPPORTED is the expected signal
+-// for a non-VMM allocation, so provide a typed, quiet compatibility fallback
+-// instead of synthesizing a generic missing-symbol trampoline on every probe.
+-extern "C" CUresult lupine_cuMemRetainAllocationHandle_unsupported(
++// NCCL both probes ordinary allocations and retains real VMM handles during
++// communicator cleanup. Route local pointers to the native typed API; an
++// ordinary allocation will naturally return CUDA_ERROR_NOT_SUPPORTED, while
++// a VMM allocation can be released without leaking the communicator.
++extern "C" CUresult lupine_cuMemRetainAllocationHandle_routed(
+     CUmemGenericAllocationHandle *handle, void *addr) {
+-  (void)handle;
+-  (void)addr;
++  if (handle == nullptr || addr == nullptr) {
++    return CUDA_ERROR_INVALID_VALUE;
++  }
++  lupine_route route = lupine_route_for_deviceptr(
++      static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(addr)));
++  if (lupine_route_is_local(route)) {
++    using real_fn_t = CUresult (*)(CUmemGenericAllocationHandle *, void *);
++    auto real = lupine_real_cuda_fn<real_fn_t>(
++        "cuMemRetainAllocationHandle");
++    return real == nullptr ? CUDA_ERROR_NOT_SUPPORTED : real(handle, addr);
++  }
++  // Remote NCCL executes this operation beside the remote context. A direct
++  // client-side remote VMM call still needs a typed RPC implementation.
+   return CUDA_ERROR_NOT_SUPPORTED;
+ }
+ 
+@@ -8419,7 +8521,7 @@ static void *lupine_get_unsupported_stub(const char *symbol) {
+ #define LUPINE_STUB_ENTRY(name)                                                \
+   { #name, (void *)&lupine_unsupported_##name }
+       {"cuMemRetainAllocationHandle",
+-       (void *)&lupine_cuMemRetainAllocationHandle_unsupported},
++       (void *)&lupine_cuMemRetainAllocationHandle_routed},
+       LUPINE_STUB_ENTRY(cuCtxCreate),
+       LUPINE_STUB_ENTRY(cuModuleLoadData),
+       LUPINE_STUB_ENTRY(cuModuleLoadFatBinary),
+diff --git a/client.exports b/client.exports
+index 8e7e29b..d22560e 100644
+--- a/client.exports
++++ b/client.exports
+@@ -8,6 +8,8 @@ LUPINE_1.0 {
+     cu*;
+     lupine_checkpoint_*;
+     lupine_local_cuda_*;
++    lupine_cuda_current_route_is_remote;
++    lupine_nccl_call;
+     lupine_rpc_stats_reset;
+   local:
+     *;
+diff --git a/codegen/gen_api.h b/codegen/gen_api.h
+index d72dc62..0ae5bd6 100644
+--- a/codegen/gen_api.h
++++ b/codegen/gen_api.h
+@@ -456,4 +456,5 @@
+ #define LUPINE_RPC_lupineDeviceSnapshot 838398900
+ #define LUPINE_RPC_lupineManagedHostFlush 1450411892
+ #define LUPINE_RPC_lupineMappedHostSnapshot 1450411893
++#define LUPINE_RPC_lupineNcclCall 1450411894
+ #define LUPINE_RPC_lupineModuleGetFunctionWithLayout 368273666
+diff --git a/h2.cpp b/h2.cpp
+index ee4aca3..7f7033a 100644
+--- a/h2.cpp
++++ b/h2.cpp
+@@ -421,11 +421,11 @@ constexpr char kLupineCompressHeader[] = "x-lupine-compress";
+ constexpr char kLupineCompressLz4[] = "lz4";
+ constexpr char kLupineCudaVersionHeader[] = "x-lupine-cuda-version";
+ constexpr char kLupineProtocolHeader[] = "x-lupine-protocol";
+-constexpr char kLupineProtocolVersion[] = "3";
++constexpr char kLupineProtocolVersion[] = "5";
+ #ifdef LUPINE_H2_PROTOCOL_MISMATCH_TEST
+ constexpr char kLupineClientProtocolVersion[] = "mismatch-test";
+ #else
+-constexpr char kLupineClientProtocolVersion[] = "3";
++constexpr char kLupineClientProtocolVersion[] = "5";
+ #endif
+ constexpr char kLupineSessionHeader[] = "x-lupine-session";
+ #ifdef LUPINE_CUDA_VERSION
+diff --git a/manual_server.cpp b/manual_server.cpp
+index 400cb8a..8ad5b59 100644
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -8,6 +8,7 @@
+ #include <cuda.h>
+ #include <errno.h>
+ #if defined(__linux__)
++#include <dlfcn.h>
+ #include <sys/mman.h> // memfd_create
+ #endif
+ #include <future>
+@@ -45,6 +46,7 @@
+ #include "lupine_attr_sizes.h"
+ #include "lupine_fatbin.h"
+ #include "lupine_log.h"
++#include "lupine_nccl.h"
+ #include "manual_server.h"
+ #include "rpc.h"
+ 
+@@ -3838,6 +3840,259 @@ int handle_manual_lupineMappedHostSnapshot(conn_t *conn) {
+   if (rpc_write_end(conn) < 0) return -1;
+   return 0;
+ }
++
++int handle_manual_lupineNcclCall(conn_t *conn) {
++  lupine_nccl_request request;
++  if (rpc_read(conn, &request, sizeof(request)) < 0) return -1;
++  int request_id = rpc_read_end(conn);
++  if (request_id < 0) return -1;
++
++  struct nccl_unique_id {
++    unsigned char bytes[128];
++  };
++  using nccl_comm = void *;
++  using nccl_stream = void *;
++  static void *library = [] {
++    void *handle = dlopen("libnccl.so.2", RTLD_NOW | RTLD_LOCAL);
++    if (handle == nullptr) {
++      handle = dlopen(
++          "/usr/local/lib/python3.12/site-packages/nvidia/nccl/lib/"
++          "libnccl.so.2",
++          RTLD_NOW | RTLD_LOCAL);
++    }
++    if (handle == nullptr) {
++      LUPINE_LOG_ERROR("Unable to load server NCCL: " << dlerror());
++    }
++    return handle;
++  }();
++  auto symbol = [](const char *name) -> void * {
++    return library == nullptr ? nullptr : dlsym(library, name);
++  };
++
++  lupine_nccl_response response;
++  nccl_comm communicator = reinterpret_cast<nccl_comm>(request.communicator);
++  nccl_stream stream = reinterpret_cast<nccl_stream>(request.stream);
++  switch (request.opcode) {
++  case LUPINE_NCCL_GET_UNIQUE_ID: {
++    using function = int (*)(nccl_unique_id *);
++    auto call = reinterpret_cast<function>(symbol("ncclGetUniqueId"));
++    nccl_unique_id id;
++    response.result = call == nullptr ? 2 : call(&id);
++    if (response.result == 0) {
++      memcpy(response.unique_id, id.bytes, sizeof(id.bytes));
++    }
++    break;
++  }
++  case LUPINE_NCCL_INIT_RANK: {
++    using function = int (*)(nccl_comm *, int, nccl_unique_id, int);
++    auto call = reinterpret_cast<function>(symbol("ncclCommInitRank"));
++    nccl_unique_id id;
++    memcpy(id.bytes, request.unique_id, sizeof(id.bytes));
++    response.result =
++        call == nullptr ? 2 : call(&communicator, request.ranks, id, request.rank);
++    response.communicator = reinterpret_cast<uint64_t>(communicator);
++    break;
++  }
++  case LUPINE_NCCL_GROUP_START:
++  case LUPINE_NCCL_GROUP_END: {
++    using function = int (*)(void);
++    const char *name = request.opcode == LUPINE_NCCL_GROUP_START
++                           ? "ncclGroupStart"
++                           : "ncclGroupEnd";
++    auto call = reinterpret_cast<function>(symbol(name));
++    response.result = call == nullptr ? 2 : call();
++    break;
++  }
++  case LUPINE_NCCL_ALL_REDUCE: {
++    using function = int (*)(const void *, void *, size_t, int, int, nccl_comm,
++                             nccl_stream);
++    auto call = reinterpret_cast<function>(symbol("ncclAllReduce"));
++    response.result = call == nullptr
++                          ? 2
++                          : call(reinterpret_cast<const void *>(request.send_buffer),
++                                 reinterpret_cast<void *>(request.receive_buffer),
++                                 request.count, request.datatype,
++                                 request.reduction, communicator, stream);
++    break;
++  }
++  case LUPINE_NCCL_ALL_GATHER: {
++    using function = int (*)(const void *, void *, size_t, int, nccl_comm,
++                             nccl_stream);
++    auto call = reinterpret_cast<function>(symbol("ncclAllGather"));
++    response.result = call == nullptr
++                          ? 2
++                          : call(reinterpret_cast<const void *>(request.send_buffer),
++                                 reinterpret_cast<void *>(request.receive_buffer),
++                                 request.count, request.datatype, communicator,
++                                 stream);
++    break;
++  }
++  case LUPINE_NCCL_REDUCE_SCATTER: {
++    using function = int (*)(const void *, void *, size_t, int, int, nccl_comm,
++                             nccl_stream);
++    auto call = reinterpret_cast<function>(symbol("ncclReduceScatter"));
++    response.result = call == nullptr
++                          ? 2
++                          : call(reinterpret_cast<const void *>(request.send_buffer),
++                                 reinterpret_cast<void *>(request.receive_buffer),
++                                 request.count, request.datatype,
++                                 request.reduction, communicator, stream);
++    break;
++  }
++  case LUPINE_NCCL_BROADCAST: {
++    using function = int (*)(const void *, void *, size_t, int, int, nccl_comm,
++                             nccl_stream);
++    auto call = reinterpret_cast<function>(symbol("ncclBroadcast"));
++    response.result = call == nullptr
++                          ? 2
++                          : call(reinterpret_cast<const void *>(request.send_buffer),
++                                 reinterpret_cast<void *>(request.receive_buffer),
++                                 request.count, request.datatype, request.root,
++                                 communicator, stream);
++    break;
++  }
++  case LUPINE_NCCL_REDUCE: {
++    using function = int (*)(const void *, void *, size_t, int, int, int,
++                             nccl_comm, nccl_stream);
++    auto call = reinterpret_cast<function>(symbol("ncclReduce"));
++    response.result = call == nullptr ? 2 : call(
++        reinterpret_cast<const void *>(request.send_buffer),
++        reinterpret_cast<void *>(request.receive_buffer), request.count,
++        request.datatype, request.reduction, request.root, communicator, stream);
++    break;
++  }
++  case LUPINE_NCCL_BCAST: {
++    using function = int (*)(void *, size_t, int, int, nccl_comm, nccl_stream);
++    auto call = reinterpret_cast<function>(symbol("ncclBcast"));
++    response.result = call == nullptr ? 2 : call(
++        reinterpret_cast<void *>(request.send_buffer), request.count,
++        request.datatype, request.root, communicator, stream);
++    break;
++  }
++  case LUPINE_NCCL_ALL_TO_ALL: {
++    using function = int (*)(const void *, void *, size_t, int, nccl_comm,
++                             nccl_stream);
++    auto call = reinterpret_cast<function>(symbol("ncclAlltoAll"));
++    response.result = call == nullptr ? 2 : call(
++        reinterpret_cast<const void *>(request.send_buffer),
++        reinterpret_cast<void *>(request.receive_buffer), request.count,
++        request.datatype, communicator, stream);
++    break;
++  }
++  case LUPINE_NCCL_GATHER:
++  case LUPINE_NCCL_SCATTER: {
++    using function = int (*)(const void *, void *, size_t, int, int, nccl_comm,
++                             nccl_stream);
++    const char *name = request.opcode == LUPINE_NCCL_GATHER ? "ncclGather"
++                                                            : "ncclScatter";
++    auto call = reinterpret_cast<function>(symbol(name));
++    response.result = call == nullptr ? 2 : call(
++        reinterpret_cast<const void *>(request.send_buffer),
++        reinterpret_cast<void *>(request.receive_buffer), request.count,
++        request.datatype, request.root, communicator, stream);
++    break;
++  }
++  case LUPINE_NCCL_SEND:
++  case LUPINE_NCCL_RECV: {
++    if (request.opcode == LUPINE_NCCL_SEND) {
++      using function = int (*)(const void *, size_t, int, int, nccl_comm,
++                               nccl_stream);
++      auto call = reinterpret_cast<function>(symbol("ncclSend"));
++      response.result = call == nullptr ? 2 : call(
++          reinterpret_cast<const void *>(request.send_buffer), request.count,
++          request.datatype, request.root, communicator, stream);
++    } else {
++      using function = int (*)(void *, size_t, int, int, nccl_comm,
++                               nccl_stream);
++      auto call = reinterpret_cast<function>(symbol("ncclRecv"));
++      response.result = call == nullptr ? 2 : call(
++          reinterpret_cast<void *>(request.receive_buffer), request.count,
++          request.datatype, request.root, communicator, stream);
++    }
++    break;
++  }
++  case LUPINE_NCCL_COMM_COUNT:
++  case LUPINE_NCCL_COMM_CUDA_DEVICE:
++  case LUPINE_NCCL_COMM_USER_RANK: {
++    using function = int (*)(const nccl_comm, int *);
++    const char *name = request.opcode == LUPINE_NCCL_COMM_COUNT
++                           ? "ncclCommCount"
++                           : (request.opcode == LUPINE_NCCL_COMM_CUDA_DEVICE
++                                  ? "ncclCommCuDevice"
++                                  : "ncclCommUserRank");
++    auto call = reinterpret_cast<function>(symbol(name));
++    response.result = call == nullptr ? 2 : call(communicator, &response.value);
++    break;
++  }
++  case LUPINE_NCCL_COMM_REGISTER: {
++    using function = int (*)(const nccl_comm, void *, size_t, void **);
++    auto call = reinterpret_cast<function>(symbol("ncclCommRegister"));
++    void *handle = nullptr;
++    response.result = call == nullptr ? 2 : call(
++        communicator, reinterpret_cast<void *>(request.send_buffer),
++        request.count, &handle);
++    response.handle = reinterpret_cast<uint64_t>(handle);
++    break;
++  }
++  case LUPINE_NCCL_COMM_DEREGISTER: {
++    using function = int (*)(const nccl_comm, void *);
++    auto call = reinterpret_cast<function>(symbol("ncclCommDeregister"));
++    response.result = call == nullptr ? 2 : call(
++        communicator, reinterpret_cast<void *>(request.send_buffer));
++    break;
++  }
++  case LUPINE_NCCL_COMM_SPLIT: {
++    using function = int (*)(nccl_comm, int, int, nccl_comm *, void *);
++    auto call = reinterpret_cast<function>(symbol("ncclCommSplit"));
++    nccl_comm new_communicator = nullptr;
++    response.result = call == nullptr ? 2 : call(
++        communicator, request.rank, request.root, &new_communicator, nullptr);
++    response.communicator = reinterpret_cast<uint64_t>(new_communicator);
++    break;
++  }
++  case LUPINE_NCCL_LAST_ERROR: {
++    using function = const char *(*)(const nccl_comm);
++    auto call = reinterpret_cast<function>(symbol("ncclGetLastError"));
++    const char *message = call == nullptr ? "server NCCL symbol unavailable"
++                                          : call(communicator);
++    response.result = 0;
++    if (message != nullptr) {
++      strncpy(response.error_string, message, sizeof(response.error_string) - 1);
++    }
++    break;
++  }
++  case LUPINE_NCCL_ASYNC_ERROR: {
++    using function = int (*)(nccl_comm, int *);
++    auto call = reinterpret_cast<function>(symbol("ncclCommGetAsyncError"));
++    response.result =
++        call == nullptr ? 2 : call(communicator, &response.async_error);
++    break;
++  }
++  case LUPINE_NCCL_FINALIZE:
++  case LUPINE_NCCL_DESTROY:
++  case LUPINE_NCCL_ABORT: {
++    using function = int (*)(nccl_comm);
++    const char *name = request.opcode == LUPINE_NCCL_FINALIZE
++                           ? "ncclCommFinalize"
++                           : (request.opcode == LUPINE_NCCL_DESTROY
++                                  ? "ncclCommDestroy"
++                                  : "ncclCommAbort");
++    auto call = reinterpret_cast<function>(symbol(name));
++    response.result = call == nullptr ? 2 : call(communicator);
++    break;
++  }
++  default:
++    response.result = 2;
++    break;
++  }
++
++  if (rpc_write_start_response(conn, request_id) < 0 ||
++      rpc_write(conn, &response, sizeof(response)) < 0 ||
++      rpc_write_end(conn) < 0) {
++    return -1;
++  }
++  return 0;
++}
+ // Serves LUPINE_RPC_lupineDeviceSnapshot: every immutable per-device value the
+ // client caches, for every device, in one response. Mutable state (primary
+ // context state, context limits) is deliberately excluded. The response is all
+diff --git a/manual_server.h b/manual_server.h
+index 215ed35..3cc2efc 100644
+--- a/manual_server.h
++++ b/manual_server.h
+@@ -83,6 +83,7 @@ int handle_manual_cuMemcpyHtoDAsync_v2(conn_t *conn);
+ int handle_manual_lupineDeviceSnapshot(conn_t *conn);
+ int handle_manual_lupineManagedHostFlush(conn_t *conn);
+ int handle_manual_lupineMappedHostSnapshot(conn_t *conn);
++int handle_manual_lupineNcclCall(conn_t *conn);
+ int handle_manual_cuMemcpyDtoHAsync_v2(conn_t *conn);
+ int handle_manual_cuMemHostAlloc(conn_t *conn);
+ int handle_manual_cuMemHostGetFlags(conn_t *conn);
+diff --git a/routing.cpp b/routing.cpp
+index d376861..9093bf8 100644
+--- a/routing.cpp
++++ b/routing.cpp
+@@ -79,6 +79,10 @@ extern "C" bool lupine_route_is_local(lupine_route route) {
+   return route.kind == LUPINE_ROUTE_LOCAL;
+ }
+ 
++extern "C" int lupine_cuda_current_route_is_remote() {
++  return lupine_route_for_current_context().kind == LUPINE_ROUTE_REMOTE ? 1 : 0;
++}
++
+ extern "C" conn_t *lupine_route_remote_conn(lupine_route route) {
+   return route.kind == LUPINE_ROUTE_REMOTE ? route.conn : nullptr;
+ }
+@@ -224,17 +228,23 @@ static CUresult lupine_ensure_device_table() {
+   auto &devices = lupine_device_table();
+   devices.clear();
+ 
++  using cuInit_fn = CUresult (*)(unsigned int);
+   using cuDeviceGetCount_fn = CUresult (*)(int *);
+   using cuDeviceGet_fn = CUresult (*)(CUdevice *, int);
++  auto local_init_fn = lupine_real_cuda_fn<cuInit_fn>("cuInit");
+   auto local_count_fn =
+       lupine_real_cuda_fn<cuDeviceGetCount_fn>("cuDeviceGetCount");
+   auto local_get_fn = lupine_real_cuda_fn<cuDeviceGet_fn>("cuDeviceGet");
+   LUPINE_TRACE_LOG("LUPINE local device-table functions count="
+                    << reinterpret_cast<void *>(local_count_fn) << " get="
+                    << reinterpret_cast<void *>(local_get_fn));
+-  if (local_count_fn != nullptr && local_get_fn != nullptr) {
++  if (local_init_fn != nullptr && local_count_fn != nullptr &&
++      local_get_fn != nullptr) {
+     int local_count = 0;
+-    CUresult local_count_result = local_count_fn(&local_count);
++    CUresult local_init_result = local_init_fn(0);
++    CUresult local_count_result =
++        local_init_result == CUDA_SUCCESS ? local_count_fn(&local_count)
++                                          : local_init_result;
+     LUPINE_TRACE_LOG("LUPINE local device count result=" << local_count_result
+                                                          << " count="
+                                                          << local_count);
+diff --git a/server.cpp b/server.cpp
+index c0cc56f..f0a60c3 100644
+--- a/server.cpp
++++ b/server.cpp
+@@ -278,6 +278,8 @@ lupine_manual_handlers() {
+       {LUPINE_RPC_lupineMappedHostSnapshot,
+        {handle_manual_lupineMappedHostSnapshot,
+         "lupineMappedHostSnapshot"}},
++      {LUPINE_RPC_lupineNcclCall,
++       {handle_manual_lupineNcclCall, "lupineNcclCall"}},
+       {LUPINE_RPC_lupineDeviceSnapshot,
+        {handle_manual_lupineDeviceSnapshot, "lupineDeviceSnapshot"}},
+       {RPC_cuMemcpyDtoHAsync_v2,

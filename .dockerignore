@@ -1,6 +1,11 @@
 .git
 .pytest_cache
-external
-results
+dev/external
+dev/results
+dev/generated
+dev/releases
+logs
 __pycache__
 *.pyc
+rgpu-client/build
+rgpu-client/*.egg-info

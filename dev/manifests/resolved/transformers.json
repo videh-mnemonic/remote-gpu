@@ -1,0 +1,12 @@
+{
+  "commit_time": "2026-08-19T16:02:04Z",
+  "declared_license": "Apache-2.0",
+  "license_file": "LICENSE",
+  "license_sha256": "77fd4710def9ec3c0f6225800e0235f15a425abd4a8b03559127fcd782612049",
+  "name": "transformers",
+  "push_url": "disabled://public-push-prohibited",
+  "requested_ref": "main",
+  "resolved_commit": "94f09cfec149050b5355bab7f207ac69e21f1a02",
+  "retrieved_at": "2026-08-20T00:11:18.307239+00:00",
+  "url": "https://github.com/huggingface/transformers.git"
+}

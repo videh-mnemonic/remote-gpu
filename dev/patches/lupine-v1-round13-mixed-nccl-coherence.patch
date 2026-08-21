@@ -1,0 +1,569 @@
+diff --git a/client.cpp b/client.cpp
+index bfea7f7..58b7ba8 100644
+--- a/client.cpp
++++ b/client.cpp
+@@ -68,7 +68,29 @@ pthread_mutex_t conn_mutex;
+ conn_t conns[16];
+ int nconns = 0;
+ static bool lupine_rpc_shutting_down = false;
+-
++static std::atomic<bool> lupine_live_coherence_running{false};
++static std::thread *lupine_live_coherence_thread = nullptr;
++
++static CUresult lupine_maybe_start_live_mapped_coherence() {
++  const char *enabled = getenv("LUPINE_LIVE_MAPPED_COHERENCE");
++  if (enabled == nullptr || strcmp(enabled, "1") != 0) return CUDA_SUCCESS;
++  bool expected = false;
++  if (!lupine_live_coherence_running.compare_exchange_strong(expected, true)) {
++    return CUDA_SUCCESS;
++  }
++  CUresult initial = lupine_live_mapped_coherence_step();
++  if (initial != CUDA_SUCCESS) {
++    lupine_live_coherence_running.store(false);
++    return initial;
++  }
++  lupine_live_coherence_thread = new std::thread([] {
++    while (lupine_live_coherence_running.load(std::memory_order_acquire)) {
++      if (lupine_live_mapped_coherence_step() != CUDA_SUCCESS) break;
++      usleep(100);
++    }
++  });
++  return CUDA_SUCCESS;
++}
+ void rpc_destroy_thread_lane(uint64_t lane_id) {
+   conn_t *active_conns[sizeof(conns) / sizeof(conns[0])];
+   int count = 0;
+@@ -4875,6 +4897,7 @@ cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
+     if (status != CUDA_SUCCESS) {
+       return status;
+     }
++
+     route = lupine_route_for_function(f);
+ 
+     status = kernel_handle ? lupine_read_kernel_param_layout(
+@@ -4981,6 +5004,20 @@ extern "C" CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
+     if (status != CUDA_SUCCESS) {
+       return status;
+     }
++    // Packed launch buffers may contain a populated prefix of a larger
++    // by-value struct (NCCL declares 4 KiB but commonly sends 144 bytes), so
++    // kernel parameter metadata cannot be used to validate or enumerate it.
++    // Relocate aligned mapped-host pointer values within the actual prefix.
++    std::vector<unsigned char> translated_packed(packed_size);
++    if (packed_size != 0) {
++      memcpy(translated_packed.data(), packed_buffer, packed_size);
++    }
++    status = lupine_relocate_mapped_host_pointers(
++        translated_packed.data(), translated_packed.size());
++    if (status != CUDA_SUCCESS) return status;
++    status = lupine_maybe_start_live_mapped_coherence();
++    if (status != CUDA_SUCCESS) return status;
++    packed_buffer = translated_packed.data();
+     conn_t *conn = lupine_route_remote_conn(route);
+     CUcontext launch_context = nullptr;
+     if (lupine_current_context != nullptr &&
+@@ -8476,6 +8513,14 @@ void rpc_close(conn_t *conn) {
+ }
+ 
+ static void lupine_rpc_shutdown() {
++  lupine_live_coherence_running.store(false, std::memory_order_release);
++  if (lupine_live_coherence_thread != nullptr) {
++    if (lupine_live_coherence_thread->joinable()) {
++      lupine_live_coherence_thread->join();
++    }
++    delete lupine_live_coherence_thread;
++    lupine_live_coherence_thread = nullptr;
++  }
+   if (pthread_mutex_lock(&conn_mutex) < 0) {
+     return;
+   }
+diff --git a/codegen/gen_api.h b/codegen/gen_api.h
+index dc0b694..d72dc62 100644
+--- a/codegen/gen_api.h
++++ b/codegen/gen_api.h
+@@ -455,4 +455,5 @@
+ #define LUPINE_RPC_cuStreamGetCaptureInfo_v3 1793131524
+ #define LUPINE_RPC_lupineDeviceSnapshot 838398900
+ #define LUPINE_RPC_lupineManagedHostFlush 1450411892
++#define LUPINE_RPC_lupineMappedHostSnapshot 1450411893
+ #define LUPINE_RPC_lupineModuleGetFunctionWithLayout 368273666
+diff --git a/copy_pipeline.cpp b/copy_pipeline.cpp
+index 3cef3f1..de2b51d 100644
+--- a/copy_pipeline.cpp
++++ b/copy_pipeline.cpp
+@@ -1,9 +1,11 @@
+ #include <algorithm>
+ #include <cstddef>
+ #include <cuda.h>
++#include <vector>
+ 
+ #include "codegen/gen_api.h"
+ #include "copy_pipeline.h"
++#include "memcpy.h"
+ #include "rpc.h"
+ 
+ #ifdef LUPINE_RPC_CLIENT
+@@ -92,6 +94,24 @@ extern "C" CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice,
+     return CUDA_ERROR_INVALID_VALUE;
+   }
+   lupine_ensure_mapped_host_readable(srcHost, ByteCount);
++  // CUDA UVA permits host-mapped pointers to be embedded directly in device
++  // control structures. The client's shadow mapping has a different virtual
++  // address from the server's CUDA mapping, so relocate those shallow pointer
++  // fields before transmitting an H2D payload (NCCL's ncclKernelComm relies on
++  // this for abort/profiler control addresses).
++  constexpr size_t embedded_pointer_scan_limit = 1 << 20;
++  std::vector<unsigned char> relocated_payload;
++  const void *payload = srcHost;
++  if (ByteCount != 0 && ByteCount <= embedded_pointer_scan_limit) {
++    relocated_payload.resize(ByteCount);
++    memcpy(relocated_payload.data(), srcHost, ByteCount);
++    CUresult relocate_result = lupine_relocate_mapped_host_pointers(
++        relocated_payload.data(), relocated_payload.size());
++    if (relocate_result != CUDA_SUCCESS) {
++      return relocate_result;
++    }
++    payload = relocated_payload.data();
++  }
+   conn_t *conn = lupine_route_remote_conn(route);
+   if (conn == nullptr) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+@@ -100,7 +120,7 @@ extern "C" CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice,
+       rpc_write(conn, &dstDevice, sizeof(dstDevice)) < 0 ||
+       rpc_write(conn, &ByteCount, sizeof(ByteCount)) < 0 ||
+       rpc_write(conn, &hStream, sizeof(hStream)) < 0 ||
+-      (ByteCount != 0 && rpc_write_payload(conn, srcHost, ByteCount) < 0)) {
++      (ByteCount != 0 && rpc_write_payload(conn, payload, ByteCount) < 0)) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+   return rpc_write_end_deferred(conn) < 0 ? CUDA_ERROR_DEVICE_UNAVAILABLE
+diff --git a/h2.cpp b/h2.cpp
+index 38ac968..ee4aca3 100644
+--- a/h2.cpp
++++ b/h2.cpp
+@@ -421,11 +421,11 @@ constexpr char kLupineCompressHeader[] = "x-lupine-compress";
+ constexpr char kLupineCompressLz4[] = "lz4";
+ constexpr char kLupineCudaVersionHeader[] = "x-lupine-cuda-version";
+ constexpr char kLupineProtocolHeader[] = "x-lupine-protocol";
+-constexpr char kLupineProtocolVersion[] = "2";
++constexpr char kLupineProtocolVersion[] = "3";
+ #ifdef LUPINE_H2_PROTOCOL_MISMATCH_TEST
+ constexpr char kLupineClientProtocolVersion[] = "mismatch-test";
+ #else
+-constexpr char kLupineClientProtocolVersion[] = "2";
++constexpr char kLupineClientProtocolVersion[] = "3";
+ #endif
+ constexpr char kLupineSessionHeader[] = "x-lupine-session";
+ #ifdef LUPINE_CUDA_VERSION
+diff --git a/manual_server.cpp b/manual_server.cpp
+index 371a44c..400cb8a 100644
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -3785,6 +3785,59 @@ int handle_manual_lupineManagedHostFlush(conn_t *conn) {
+ 
+   return rpc_read_end(conn) < 0 ? -1 : 0;
+ }
++
++// Snapshot a server-side CUDA host mapping without synchronizing a stream.
++// Persistent kernels and CPU proxy threads use this memory concurrently, so a
++// CUDA D2H copy would deadlock behind the kernel it is intended to service.
++int handle_manual_lupineMappedHostSnapshot(conn_t *conn) {
++  static thread_local std::unordered_map<void *, std::vector<unsigned char>>
++      previous_snapshots;
++  void *server_host_ptr = nullptr;
++  size_t bytes = 0;
++  if (rpc_read(conn, &server_host_ptr, sizeof(server_host_ptr)) < 0 ||
++      rpc_read(conn, &bytes, sizeof(bytes)) < 0 || bytes > (1ULL << 30)) {
++    return -1;
++  }
++  int request_id = rpc_read_end(conn);
++  if (request_id < 0) return -1;
++
++  auto *source = static_cast<unsigned char *>(server_host_ptr);
++  auto found = previous_snapshots.find(server_host_ptr);
++  bool full = found == previous_snapshots.end() || found->second.size() != bytes;
++  std::vector<std::pair<uint64_t, uint32_t>> changed;
++  constexpr size_t block_bytes = 64;
++  if (full) {
++    previous_snapshots[server_host_ptr] =
++        std::vector<unsigned char>(source, source + bytes);
++  } else {
++    auto &previous = found->second;
++    for (size_t offset = 0; offset < bytes; offset += block_bytes) {
++      size_t block = std::min(block_bytes, bytes - offset);
++      if (memcmp(previous.data() + offset, source + offset, block) != 0) {
++        changed.emplace_back(offset, static_cast<uint32_t>(block));
++        memcpy(previous.data() + offset, source + offset, block);
++      }
++    }
++  }
++  uint32_t count = static_cast<uint32_t>(changed.size());
++  if (rpc_write_start_response(conn, request_id) < 0 ||
++      rpc_write(conn, &full, sizeof(full)) < 0 ||
++      rpc_write(conn, &count, sizeof(count)) < 0 ||
++      (full && bytes != 0 && rpc_write(conn, server_host_ptr, bytes) < 0)) {
++    return -1;
++  }
++  if (!full) {
++    for (const auto &range : changed) {
++      if (rpc_write(conn, &range.first, sizeof(range.first)) < 0 ||
++          rpc_write(conn, &range.second, sizeof(range.second)) < 0 ||
++          rpc_write(conn, source + range.first, range.second) < 0) {
++        return -1;
++      }
++    }
++  }
++  if (rpc_write_end(conn) < 0) return -1;
++  return 0;
++}
+ // Serves LUPINE_RPC_lupineDeviceSnapshot: every immutable per-device value the
+ // client caches, for every device, in one response. Mutable state (primary
+ // context state, context limits) is deliberately excluded. The response is all
+diff --git a/manual_server.h b/manual_server.h
+index 98f7c01..215ed35 100644
+--- a/manual_server.h
++++ b/manual_server.h
+@@ -82,6 +82,7 @@ int handle_manual_cuMemcpyAsync(conn_t *conn);
+ int handle_manual_cuMemcpyHtoDAsync_v2(conn_t *conn);
+ int handle_manual_lupineDeviceSnapshot(conn_t *conn);
+ int handle_manual_lupineManagedHostFlush(conn_t *conn);
++int handle_manual_lupineMappedHostSnapshot(conn_t *conn);
+ int handle_manual_cuMemcpyDtoHAsync_v2(conn_t *conn);
+ int handle_manual_cuMemHostAlloc(conn_t *conn);
+ int handle_manual_cuMemHostGetFlags(conn_t *conn);
+diff --git a/memcpy.cpp b/memcpy.cpp
+index 6a136ac..983a368 100644
+--- a/memcpy.cpp
++++ b/memcpy.cpp
+@@ -95,6 +95,9 @@ struct lupine_mapped_host_snapshot {
+   CUdeviceptr device_ptr = 0;
+   bool device_dirty = false;
+   bool managed = false;
++  CUdeviceptr server_host_ptr = 0;
++  int route_id = -2;
++  bool client_to_server_only = false;
+ };
+ 
+ using lupine_host_allocation_map =
+@@ -489,9 +492,11 @@ static std::vector<lupine_mapped_host_snapshot> lupine_mapped_host_snapshots() {
+   std::lock_guard<std::mutex> lock(lupine_host_allocation_mutex());
+   for (const auto &entry : lupine_mutable_host_allocations_locked()) {
+     if (entry.second.device_ptr != 0 && !entry.second.local_cuda) {
+-      snapshots.push_back({entry.first, entry.second.size,
+-                           entry.second.device_ptr, entry.second.device_dirty,
+-                           entry.second.managed});
++      snapshots.push_back(
++          {entry.first, entry.second.size, entry.second.device_ptr,
++           entry.second.device_dirty, entry.second.managed,
++           entry.second.server_host_ptr, entry.second.route_id,
++           entry.second.client_to_server_only});
+     }
+   }
+   return snapshots;
+@@ -909,6 +914,268 @@ CUresult lupine_sync_mapped_host_to_device_for_launch(
+   return lupine_flush_dirty_host_pages_to_server();
+ }
+ 
++extern "C" CUresult
++lupine_relocate_mapped_host_pointers(void *data_pointer, size_t bytes) {
++  if (data_pointer == nullptr && bytes != 0) {
++    return CUDA_ERROR_INVALID_VALUE;
++  }
++  auto *data = static_cast<unsigned char *>(data_pointer);
++  std::vector<lupine_mapped_host_snapshot> snapshots =
++      lupine_mapped_host_snapshots();
++  size_t relocated = 0;
++  for (size_t offset = 0; offset + sizeof(CUdeviceptr) <= bytes;
++       offset += alignof(CUdeviceptr)) {
++    CUdeviceptr value = 0;
++    memcpy(&value, data + offset, sizeof(value));
++    for (const auto &mapping : snapshots) {
++      CUdeviceptr translated = 0;
++      if (lupine_host_ptr_in_mapping(value, mapping, &translated)) {
++        memcpy(data + offset, &translated, sizeof(translated));
++        lupine_mark_mapped_device_dirty(mapping.host);
++        ++relocated;
++        break;
++      }
++      if (lupine_device_ptr_in_mapping(value, mapping)) {
++        lupine_mark_mapped_device_dirty(mapping.host);
++        break;
++      }
++    }
++  }
++  LUPINE_TRACE_LOG("LUPINE mapped-pointer relocations=" << relocated
++                                                        << " bytes=" << bytes);
++  return lupine_flush_dirty_host_pages_to_server();
++}
++
++extern "C" CUresult lupine_live_mapped_coherence_step() {
++  static const size_t coherence_window = [] {
++    const char *configured = getenv("LUPINE_COHERENCE_WINDOW_BYTES");
++    if (configured == nullptr || configured[0] == '\0') return size_t{4 * 1024 * 1024};
++    char *end = nullptr;
++    unsigned long long value = strtoull(configured, &end, 10);
++    return end != configured && *end == '\0' && value != 0
++               ? static_cast<size_t>(value)
++               : size_t{4 * 1024 * 1024};
++  }();
++  struct pending_write {
++    conn_t *conn = nullptr;
++    CUdeviceptr destination = 0;
++    std::vector<unsigned char> data;
++  };
++  // These deliberately live until process exit. ELF destructor ordering across
++  // translation units is not defined; the client destructor must stop and join
++  // the worker before its state can disappear.
++  static auto *shadow_mutex = new std::mutex();
++  static auto *shadows =
++      new std::unordered_map<void *, std::vector<unsigned char>>();
++  static auto *remote_views =
++      new std::unordered_map<void *, std::vector<unsigned char>>();
++  static uint64_t step_number = 0;
++  std::lock_guard<std::mutex> coherence_lock(*shadow_mutex);
++  ++step_number;
++
++  std::vector<lupine_mapped_host_snapshot> mappings =
++      lupine_mapped_host_snapshots();
++  std::vector<pending_write> pending_writes;
++  auto fetch_remote_changes = [&](const lupine_mapped_host_snapshot &mapping) {
++    if (mapping.size == 0 || mapping.server_host_ptr == 0) return CUDA_SUCCESS;
++    conn_t *conn = lupine_route_remote_conn(
++        lupine_route_from_identity(mapping.route_id));
++    if (conn == nullptr) return CUDA_ERROR_DEVICE_UNAVAILABLE;
++
++    auto remote_inserted = remote_views->emplace(
++        mapping.host, std::vector<unsigned char>(mapping.size));
++    auto &remote = remote_inserted.first->second;
++    if (remote.size() != mapping.size) remote.assign(mapping.size, 0);
++    bool full = false;
++    uint32_t changed_count = 0;
++    if (rpc_write_start_request(conn, LUPINE_RPC_lupineMappedHostSnapshot) < 0 ||
++        rpc_write(conn, &mapping.server_host_ptr,
++                  sizeof(mapping.server_host_ptr)) < 0 ||
++        rpc_write(conn, &mapping.size, sizeof(mapping.size)) < 0 ||
++        rpc_wait_for_response(conn) < 0 ||
++        rpc_read(conn, &full, sizeof(full)) < 0 ||
++        rpc_read(conn, &changed_count, sizeof(changed_count)) < 0 ||
++        (full && mapping.size != 0 &&
++         rpc_read(conn, remote.data(), remote.size()) < 0)) {
++      return CUDA_ERROR_DEVICE_UNAVAILABLE;
++    }
++    if (!full) {
++      for (uint32_t i = 0; i < changed_count; ++i) {
++        uint64_t offset = 0;
++        uint32_t changed_bytes = 0;
++        if (rpc_read(conn, &offset, sizeof(offset)) < 0 ||
++            rpc_read(conn, &changed_bytes, sizeof(changed_bytes)) < 0 ||
++            offset > mapping.size || changed_bytes > mapping.size - offset ||
++            rpc_read(conn, remote.data() + offset, changed_bytes) < 0) {
++          return CUDA_ERROR_DEVICE_UNAVAILABLE;
++        }
++      }
++    }
++    if (rpc_read_end(conn) < 0) return CUDA_ERROR_DEVICE_UNAVAILABLE;
++    return CUDA_SUCCESS;
++  };
++
++  // Publication barrier: sample every mapping once, then sample them again
++  // before exposing any remote control word to the local proxy. If a GPU
++  // publishes payload followed by a ready counter in a later allocation, the
++  // second pass observes the payload before the proxy can consume the counter.
++  for (const auto &mapping : mappings) {
++    if (mapping.size == 0 || mapping.server_host_ptr == 0) continue;
++    CUresult result = fetch_remote_changes(mapping);
++    if (result != CUDA_SUCCESS) return result;
++  }
++
++  for (const auto &mapping : mappings) {
++    if (mapping.size == 0 || mapping.server_host_ptr == 0) continue;
++    CUresult fetch_result = fetch_remote_changes(mapping);
++    if (fetch_result != CUDA_SUCCESS) return fetch_result;
++    conn_t *conn = lupine_route_remote_conn(
++        lupine_route_from_identity(mapping.route_id));
++    auto &remote = remote_views->at(mapping.host);
++
++    std::vector<unsigned char> merged(mapping.size);
++    size_t mapping_pending_begin = pending_writes.size();
++    size_t pending_start = mapping.size;
++    size_t local_change_bytes = 0;
++    size_t remote_change_bytes = 0;
++    {
++      std::lock_guard<std::mutex> lock(lupine_host_allocation_mutex());
++      auto it = lupine_mutable_host_allocations_locked().find(mapping.host);
++      if (it == lupine_mutable_host_allocations_locked().end()) continue;
++      if (it->second.tracking_enabled) {
++        lupine_disable_dirty_tracking(mapping.host, it->second);
++      }
++      auto inserted = shadows->emplace(
++          mapping.host, std::vector<unsigned char>(
++                            static_cast<unsigned char *>(mapping.host),
++                            static_cast<unsigned char *>(mapping.host) +
++                                mapping.size));
++      auto &shadow = inserted.first->second;
++      if (shadow.size() != mapping.size) {
++        shadow.assign(static_cast<unsigned char *>(mapping.host),
++                      static_cast<unsigned char *>(mapping.host) + mapping.size);
++      }
++      auto *local = static_cast<unsigned char *>(mapping.host);
++      for (size_t i = 0; i < mapping.size; i += sizeof(uint64_t)) {
++        size_t word_bytes = std::min(sizeof(uint64_t), mapping.size - i);
++        bool local_changed =
++            memcmp(local + i, shadow.data() + i, word_bytes) != 0;
++        bool remote_changed =
++            memcmp(remote.data() + i, shadow.data() + i, word_bytes) != 0;
++        local_change_bytes += local_changed ? word_bytes : 0;
++        remote_change_bytes += remote_changed ? word_bytes : 0;
++        // Registrations created specifically for a host pointer query are
++        // CPU-to-GPU mappings: never overwrite their producer from the remote
++        // mirror. For bidirectional allocations, remote wins a true conflict
++        // so progress counters cannot move backwards.
++        bool publish_local =
++            local_changed &&
++            (mapping.client_to_server_only || !remote_changed);
++        const unsigned char *value =
++            mapping.client_to_server_only
++                ? local + i
++                : (remote_changed ? remote.data() + i : local + i);
++        memcpy(merged.data() + i, value, word_bytes);
++        memcpy(local + i, value, word_bytes);
++
++        // Coalesce adjacent locally-produced words. NCCL's mapped control
++        // allocations can be several MiB, while the common update is only an
++        // eight-byte queue word. Sending the whole allocation here both
++        // amplifies traffic and delays publication of the word behind it.
++        if (publish_local && pending_start == mapping.size) {
++          pending_start = i;
++        }
++        bool finish_pending = pending_start != mapping.size &&
++                              (!publish_local || i + word_bytes == mapping.size);
++        if (finish_pending) {
++          size_t pending_end = publish_local ? i + word_bytes : i;
++          size_t expanded_start =
++              (pending_start / coherence_window) * coherence_window;
++          size_t expanded_end = std::min(
++              mapping.size,
++              ((pending_end + coherence_window - 1) / coherence_window) *
++                  coherence_window);
++          pending_write write;
++          write.conn = conn;
++          write.destination = mapping.server_host_ptr + expanded_start;
++          write.data.assign(merged.data() + expanded_start,
++                            merged.data() + expanded_end);
++          pending_writes.push_back(std::move(write));
++          pending_start = mapping.size;
++        }
++      }
++      shadow = merged;
++    }
++
++    // A broad producer update is a queue-slot publication, not a sparse set of
++    // independent words. Preserve its unchanged padding and metadata exactly;
++    // sparse range transport remains the fast path for ordinary counters.
++    if (local_change_bytes >= 64 * 1024 &&
++        pending_writes.size() != mapping_pending_begin) {
++      pending_writes.resize(mapping_pending_begin);
++      pending_write write;
++      write.conn = conn;
++      write.destination = mapping.server_host_ptr;
++      write.data = merged;
++      pending_writes.push_back(std::move(write));
++    }
++
++    if (step_number <= 3 || local_change_bytes != 0 ||
++        remote_change_bytes != 0) {
++      LUPINE_TRACE_LOG("LUPINE live coherence step=" << step_number
++                       << " host=" << mapping.host << " bytes=" << mapping.size
++                       << " c2s=" << mapping.client_to_server_only
++                       << " local_changed=" << local_change_bytes
++                       << " remote_changed=" << remote_change_bytes
++                       << " pending_ranges=" << pending_writes.size());
++    }
++  }
++
++  std::stable_sort(pending_writes.begin(), pending_writes.end(),
++                   [](const pending_write &a, const pending_write &b) {
++                     if (a.conn != b.conn) return a.conn < b.conn;
++                     return a.data.size() > b.data.size();
++                   });
++
++  auto publish_pending = [&]() {
++    std::vector<const pending_write *> selected;
++    selected.reserve(pending_writes.size());
++    for (const auto &write : pending_writes) {
++      selected.push_back(&write);
++    }
++    // A single request preserves range order on a route. Send each batch
++    // twice: the first pass publishes payload, and the second is a release-like
++    // barrier for control words whose producer ordering is otherwise invisible
++    // after diffing a final CPU snapshot.
++    for (size_t begin = 0; begin < selected.size();) {
++      conn_t *conn = selected[begin]->conn;
++      size_t end = begin;
++      while (end < selected.size() && selected[end]->conn == conn &&
++             end - begin < 1024) {
++        ++end;
++      }
++      uint32_t count = static_cast<uint32_t>(end - begin);
++      if (rpc_write_start_request(conn, LUPINE_RPC_lupineManagedHostFlush) < 0 ||
++          rpc_write(conn, &count, sizeof(count)) < 0) {
++        return CUDA_ERROR_DEVICE_UNAVAILABLE;
++      }
++      for (size_t i = begin; i < end; ++i) {
++        size_t bytes = selected[i]->data.size();
++        if (rpc_write(conn, &selected[i]->destination,
++                      sizeof(selected[i]->destination)) < 0 ||
++            rpc_write(conn, &bytes, sizeof(bytes)) < 0 ||
++            rpc_write(conn, selected[i]->data.data(), bytes) < 0) {
++          return CUDA_ERROR_DEVICE_UNAVAILABLE;
++        }
++      }
++      if (rpc_write_end(conn) < 0) return CUDA_ERROR_DEVICE_UNAVAILABLE;
++      begin = end;
++    }
++    return CUDA_SUCCESS;
++  };
++  return publish_pending();
++}
++
+ // Wire-fetch [offset, offset + bytes) of the backing. Handler-safe: must
+ // not take lupine_host_allocation_mutex(); caller made the range writable.
+ static bool lupine_fetch_stale_range(lupine_host_allocation *allocation,
+@@ -1700,7 +1967,7 @@ extern "C" CUresult cuMemHostGetDevicePointer_v2(CUdeviceptr *pdptr, void *p,
+     uintptr_t page = reinterpret_cast<uintptr_t>(p) & ~(page_size - 1);
+     CUresult result =
+         lupine_register_host(reinterpret_cast<void *>(page), page_size,
+-                             CU_MEMHOSTREGISTER_DEVICEMAP, true);
++                             CU_MEMHOSTREGISTER_DEVICEMAP, false);
+     if (result != CUDA_SUCCESS &&
+         result != CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED) {
+       return result;
+diff --git a/memcpy.h b/memcpy.h
+index 4219d19..0f1cdcc 100644
+--- a/memcpy.h
++++ b/memcpy.h
+@@ -29,6 +29,9 @@ extern "C" CUresult lupine_flush_dirty_host_pages_to_server();
+ extern "C" bool lupine_translate_managed_host_ptr(CUdeviceptr ptr,
+                                                   CUdeviceptr *translated);
+ extern "C" CUresult lupine_sync_mapped_device_to_host();
++extern "C" CUresult
++lupine_relocate_mapped_host_pointers(void *data, size_t bytes);
++extern "C" CUresult lupine_live_mapped_coherence_step();
+ 
+ CUresult lupine_sync_mapped_host_to_device_for_launch(
+     void *const *kernel_params, const size_t *sizes, uint32_t count,
+diff --git a/server.cpp b/server.cpp
+index c4e996d..c0cc56f 100644
+--- a/server.cpp
++++ b/server.cpp
+@@ -275,6 +275,9 @@ lupine_manual_handlers() {
+        {handle_manual_cuMemcpyHtoDAsync_v2, "cuMemcpyHtoDAsync_v2"}},
+       {LUPINE_RPC_lupineManagedHostFlush,
+        {handle_manual_lupineManagedHostFlush, "lupineManagedHostFlush"}},
++      {LUPINE_RPC_lupineMappedHostSnapshot,
++       {handle_manual_lupineMappedHostSnapshot,
++        "lupineMappedHostSnapshot"}},
+       {LUPINE_RPC_lupineDeviceSnapshot,
+        {handle_manual_lupineDeviceSnapshot, "lupineDeviceSnapshot"}},
+       {RPC_cuMemcpyDtoHAsync_v2,
+

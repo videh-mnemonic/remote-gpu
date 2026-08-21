@@ -1,0 +1,38 @@
+diff --git a/lupine_cublas.h b/lupine_cublas.h
+--- a/lupine_cublas.h
++++ b/lupine_cublas.h
+@@ -141,4 +141,5 @@ enum lupine_cublas_opcode : uint32_t {
+   LUPINE_CUBLAS_IDAMAX = 137,
+   LUPINE_CUBLAS_IDAMIN = 138,
+   LUPINE_CUBLAS_CGEMM_STRIDED_BATCHED = 139,
++  LUPINE_CUBLAS_SGETRF_BATCHED = 140,
+ };
+diff --git a/manual_server.cpp b/manual_server.cpp
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -3942,6 +3942,7 @@ lupine_cublas_response lupine_cublas_call(
+       request.opcode == LUPINE_CUBLAS_ZDOTC ||
+       request.opcode == LUPINE_CUBLAS_CGETRS_BATCHED ||
+       request.opcode == LUPINE_CUBLAS_CGETRF_BATCHED ||
++      request.opcode == LUPINE_CUBLAS_SGETRF_BATCHED ||
+       request.opcode == LUPINE_CUBLAS_DGETRS_BATCHED ||
+       request.opcode == LUPINE_CUBLAS_DGETRF_BATCHED ||
+       request.opcode == LUPINE_CUBLAS_DTRSM_BATCHED ||
+@@ -5516,6 +5517,17 @@ lupine_cublas_response lupine_cublas_call(
+                    reinterpret_cast<int *>(request.c), request.batch_count);
+     break;
+   }
++  case LUPINE_CUBLAS_SGETRF_BATCHED: {
++    using function = int (*)(void *, int, float **, int, int *, int *, int);
++    auto call = reinterpret_cast<function>(symbol("cublasSgetrfBatched"));
++    response.status =
++        call == nullptr
++            ? 13
++            : call(handle, request.n, reinterpret_cast<float **>(request.a),
++                   request.lda, reinterpret_cast<int *>(request.b),
++                   reinterpret_cast<int *>(request.c), request.batch_count);
++    break;
++  }
+   case LUPINE_CUBLAS_DAXPY: {
+     using function = int (*)(void *, int, const double *, const double *, int,
+                              double *, int);

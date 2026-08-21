@@ -1,0 +1,234 @@
+diff --git a/client.cpp b/client.cpp
+index c0d3484..1b660d2 100644
+--- a/client.cpp
++++ b/client.cpp
+@@ -1512,6 +1512,13 @@ static CUresult lupine_load_recorded_library_on_route(CUlibrary source_library,
+ 
+   CUlibrary loaded = nullptr;
+   CUresult result = CUDA_ERROR_DEVICE_UNAVAILABLE;
++  struct lupine_wire_kernel_record {
++    std::string name;
++    CUkernel kernel = nullptr;
++    uint32_t param_count = 0;
++    std::vector<uint64_t> params;
++  };
++  std::vector<lupine_wire_kernel_record> table;
+   if (lupine_route_is_local(route)) {
+     using real_fn_t =
+         CUresult (*)(CUlibrary *, const void *, CUjit_option *, void **,
+@@ -1528,6 +1535,7 @@ static CUresult lupine_load_recorded_library_on_route(CUlibrary source_library,
+     unsigned int zero_options = 0;
+     std::vector<uintptr_t> jit_raw_values;
+     std::vector<uintptr_t> library_raw_values;
++    uint32_t table_count = 0;
+     if (conn == nullptr ||
+         rpc_write_start_request(conn, RPC_cuLibraryLoadData) < 0 ||
+         rpc_write(conn, &record.kind, sizeof(record.kind)) < 0 ||
+@@ -1540,7 +1548,32 @@ static CUresult lupine_load_recorded_library_on_route(CUlibrary source_library,
+         rpc_wait_for_response(conn) < 0 ||
+         rpc_read(conn, &loaded, sizeof(loaded)) < 0 ||
+         rpc_read_jit_outputs(conn, {}) < 0 ||
+-        rpc_read(conn, &result, sizeof(result)) < 0 || rpc_read_end(conn) < 0) {
++        rpc_read(conn, &table_count, sizeof(table_count)) < 0) {
++      return CUDA_ERROR_DEVICE_UNAVAILABLE;
++    }
++    for (uint32_t i = 0; i < table_count; ++i) {
++      lupine_wire_kernel_record record;
++      uint32_t name_len = 0;
++      if (rpc_read(conn, &name_len, sizeof(name_len)) < 0 || name_len == 0 ||
++          name_len > 64 * 1024) {
++        return CUDA_ERROR_DEVICE_UNAVAILABLE;
++      }
++      record.name.resize(name_len);
++      if (rpc_read(conn, record.name.data(), name_len) < 0 ||
++          rpc_read(conn, &record.kernel, sizeof(record.kernel)) < 0 ||
++          rpc_read(conn, &record.param_count, sizeof(record.param_count)) < 0) {
++        return CUDA_ERROR_DEVICE_UNAVAILABLE;
++      }
++      record.name.resize(name_len - 1);
++      record.params.resize(static_cast<size_t>(record.param_count) * 2);
++      if (record.param_count != 0 &&
++          rpc_read(conn, record.params.data(),
++                   record.params.size() * sizeof(uint64_t)) < 0) {
++        return CUDA_ERROR_DEVICE_UNAVAILABLE;
++      }
++      table.push_back(std::move(record));
++    }
++    if (rpc_read(conn, &result, sizeof(result)) < 0 || rpc_read_end(conn) < 0) {
+       return CUDA_ERROR_DEVICE_UNAVAILABLE;
+     }
+   }
+@@ -1560,6 +1593,32 @@ static CUresult lupine_load_recorded_library_on_route(CUlibrary source_library,
+     loaded_record.image = std::move(record.image);
+     loaded_record.libraries_by_route[route_id] = loaded;
+   }
++  for (const auto &kernel_record : table) {
++    if (kernel_record.kernel == nullptr) {
++      continue;
++    }
++    for (uint32_t index = 0; index < kernel_record.param_count; ++index) {
++      lupine_param_info_cache().insert_or_assign(
++          lupine_param_info_key{
++              reinterpret_cast<uintptr_t>(kernel_record.kernel), index, true},
++          lupine_param_info_value{
++              CUDA_SUCCESS,
++              static_cast<size_t>(kernel_record.params[index * 2]),
++              static_cast<size_t>(kernel_record.params[index * 2 + 1])});
++    }
++    lupine_param_info_cache().insert_or_assign(
++        lupine_param_info_key{
++            reinterpret_cast<uintptr_t>(kernel_record.kernel),
++            kernel_record.param_count, true},
++        lupine_param_info_value{CUDA_ERROR_INVALID_VALUE, 0, 0});
++    if (lupine_record_library_kernel(kernel_record.kernel, loaded,
++                                     kernel_record.name.c_str(), route) ==
++        CUDA_SUCCESS) {
++      lupine_library_kernel_names().insert_or_assign(
++          lupine_library_kernel_name_key{loaded, kernel_record.name},
++          kernel_record.kernel);
++    }
++  }
+   *library = loaded;
+   return CUDA_SUCCESS;
+ }
+@@ -4673,10 +4732,22 @@ cuLibraryLoadData(CUlibrary *library, const void *code,
+         CUresult (*)(CUlibrary *, const void *, CUjit_option *, void **,
+                      unsigned int, CUlibraryOption *, void **, unsigned int);
+     auto real = lupine_real_cuda_fn<real_fn_t>("cuLibraryLoadData");
+-    return real == nullptr ? CUDA_ERROR_DEVICE_UNAVAILABLE
+-                           : real(library, code, jitOptions, jitOptionsValues,
+-                                  numJitOptions, libraryOptions,
+-                                  libraryOptionValues, numLibraryOptions);
++    if (real == nullptr) {
++      return CUDA_ERROR_DEVICE_UNAVAILABLE;
++    }
++    CUresult result =
++        real(library, code, jitOptions, jitOptionsValues, numJitOptions,
++             libraryOptions, libraryOptionValues, numLibraryOptions);
++    if (result == CUDA_SUCCESS) {
++      // Preserve the image even when the first load is local. PyTorch lazily
++      // creates CUDA libraries, so a process that uses cuda:0 before cuda:1
++      // must be able to recreate the same library on the remote route when a
++      // recorded kernel handle is launched there later.
++      lupine_note_library_owner_route(*library, route);
++      lupine_record_library_image(*library, route, kind, image_bytes.data(),
++                                  image_bytes.size(), code);
++    }
++    return result;
+   }
+ 
+   auto bindings = lupine_capture_jit_client_bindings(numJitOptions, jitOptions,
+diff --git a/lupine_cublas.h b/lupine_cublas.h
+index c63b8dc..8c6b69e 100644
+--- a/lupine_cublas.h
++++ b/lupine_cublas.h
+@@ -23,6 +23,7 @@ enum lupine_cublas_opcode : uint32_t {
+   LUPINE_CUBLAS_LT_PREFERENCE_SET_ATTRIBUTE = 18,
+   LUPINE_CUBLAS_LT_HEURISTIC = 19,
+   LUPINE_CUBLAS_LT_MATMUL = 20,
++  LUPINE_CUBLAS_GEMM_STRIDED_BATCHED_EX = 21,
+ };
+ 
+ struct lupine_cublas_request {
+@@ -67,6 +68,13 @@ struct lupine_cublas_request {
+   int32_t requested_algorithms = 0;
+   uint32_t payload_size = 0;
+   uint8_t payload[128] = {};
++  int64_t stride_a = 0;
++  int64_t stride_b = 0;
++  int64_t stride_c = 0;
++  int32_t batch_count = 0;
++  uint32_t handle_state_mask = 0;
++  int32_t math_mode = 0;
++  int32_t pointer_mode = 0;
+   uint64_t context = 0;
+ };
+ 
+diff --git a/manual_server.cpp b/manual_server.cpp
+index a327f9a..1d84cb0 100644
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -3888,6 +3888,47 @@ int handle_manual_lupineCublasCall(conn_t *conn) {
+ 
+   lupine_cublas_response response;
+   void *handle = reinterpret_cast<void *>(request.handle);
++  int handle_state_status = 0;
++  const bool applies_handle_state =
++      request.opcode == LUPINE_CUBLAS_SGEMM ||
++      request.opcode == LUPINE_CUBLAS_GEMM_EX ||
++      request.opcode == LUPINE_CUBLAS_SGEMM_EX ||
++      request.opcode == LUPINE_CUBLAS_GEMM_STRIDED_BATCHED_EX;
++  if (applies_handle_state && (request.handle_state_mask & 1u) != 0) {
++    using function = int (*)(void *, void *);
++    auto call = reinterpret_cast<function>(symbol("cublasSetStream_v2"));
++    handle_state_status =
++        call == nullptr
++            ? 13
++            : call(handle, reinterpret_cast<void *>(request.stream));
++  }
++  if (applies_handle_state && handle_state_status == 0 &&
++      (request.handle_state_mask & 2u) != 0) {
++    using function = int (*)(void *, void *, size_t);
++    auto call = reinterpret_cast<function>(symbol("cublasSetWorkspace_v2"));
++    handle_state_status =
++        call == nullptr
++            ? 13
++            : call(handle, reinterpret_cast<void *>(request.workspace),
++                   static_cast<size_t>(request.workspace_size));
++  }
++  if (applies_handle_state && handle_state_status == 0 &&
++      (request.handle_state_mask & 4u) != 0) {
++    using function = int (*)(void *, int);
++    auto call = reinterpret_cast<function>(symbol("cublasSetMathMode"));
++    handle_state_status =
++        call == nullptr ? 13 : call(handle, request.math_mode);
++  }
++  if (applies_handle_state && handle_state_status == 0 &&
++      (request.handle_state_mask & 8u) != 0) {
++    using function = int (*)(void *, int);
++    auto call = reinterpret_cast<function>(symbol("cublasSetPointerMode_v2"));
++    handle_state_status =
++        call == nullptr ? 13 : call(handle, request.pointer_mode);
++  }
++  if (handle_state_status != 0) {
++    response.status = handle_state_status;
++  } else {
+   switch (request.opcode) {
+   case LUPINE_CUBLAS_CREATE: {
+     using function = int (*)(void **);
+@@ -3982,6 +4023,27 @@ int handle_manual_lupineCublasCall(conn_t *conn) {
+                    request.ldc);
+     break;
+   }
++  case LUPINE_CUBLAS_GEMM_STRIDED_BATCHED_EX: {
++    using function = int (*)(void *, int, int, int, int, int, const void *,
++                             const void *, int, int, int64_t, const void *, int,
++                             int, int64_t, const void *, void *, int, int,
++                             int64_t, int, int, int);
++    auto call = reinterpret_cast<function>(
++        symbol("cublasGemmStridedBatchedEx"));
++    response.status =
++        call == nullptr || request.scalar_size > sizeof(request.alpha_data)
++            ? 13
++            : call(handle, request.transa, request.transb, request.m, request.n,
++                   request.k, request.alpha_data,
++                   reinterpret_cast<const void *>(request.a), request.a_type,
++                   request.lda, request.stride_a,
++                   reinterpret_cast<const void *>(request.b), request.b_type,
++                   request.ldb, request.stride_b, request.beta_data,
++                   reinterpret_cast<void *>(request.c), request.c_type,
++                   request.ldc, request.stride_c, request.batch_count,
++                   request.compute_type, request.algorithm);
++    break;
++  }
+   case LUPINE_CUBLAS_LT_MATMUL_DESC_CREATE: {
+     using function = int (*)(void **, int, int);
+     auto call = reinterpret_cast<function>(lt_symbol("cublasLtMatmulDescCreate"));
+@@ -4102,6 +4164,7 @@ int handle_manual_lupineCublasCall(conn_t *conn) {
+     response.status = 15;
+     break;
+   }
++  }
+   if (requested_context != nullptr) {
+     (void)cuCtxSetCurrent(requested_context);
+   } else if (saved_context_result == CUDA_SUCCESS) {

@@ -1,0 +1,12 @@
+{
+  "commit_time": "2026-08-13T16:54:11Z",
+  "declared_license": "Apache-2.0",
+  "license_file": "LICENSE.md",
+  "license_sha256": "ab89ceca19ca531005699095ca542f982fac92efd82f954f49ac17aa99a37cda",
+  "name": "litgpt",
+  "push_url": "disabled://public-push-prohibited",
+  "requested_ref": "main",
+  "resolved_commit": "7bf2960dfb26bae8e815c9a16a22732974824ac1",
+  "retrieved_at": "2026-08-19T23:54:06.612920+00:00",
+  "url": "https://github.com/Lightning-AI/litgpt.git"
+}

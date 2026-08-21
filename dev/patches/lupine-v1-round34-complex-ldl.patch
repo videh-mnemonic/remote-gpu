@@ -1,0 +1,53 @@
+diff --git a/lupine_cublas.h b/lupine_cublas.h
+index 909b046..13fe0ad 100644
+--- a/lupine_cublas.h
++++ b/lupine_cublas.h
+@@ -143,6 +143,8 @@ enum lupine_cublas_opcode : uint32_t {
+   LUPINE_CUBLAS_IDAMIN = 138,
+   LUPINE_CUBLAS_CGEMM_STRIDED_BATCHED = 139,
+   LUPINE_CUBLAS_SGETRF_BATCHED = 140,
++  LUPINE_CUSOLVER_DN_ZSYTRF_BUFFER_SIZE = 141,
++  LUPINE_CUSOLVER_DN_ZSYTRF = 142,
+ };
+ 
+ struct lupine_cublas_request {
+diff --git a/manual_server.cpp b/manual_server.cpp
+index f2a8fee..cce4028 100644
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -5199,6 +5199,34 @@ int handle_manual_lupineCublasCall(conn_t *conn) {
+                    reinterpret_cast<int *>(request.d));
+     break;
+   }
++  case LUPINE_CUSOLVER_DN_ZSYTRF_BUFFER_SIZE: {
++    using function = int (*)(void *, int, void *, int, int *);
++    auto call = reinterpret_cast<function>(
++        solver_symbol("cusolverDnZsytrf_bufferSize"));
++    int lwork = 0;
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.n, reinterpret_cast<void *>(request.a),
++                   request.lda, &lwork);
++    response.value = lwork;
++    break;
++  }
++  case LUPINE_CUSOLVER_DN_ZSYTRF: {
++    using function = int (*)(void *, int, int, void *, int, int *, void *, int,
++                             int *);
++    auto call =
++        reinterpret_cast<function>(solver_symbol("cusolverDnZsytrf"));
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.transa, request.n,
++                   reinterpret_cast<void *>(request.a), request.lda,
++                   reinterpret_cast<int *>(request.b),
++                   reinterpret_cast<void *>(request.workspace), request.value,
++                   reinterpret_cast<int *>(request.d));
++    break;
++  }
+   case LUPINE_CUSOLVER_DN_XSYTRS_BUFFER_SIZE: {
+     using function = int (*)(void *, int, int64_t, int64_t, int, const void *,
+                              int64_t, const int64_t *, int, void *, int64_t,
+

@@ -1,0 +1,12 @@
+{
+  "commit_time": "2026-08-19T15:18:59-07:00",
+  "declared_license": "BSD-3-Clause",
+  "license_file": "LICENSE",
+  "license_sha256": "6eea30995941126beeb99ef775f0968ed8320beb4834ad28d6ae6704a1a92930",
+  "name": "torchtitan",
+  "push_url": "disabled://public-push-prohibited",
+  "requested_ref": "main",
+  "resolved_commit": "b64d3f6a91b0e835e2e264a259c5feb4209e003f",
+  "retrieved_at": "2026-08-19T23:54:07.461612+00:00",
+  "url": "https://github.com/pytorch/torchtitan.git"
+}

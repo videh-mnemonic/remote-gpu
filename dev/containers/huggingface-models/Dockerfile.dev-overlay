@@ -1,0 +1,9 @@
+ARG LUPINE_SHIM_IMAGE=remote-gpu-lupine-client:nccl-dev
+ARG HUGGINGFACE_IMAGE=remote-gpu-huggingface:adaptive-dev
+
+FROM ${LUPINE_SHIM_IMAGE} AS shim
+FROM ${HUGGINGFACE_IMAGE}
+
+COPY --from=shim /opt/lupine/lib/libcuda.so.1 /opt/lupine/lib/libcuda.so.1
+COPY --from=shim /opt/lupine/lib/libnvidia-ml.so.1 /opt/lupine/lib/libnvidia-ml.so.1
+COPY --from=shim /opt/lupine/lib/liblupine-cudart-compat.so /opt/lupine/lib/liblupine-cudart-compat.so

@@ -1,0 +1,275 @@
+diff --git a/codegen/codegen.py b/codegen/codegen.py
+index 0f55dcc..14a178f 100644
+--- a/codegen/codegen.py
++++ b/codegen/codegen.py
+@@ -746,7 +746,35 @@ def client_call_args(function: Function, metadata: FunctionAnnotationMetadata) -
+     ]
+ 
+ 
+-def write_client_rpc_write(f, operation: Operation, metadata: FunctionAnnotationMetadata):
++def write_client_rpc_write(
++    f,
++    operation: Operation,
++    metadata: FunctionAnnotationMetadata,
++    function: Optional[Function] = None,
++):
++    function_name = function.name.format() if function is not None else ""
++    parameter_name = operation.parameter.name
++    vmm_override = {
++        ("cuMemCreate", "prop"): (
++            "        rpc_write(conn, &remote_prop, sizeof(remote_prop)) < 0 ||\n"
++        ),
++        ("cuMemSetAccess", "desc"): (
++            "        (count * sizeof(const CUmemAccessDesc) != 0 && "
++            "rpc_write(conn, remote_desc.data(), count * sizeof(const CUmemAccessDesc)) < 0) ||\n"
++        ),
++        ("cuMemGetAccess", "location"): (
++            "        rpc_write(conn, &remote_location, sizeof(remote_location)) < 0 ||\n"
++        ),
++        ("cuMemGetAllocationGranularity", "prop"): (
++            "        rpc_write(conn, &remote_prop, sizeof(remote_prop)) < 0 ||\n"
++        ),
++        ("cuMemAddressReserve", "addr"): (
++            "        rpc_write(conn, &remote_addr_hint, sizeof(remote_addr_hint)) < 0 ||\n"
++        ),
++    }.get((function_name, parameter_name))
++    if vmm_override is not None:
++        f.write(vmm_override)
++        return
+     if (
+         isinstance(operation, OpaqueTypeOperation)
+         and operation.send
+@@ -762,6 +790,47 @@ def write_client_rpc_write(f, operation: Operation, metadata: FunctionAnnotation
+     operation.client_rpc_write(f)
+ 
+ 
++def write_client_vmm_location_translation(f, function: Function):
++    """Translate virtual CUDA ordinals embedded in VMM descriptor structs."""
++    name = function.name.format()
++    if name == "cuMemAddressReserve":
++        f.write("    CUdeviceptr remote_addr_hint = addr;\n")
++        f.write("    if (remote_addr_hint == 0) {\n")
++        f.write("        const uint64_t route_number = static_cast<uint64_t>(lupine_route_identity(route) + 1);\n")
++        f.write("        remote_addr_hint = static_cast<CUdeviceptr>(route_number << 48);\n")
++        f.write("    }\n")
++    elif name in {"cuMemCreate", "cuMemGetAllocationGranularity"}:
++        f.write("    if (conn == nullptr) return CUDA_ERROR_DEVICE_UNAVAILABLE;\n")
++        f.write("    if (prop == nullptr) return CUDA_ERROR_INVALID_VALUE;\n")
++        f.write("    CUmemAllocationProp remote_prop = *prop;\n")
++        f.write("    if (remote_prop.location.type == CU_MEM_LOCATION_TYPE_DEVICE) {\n")
++        f.write("        CUdevice remote_device = static_cast<CUdevice>(remote_prop.location.id);\n")
++        f.write("        if (!lupine_translate_device_for_conn(conn, &remote_device)) return CUDA_ERROR_INVALID_DEVICE;\n")
++        f.write("        remote_prop.location.id = static_cast<int>(remote_device);\n")
++        f.write("    }\n")
++    elif name == "cuMemSetAccess":
++        f.write("    if (conn == nullptr) return CUDA_ERROR_DEVICE_UNAVAILABLE;\n")
++        f.write("    std::vector<CUmemAccessDesc> remote_desc;\n")
++        f.write("    if (count != 0 && desc != nullptr) {\n")
++        f.write("        remote_desc.assign(desc, desc + count);\n")
++        f.write("        for (CUmemAccessDesc &entry : remote_desc) {\n")
++        f.write("            if (entry.location.type != CU_MEM_LOCATION_TYPE_DEVICE) continue;\n")
++        f.write("            CUdevice remote_device = static_cast<CUdevice>(entry.location.id);\n")
++        f.write("            if (!lupine_translate_device_for_conn(conn, &remote_device)) return CUDA_ERROR_INVALID_DEVICE;\n")
++        f.write("            entry.location.id = static_cast<int>(remote_device);\n")
++        f.write("        }\n")
++        f.write("    }\n")
++    elif name == "cuMemGetAccess":
++        f.write("    if (conn == nullptr) return CUDA_ERROR_DEVICE_UNAVAILABLE;\n")
++        f.write("    if (location == nullptr) return CUDA_ERROR_INVALID_VALUE;\n")
++        f.write("    CUmemLocation remote_location = *location;\n")
++        f.write("    if (remote_location.type == CU_MEM_LOCATION_TYPE_DEVICE) {\n")
++        f.write("        CUdevice remote_device = static_cast<CUdevice>(remote_location.id);\n")
++        f.write("        if (!lupine_translate_device_for_conn(conn, &remote_device)) return CUDA_ERROR_INVALID_DEVICE;\n")
++        f.write("        remote_location.id = static_cast<int>(remote_device);\n")
++        f.write("    }\n")
++
++
+ def client_record_owner_stmt(owner: OwnerAnnotation) -> str:
+     kind = owner.kind
+     name = owner.parameter.name
+@@ -817,6 +886,10 @@ def write_client_post_call(f, function: Function, metadata: FunctionAnnotationMe
+         f.write("        else allocation_size = WidthInBytes * Height;\n")
+         f.write("        lupine_note_deviceptr_allocation_route(*dptr, allocation_size, route);\n")
+         f.write("    }\n")
++    if function.name.format() == "cuMemAddressReserve":
++        f.write("    if (return_value == CUDA_SUCCESS && ptr != nullptr) lupine_note_deviceptr_allocation_route(*ptr, size, route);\n")
++    if function.name.format() == "cuMemAddressFree":
++        f.write("    if (return_value == CUDA_SUCCESS) lupine_forget_deviceptr_owner(ptr);\n")
+     if function.name.format() in {"cuMemAllocAsync", "cuMemAllocFromPoolAsync"}:
+         f.write("    if (return_value == CUDA_SUCCESS && dptr != nullptr) lupine_note_deviceptr_allocation_route(*dptr, bytesize, route);\n")
+     if function.name.format() == "cuMemFreeAsync":
+@@ -1651,6 +1724,8 @@ def main():
+             f.write("    }\n")
+             f.write("    conn_t *conn = lupine_route_remote_conn(route);\n")
+ 
++            write_client_vmm_location_translation(f, function)
++
+             for operation in operations:
+                 if isinstance(operation, OpaqueTypeOperation):
+                     f.write(operation.client_declaration())
+@@ -1707,7 +1782,7 @@ def main():
+                     )
+                 )
+                 for operation in operations:
+-                    write_client_rpc_write(f, operation, metadata)
++                    write_client_rpc_write(f, operation, metadata, function)
+                 f.write("        rpc_write_end_deferred(conn) < 0) {\n")
+                 f.write("        return {r};\n".format(r=error_return))
+                 f.write("    }\n")
+@@ -1730,7 +1805,7 @@ def main():
+             )
+ 
+             for operation in operations:
+-                write_client_rpc_write(f, operation, metadata)
++                write_client_rpc_write(f, operation, metadata, function)
+ 
+             f.write("        rpc_wait_for_response(conn) < 0 ||\n")
+ 
+diff --git a/codegen/gen_client.cpp b/codegen/gen_client.cpp
+index b6df629..5643326 100644
+--- a/codegen/gen_client.cpp
++++ b/codegen/gen_client.cpp
+@@ -2173,21 +2173,28 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
+     using real_fn_t = CUresult (*)(CUdeviceptr*, size_t, size_t, CUdeviceptr, unsigned long long);
+     if (lupine_call_local_cuda_if_routed<real_fn_t>(
+             route, "cuMemAddressReserve", &return_value, ptr, size, alignment, addr, flags)) {
++    if (return_value == CUDA_SUCCESS && ptr != nullptr) lupine_note_deviceptr_allocation_route(*ptr, size, route);
+         return return_value;
+     }
+     conn_t *conn = lupine_route_remote_conn(route);
++    CUdeviceptr remote_addr_hint = addr;
++    if (remote_addr_hint == 0) {
++        const uint64_t route_number = static_cast<uint64_t>(lupine_route_identity(route) + 1);
++        remote_addr_hint = static_cast<CUdeviceptr>(route_number << 48);
++    }
+     if (conn == nullptr ||
+         rpc_write_start_request(conn, RPC_cuMemAddressReserve) < 0 ||
+         rpc_write(conn, ptr, sizeof(CUdeviceptr)) < 0 ||
+         rpc_write(conn, &size, sizeof(size_t)) < 0 ||
+         rpc_write(conn, &alignment, sizeof(size_t)) < 0 ||
+-        rpc_write(conn, &addr, sizeof(CUdeviceptr)) < 0 ||
++        rpc_write(conn, &remote_addr_hint, sizeof(remote_addr_hint)) < 0 ||
+         rpc_write(conn, &flags, sizeof(unsigned long long)) < 0 ||
+         rpc_wait_for_response(conn) < 0 ||
+         rpc_read(conn, ptr, sizeof(CUdeviceptr)) < 0 ||
+         rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+         rpc_read_end(conn) < 0)
+         return CUDA_ERROR_DEVICE_UNAVAILABLE;
++    if (return_value == CUDA_SUCCESS && ptr != nullptr) lupine_note_deviceptr_allocation_route(*ptr, size, route);
+     return return_value;
+ }
+ 
+@@ -2198,6 +2205,7 @@ CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size)
+     using real_fn_t = CUresult (*)(CUdeviceptr, size_t);
+     if (lupine_call_local_cuda_if_routed<real_fn_t>(
+             route, "cuMemAddressFree", &return_value, ptr, size)) {
++    if (return_value == CUDA_SUCCESS) lupine_forget_deviceptr_owner(ptr);
+     if (return_value == CUDA_SUCCESS) lupine_invalidate_pointer_attribute_cache();
+         return return_value;
+     }
+@@ -2210,6 +2218,7 @@ CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size)
+         rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+         rpc_read_end(conn) < 0)
+         return CUDA_ERROR_DEVICE_UNAVAILABLE;
++    if (return_value == CUDA_SUCCESS) lupine_forget_deviceptr_owner(ptr);
+     if (return_value == CUDA_SUCCESS) lupine_invalidate_pointer_attribute_cache();
+     return return_value;
+ }
+@@ -2224,10 +2233,21 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle* handle, size_t size, const CU
+         return return_value;
+     }
+     conn_t *conn = lupine_route_remote_conn(route);
++    if (conn == nullptr)
++        return CUDA_ERROR_DEVICE_UNAVAILABLE;
++    if (prop == nullptr)
++        return CUDA_ERROR_INVALID_VALUE;
++    CUmemAllocationProp remote_prop = *prop;
++    if (remote_prop.location.type == CU_MEM_LOCATION_TYPE_DEVICE) {
++        CUdevice remote_device = static_cast<CUdevice>(remote_prop.location.id);
++        if (!lupine_translate_device_for_conn(conn, &remote_device))
++            return CUDA_ERROR_INVALID_DEVICE;
++        remote_prop.location.id = static_cast<int>(remote_device);
++    }
+     if (conn == nullptr ||
+         rpc_write_start_request(conn, RPC_cuMemCreate) < 0 ||
+         rpc_write(conn, &size, sizeof(size_t)) < 0 ||
+-        rpc_write(conn, prop, sizeof(const CUmemAllocationProp)) < 0 ||
++        rpc_write(conn, &remote_prop, sizeof(remote_prop)) < 0 ||
+         rpc_write(conn, &flags, sizeof(unsigned long long)) < 0 ||
+         rpc_wait_for_response(conn) < 0 ||
+         rpc_read(conn, handle, sizeof(CUmemGenericAllocationHandle)) < 0 ||
+@@ -2340,14 +2360,28 @@ CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* des
+         return return_value;
+     }
+     conn_t *conn = lupine_route_remote_conn(route);
++    if (conn == nullptr)
++        return CUDA_ERROR_DEVICE_UNAVAILABLE;
+     if (count * sizeof(const CUmemAccessDesc) != 0 && desc == nullptr)
+         return CUDA_ERROR_INVALID_VALUE;
++    std::vector<CUmemAccessDesc> remote_desc;
++    if (count != 0) {
++        remote_desc.assign(desc, desc + count);
++        for (CUmemAccessDesc &entry : remote_desc) {
++            if (entry.location.type != CU_MEM_LOCATION_TYPE_DEVICE)
++                continue;
++            CUdevice remote_device = static_cast<CUdevice>(entry.location.id);
++            if (!lupine_translate_device_for_conn(conn, &remote_device))
++                return CUDA_ERROR_INVALID_DEVICE;
++            entry.location.id = static_cast<int>(remote_device);
++        }
++    }
+     if (conn == nullptr ||
+         rpc_write_start_request(conn, RPC_cuMemSetAccess) < 0 ||
+         rpc_write(conn, &ptr, sizeof(CUdeviceptr)) < 0 ||
+         rpc_write(conn, &size, sizeof(size_t)) < 0 ||
+         rpc_write(conn, &count, sizeof(size_t)) < 0 ||
+-        (count * sizeof(const CUmemAccessDesc) != 0 && rpc_write(conn, desc, count * sizeof(const CUmemAccessDesc)) < 0) ||
++        (count * sizeof(const CUmemAccessDesc) != 0 && rpc_write(conn, remote_desc.data(), count * sizeof(const CUmemAccessDesc)) < 0) ||
+         rpc_wait_for_response(conn) < 0 ||
+         rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+         rpc_read_end(conn) < 0)
+@@ -2366,9 +2400,20 @@ CUresult cuMemGetAccess(unsigned long long* flags, const CUmemLocation* location
+         return return_value;
+     }
+     conn_t *conn = lupine_route_remote_conn(route);
++    if (conn == nullptr)
++        return CUDA_ERROR_DEVICE_UNAVAILABLE;
++    if (location == nullptr)
++        return CUDA_ERROR_INVALID_VALUE;
++    CUmemLocation remote_location = *location;
++    if (remote_location.type == CU_MEM_LOCATION_TYPE_DEVICE) {
++        CUdevice remote_device = static_cast<CUdevice>(remote_location.id);
++        if (!lupine_translate_device_for_conn(conn, &remote_device))
++            return CUDA_ERROR_INVALID_DEVICE;
++        remote_location.id = static_cast<int>(remote_device);
++    }
+     if (conn == nullptr ||
+         rpc_write_start_request(conn, RPC_cuMemGetAccess) < 0 ||
+-        rpc_write(conn, location, sizeof(const CUmemLocation)) < 0 ||
++        rpc_write(conn, &remote_location, sizeof(remote_location)) < 0 ||
+         rpc_write(conn, &ptr, sizeof(CUdeviceptr)) < 0 ||
+         rpc_wait_for_response(conn) < 0 ||
+         rpc_read(conn, flags, sizeof(unsigned long long)) < 0 ||
+@@ -2388,9 +2433,20 @@ CUresult cuMemGetAllocationGranularity(size_t* granularity, const CUmemAllocatio
+         return return_value;
+     }
+     conn_t *conn = lupine_route_remote_conn(route);
++    if (conn == nullptr)
++        return CUDA_ERROR_DEVICE_UNAVAILABLE;
++    if (prop == nullptr)
++        return CUDA_ERROR_INVALID_VALUE;
++    CUmemAllocationProp remote_prop = *prop;
++    if (remote_prop.location.type == CU_MEM_LOCATION_TYPE_DEVICE) {
++        CUdevice remote_device = static_cast<CUdevice>(remote_prop.location.id);
++        if (!lupine_translate_device_for_conn(conn, &remote_device))
++            return CUDA_ERROR_INVALID_DEVICE;
++        remote_prop.location.id = static_cast<int>(remote_device);
++    }
+     if (conn == nullptr ||
+         rpc_write_start_request(conn, RPC_cuMemGetAllocationGranularity) < 0 ||
+-        rpc_write(conn, prop, sizeof(const CUmemAllocationProp)) < 0 ||
++        rpc_write(conn, &remote_prop, sizeof(remote_prop)) < 0 ||
+         rpc_write(conn, &option, sizeof(CUmemAllocationGranularity_flags)) < 0 ||
+         rpc_wait_for_response(conn) < 0 ||
+         rpc_read(conn, granularity, sizeof(size_t)) < 0 ||
+

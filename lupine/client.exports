@@ -1,0 +1,22 @@
+GLIBC_2.2.5 {
+  global:
+    dlsym;
+};
+
+LUPINE_1.0 {
+  global:
+    cu*;
+    lupine_checkpoint_*;
+    lupine_local_cuda_*;
+    lupine_cuda_current_route_is_remote;
+    lupine_cuda_current_route_id;
+    lupine_cuda_device_route_id;
+    lupine_nccl_call;
+    lupine_nccl_call_on_route;
+    lupine_cublas_call_on_route;
+    lupine_restore_default_context_hint;
+    lupine_repair_current_context_device;
+    lupine_rpc_stats_reset;
+  local:
+    *;
+} GLIBC_2.2.5;

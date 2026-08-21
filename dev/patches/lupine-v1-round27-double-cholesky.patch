@@ -1,0 +1,61 @@
+--- a/lupine_cublas.h
++++ b/lupine_cublas.h
+@@ -120,6 +120,9 @@
+   LUPINE_CUBLAS_DGEMM_BATCHED = 115,
+   LUPINE_CUBLAS_DGEMV = 116,
+   LUPINE_CUBLAS_DTRSM = 117,
++  LUPINE_CUSOLVER_DN_DPOTRF_BUFFER_SIZE = 118,
++  LUPINE_CUSOLVER_DN_DPOTRF = 119,
++  LUPINE_CUSOLVER_DN_DPOTRS = 120,
+ };
+ 
+ struct lupine_cublas_request {
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -4877,6 +4877,46 @@
+                    reinterpret_cast<int *>(request.d));
+     break;
+   }
++  case LUPINE_CUSOLVER_DN_DPOTRF_BUFFER_SIZE: {
++    using function = int (*)(void *, int, int, double *, int, int *);
++    auto call = reinterpret_cast<function>(
++        solver_symbol("cusolverDnDpotrf_bufferSize"));
++    int lwork = 0;
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.transa, request.n,
++                   reinterpret_cast<double *>(request.a), request.lda,
++                   &lwork);
++    response.value = lwork;
++    break;
++  }
++  case LUPINE_CUSOLVER_DN_DPOTRF: {
++    using function = int (*)(void *, int, int, double *, int, double *, int,
++                             int *);
++    auto call = reinterpret_cast<function>(solver_symbol("cusolverDnDpotrf"));
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.transa, request.n,
++                   reinterpret_cast<double *>(request.a), request.lda,
++                   reinterpret_cast<double *>(request.workspace), request.value,
++                   reinterpret_cast<int *>(request.b));
++    break;
++  }
++  case LUPINE_CUSOLVER_DN_DPOTRS: {
++    using function = int (*)(void *, int, int, int, const double *, int,
++                             double *, int, int *);
++    auto call = reinterpret_cast<function>(solver_symbol("cusolverDnDpotrs"));
++    response.status =
++        call == nullptr
++            ? 7
++            : call(handle, request.transa, request.n, request.k,
++                   reinterpret_cast<const double *>(request.a), request.lda,
++                   reinterpret_cast<double *>(request.b), request.ldb,
++                   reinterpret_cast<int *>(request.c));
++    break;
++  }
+   case LUPINE_CUSOLVER_DN_SORMQR_BUFFER_SIZE: {
+     using function = int (*)(void *, int, int, int, int, int, const float *,
+                              int, const float *, const float *, int, int *);

@@ -1,0 +1,141 @@
+--- a/lupine_cublas.h
++++ b/lupine_cublas.h
+@@ -133,6 +133,14 @@
+   LUPINE_CUSOLVER_DN_DPOTRS_BATCHED = 128,
+   LUPINE_CUSOLVER_DN_DSYEVJ_BATCHED_BUFFER_SIZE = 129,
+   LUPINE_CUSOLVER_DN_DSYEVJ_BATCHED = 130,
++  LUPINE_CUBLAS_DAXPY = 131,
++  LUPINE_CUBLAS_DCOPY = 132,
++  LUPINE_CUBLAS_DSCAL = 133,
++  LUPINE_CUBLAS_DNRM2 = 134,
++  LUPINE_CUBLAS_DASUM = 135,
++  LUPINE_CUBLAS_DSWAP = 136,
++  LUPINE_CUBLAS_IDAMAX = 137,
++  LUPINE_CUBLAS_IDAMIN = 138,
+ };
+ 
+ struct lupine_cublas_request {
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -3947,6 +3947,14 @@
+       request.opcode == LUPINE_CUBLAS_DTRSM ||
+       request.opcode == LUPINE_CUBLAS_DGEMM_BATCHED ||
+       request.opcode == LUPINE_CUBLAS_DGEMV ||
++      request.opcode == LUPINE_CUBLAS_DAXPY ||
++      request.opcode == LUPINE_CUBLAS_DCOPY ||
++      request.opcode == LUPINE_CUBLAS_DSCAL ||
++      request.opcode == LUPINE_CUBLAS_DNRM2 ||
++      request.opcode == LUPINE_CUBLAS_DASUM ||
++      request.opcode == LUPINE_CUBLAS_DSWAP ||
++      request.opcode == LUPINE_CUBLAS_IDAMAX ||
++      request.opcode == LUPINE_CUBLAS_IDAMIN ||
+       request.opcode == LUPINE_CUBLAS_ZGETRS_BATCHED;
+   if (applies_handle_state &&
+       (request.handle_state_mask & 1u) != 0) {
+@@ -5507,6 +5515,106 @@
+                    reinterpret_cast<int *>(request.c), request.batch_count);
+     break;
+   }
++  case LUPINE_CUBLAS_DAXPY: {
++    using function = int (*)(void *, int, const double *, const double *, int,
++                             double *, int);
++    auto call = reinterpret_cast<function>(symbol("cublasDaxpy_v2"));
++    alignas(16) unsigned char aligned_alpha[16] = {};
++    memcpy(aligned_alpha, request.alpha_data, sizeof(aligned_alpha));
++    const double *alpha = request.pointer_mode == 0
++                              ? reinterpret_cast<const double *>(aligned_alpha)
++                              : reinterpret_cast<const double *>(request.c);
++    response.status =
++        call == nullptr
++            ? 13
++            : call(handle, request.n, alpha,
++                   reinterpret_cast<const double *>(request.a), request.lda,
++                   reinterpret_cast<double *>(request.b), request.ldb);
++    break;
++  }
++  case LUPINE_CUBLAS_DCOPY: {
++    using function = int (*)(void *, int, const double *, int, double *, int);
++    auto call = reinterpret_cast<function>(symbol("cublasDcopy_v2"));
++    response.status =
++        call == nullptr
++            ? 13
++            : call(handle, request.n,
++                   reinterpret_cast<const double *>(request.a), request.lda,
++                   reinterpret_cast<double *>(request.b), request.ldb);
++    break;
++  }
++  case LUPINE_CUBLAS_DSCAL: {
++    using function = int (*)(void *, int, const double *, double *, int);
++    auto call = reinterpret_cast<function>(symbol("cublasDscal_v2"));
++    alignas(16) unsigned char aligned_alpha[16] = {};
++    memcpy(aligned_alpha, request.alpha_data, sizeof(aligned_alpha));
++    const double *alpha = request.pointer_mode == 0
++                              ? reinterpret_cast<const double *>(aligned_alpha)
++                              : reinterpret_cast<const double *>(request.c);
++    response.status =
++        call == nullptr
++            ? 13
++            : call(handle, request.n, alpha,
++                   reinterpret_cast<double *>(request.a), request.lda);
++    break;
++  }
++  case LUPINE_CUBLAS_DNRM2:
++  case LUPINE_CUBLAS_DASUM: {
++    using function = int (*)(void *, int, const double *, int, double *);
++    const char *name = request.opcode == LUPINE_CUBLAS_DNRM2
++                           ? "cublasDnrm2_v2"
++                           : "cublasDasum_v2";
++    auto call = reinterpret_cast<function>(symbol(name));
++    double host_result = 0.0;
++    double *result = request.pointer_mode == 0
++                         ? &host_result
++                         : reinterpret_cast<double *>(request.c);
++    response.status =
++        call == nullptr
++            ? 13
++            : call(handle, request.n,
++                   reinterpret_cast<const double *>(request.a), request.lda,
++                   result);
++    if (request.pointer_mode == 0 && response.status == 0) {
++      memcpy(response.payload, &host_result, sizeof(host_result));
++      response.payload_size = sizeof(host_result);
++    }
++    break;
++  }
++  case LUPINE_CUBLAS_DSWAP: {
++    using function = int (*)(void *, int, double *, int, double *, int);
++    auto call = reinterpret_cast<function>(symbol("cublasDswap_v2"));
++    response.status =
++        call == nullptr
++            ? 13
++            : call(handle, request.n, reinterpret_cast<double *>(request.a),
++                   request.lda, reinterpret_cast<double *>(request.b),
++                   request.ldb);
++    break;
++  }
++  case LUPINE_CUBLAS_IDAMAX:
++  case LUPINE_CUBLAS_IDAMIN: {
++    using function = int (*)(void *, int, const double *, int, int *);
++    const char *name = request.opcode == LUPINE_CUBLAS_IDAMAX
++                           ? "cublasIdamax_v2"
++                           : "cublasIdamin_v2";
++    auto call = reinterpret_cast<function>(symbol(name));
++    int host_result = 0;
++    int *result = request.pointer_mode == 0
++                      ? &host_result
++                      : reinterpret_cast<int *>(request.c);
++    response.status =
++        call == nullptr
++            ? 13
++            : call(handle, request.n,
++                   reinterpret_cast<const double *>(request.a), request.lda,
++                   result);
++    if (request.pointer_mode == 0 && response.status == 0) {
++      memcpy(response.payload, &host_result, sizeof(host_result));
++      response.payload_size = sizeof(host_result);
++    }
++    break;
++  }
+   case LUPINE_CUBLAS_CREATE: {
+     using function = int (*)(void **);
+     auto call = reinterpret_cast<function>(symbol("cublasCreate_v2"));

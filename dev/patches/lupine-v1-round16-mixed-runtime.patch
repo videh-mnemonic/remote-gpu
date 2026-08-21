@@ -1,0 +1,327 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1145cb6..0c155ca 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -162,11 +162,13 @@ if (NOT WIN32)
+     )
+ 
+     add_library(lupine_cudart_compat SHARED
+-        ${CMAKE_CURRENT_SOURCE_DIR}/cudart_compat.cpp)
++        ${CMAKE_CURRENT_SOURCE_DIR}/cudart_compat.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/cudart_prime_kernel.cu)
+     target_include_directories(lupine_cudart_compat PRIVATE
+         ${CUDAToolkit_INCLUDE_DIRS})
+     target_link_libraries(lupine_cudart_compat PRIVATE ${CLIENT_OUTPUT})
+     set_target_properties(lupine_cudart_compat PROPERTIES
++        CUDA_RUNTIME_LIBRARY Shared
+         POSITION_INDEPENDENT_CODE ON
+         OUTPUT_NAME lupine-cudart-compat
+     )
+diff --git a/Dockerfile b/Dockerfile
+index af1ee4e..d57ae86 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -113,7 +113,8 @@ COPY --from=client-build /opt/lupine/build/libcuda.so.1 /opt/lupine/lib/libcuda.
+ COPY --from=client-build /opt/lupine/build/libnvidia-ml.so.1 /opt/lupine/lib/libnvidia-ml.so.1
+ COPY --from=client-build /opt/lupine/build/liblupine-cudart-compat.so /opt/lupine/lib/liblupine-cudart-compat.so
+ 
+-RUN ln -sf /opt/lupine/lib/libcuda.so.1 /opt/lupine/lib/libcuda.so \
++RUN cp -L /usr/local/cuda/lib64/libcudart.so.13 /opt/lupine/lib/libcudart.so.13 \
++    && ln -sf /opt/lupine/lib/libcuda.so.1 /opt/lupine/lib/libcuda.so \
+     && ln -sf /opt/lupine/lib/libnvidia-ml.so.1 /opt/lupine/lib/libnvidia-ml.so
+ 
+ ENV LUPINE_LIBCUDA=/opt/lupine/lib/libcuda.so.1
+@@ -149,6 +150,7 @@ COPY --from=nvidia-utils /nvidia-smi /usr/bin/nvidia-smi
+ COPY --from=client-build /opt/lupine/build/libcuda.so.1 /opt/lupine/lib/libcuda.so.1
+ COPY --from=client-build /opt/lupine/build/libnvidia-ml.so.1 /opt/lupine/lib/libnvidia-ml.so.1
+ COPY --from=client-build /opt/lupine/build/liblupine-cudart-compat.so /opt/lupine/lib/liblupine-cudart-compat.so
++COPY --from=client /opt/lupine/lib/libcudart.so.13 /opt/lupine/lib/libcudart.so.13
+ 
+ RUN ln -sf /opt/lupine/lib/libcuda.so.1 /opt/lupine/lib/libcuda.so \
+     && ln -sf /opt/lupine/lib/libnvidia-ml.so.1 /opt/lupine/lib/libnvidia-ml.so
+diff --git a/client.cpp b/client.cpp
+index 249af48..d0e575d 100644
+--- a/client.cpp
++++ b/client.cpp
+@@ -291,6 +291,22 @@ extern "C" int lupine_nccl_call(const lupine_nccl_request *request,
+   return 0;
+ }
+ 
++extern "C" int lupine_nccl_call_on_route(
++    int route_id, const lupine_nccl_request *request,
++    lupine_nccl_response *response) {
++  if (route_id < 0 || request == nullptr || response == nullptr) return -1;
++  conn_t *conn = lupine_thread_conn_by_index(static_cast<unsigned int>(route_id));
++  if (conn == nullptr) return -1;
++  if (rpc_write_start_request(conn, LUPINE_RPC_lupineNcclCall) < 0 ||
++      rpc_write(conn, request, sizeof(*request)) < 0 ||
++      rpc_wait_for_response(conn) < 0 ||
++      rpc_read(conn, response, sizeof(*response)) < 0 ||
++      rpc_read_end(conn) < 0) {
++    return -1;
++  }
++  return 0;
++}
++
+ extern "C" CUresult lupine_missing_driver_api_called(const char *symbol) {
+   LUPINE_LOG_ERROR("LUPINE missing Driver API called: " << symbol);
+   return CUDA_ERROR_NOT_SUPPORTED;
+@@ -8245,8 +8261,10 @@ extern "C" CUresult cuGetExportTable(const void **ppExportTable,
+     // commonly imports CUDA while device 0 is current and only then selects
+     // LOCAL_RANK.  Prefer that rank's eventual device so a remote rank does
+     // not retain a native cuBLAS table and later pass remote addresses to it.
+-    // Public driver entry points remain dynamically routed and mixed-device
+-    // applications without LOCAL_RANK retain the current-context behavior.
++    // Public driver entry points remain dynamically routed. For a genuinely
++    // mixed single-process application, prefer an interposed remote table:
++    // those stubs can route both local and remote handles, whereas a native
++    // table cached while cuda:0 is current can never consume cuda:1 handles.
+     const char *local_rank_value = getenv("LOCAL_RANK");
+     if (local_rank_value != nullptr && local_rank_value[0] != '\0') {
+       char *end = nullptr;
+@@ -8261,6 +8279,21 @@ extern "C" CUresult cuGetExportTable(const void **ppExportTable,
+         }
+       }
+     }
++    if (!rank_route_selected &&
++        (local_rank_value == nullptr || local_rank_value[0] == '\0')) {
++      int device_count = 0;
++      if (lupine_virtual_device_count(&device_count) == CUDA_SUCCESS) {
++        for (int ordinal = 0; ordinal < device_count; ++ordinal) {
++          CUdevice candidate = static_cast<CUdevice>(ordinal);
++          lupine_route candidate_route = lupine_route_for_device(&candidate);
++          if (candidate_route.kind == LUPINE_ROUTE_REMOTE) {
++            route = candidate_route;
++            rank_route_selected = true;
++            break;
++          }
++        }
++      }
++    }
+     if (!rank_route_selected && !lupine_route_is_local(route)) {
+       using current_fn_t = CUresult (*)(CUcontext *);
+       auto current = lupine_real_cuda_fn<current_fn_t>("cuCtxGetCurrent");
+diff --git a/client.exports b/client.exports
+index d22560e..24e8d4d 100644
+--- a/client.exports
++++ b/client.exports
+@@ -9,7 +9,10 @@ LUPINE_1.0 {
+     lupine_checkpoint_*;
+     lupine_local_cuda_*;
+     lupine_cuda_current_route_is_remote;
++    lupine_cuda_current_route_id;
++    lupine_cuda_device_route_id;
+     lupine_nccl_call;
++    lupine_nccl_call_on_route;
+     lupine_rpc_stats_reset;
+   local:
+     *;
+diff --git a/cudart_compat.cpp b/cudart_compat.cpp
+index 2746901..b3b2189 100644
+--- a/cudart_compat.cpp
++++ b/cudart_compat.cpp
+@@ -1,4 +1,13 @@
+ #include <cuda.h>
++#include <dlfcn.h>
++
++#include <cstdlib>
++#include <cstdio>
++#include <mutex>
++
++extern "C" int lupine_launch_runtime_anchor_kernel();
++
++static thread_local int lupine_runtime_device = -1;
+ 
+ // CUDA 13 NCCL requires the query-status output from this Runtime API. With an
+ // interposed libcuda, libcudart falls back to the legacy four-argument Driver
+@@ -23,3 +32,146 @@ extern "C" int cudaGetDriverEntryPointByVersion_ptsz(
+   return cudaGetDriverEntryPointByVersion(symbol, pfn, cudaVersion, flags,
+                                           driverStatus);
+ }
++
++// libcudart's process-global current-device query can return
++// cudaErrorDevicesUnavailable after alternating between primary contexts that
++// live in local and remote driver processes. The interposed Driver API already
++// owns the authoritative routed current context and maps its CUdevice back to
++// the virtual ordinal, so use that whenever a context is current. Preserve the
++// real Runtime behavior (including its default-device initialization) when no
++// context exists yet.
++extern "C" int cudaGetDevice(int *device) {
++  if (device == nullptr) return 1; // cudaErrorInvalidValue
++  bool debug = std::getenv("LUPINE_CUDART_COMPAT_DEBUG") != nullptr;
++  CUcontext context = nullptr;
++  if (cuCtxGetCurrent(&context) == CUDA_SUCCESS && context != nullptr) {
++    CUdevice current = -1;
++    if (cuCtxGetDevice(&current) == CUDA_SUCCESS) {
++      *device = static_cast<int>(current);
++      if (debug)
++        std::fprintf(stderr, "lupine-cudart: cudaGetDevice driver=%d\n",
++                     *device);
++      return 0; // cudaSuccess
++    }
++  }
++  if (lupine_runtime_device >= 0) {
++    using set_device_fn = int (*)(int);
++    static set_device_fn restore =
++        reinterpret_cast<set_device_fn>(dlsym(RTLD_NEXT, "cudaSetDevice"));
++    int restore_result = restore == nullptr ? 999 : restore(lupine_runtime_device);
++    if (restore_result != 0) return restore_result;
++    *device = lupine_runtime_device;
++    if (debug)
++      std::fprintf(stderr,
++                   "lupine-cudart: cudaGetDevice restored-and-tracked=%d\n",
++                   *device);
++    return 0;
++  }
++  using get_device_fn = int (*)(int *);
++  static get_device_fn real_get =
++      reinterpret_cast<get_device_fn>(dlsym(RTLD_NEXT, "cudaGetDevice"));
++  int result = real_get == nullptr ? 999 : real_get(device);
++  if (debug)
++    std::fprintf(stderr, "lupine-cudart: cudaGetDevice runtime=%d device=%d\n",
++                 result, result == 0 ? *device : -1);
++  return result;
++}
++
++// CUDA's private runtime state is process-wide, while a LUPINE mixed process
++// combines contexts created by two driver processes. CUDA 13 accepts that
++// arrangement when the remote runtime context is initialized first, but a
++// local-first allocation leaves later remote allocation with
++// cudaErrorDevicesUnavailable. Prime one remote context before the first local
++// cudaSetDevice in a non-torchrun mixed process. Keep a one-byte allocation
++// alive for the process lifetime: releasing the final remote Runtime allocation
++// lets libcudart discard the state that makes the later mixed transition safe.
++extern "C" int cudaSetDevice(int device) {
++  using set_device_fn = int (*)(int);
++  using malloc_fn = int (*)(void **, size_t);
++  using memset_fn = int (*)(void *, int, size_t);
++  using synchronize_fn = int (*)();
++  using route_fn = int (*)(int);
++  static set_device_fn real_set =
++      reinterpret_cast<set_device_fn>(dlsym(RTLD_NEXT, "cudaSetDevice"));
++  static malloc_fn real_malloc =
++      reinterpret_cast<malloc_fn>(dlsym(RTLD_NEXT, "cudaMalloc"));
++  static memset_fn real_memset =
++      reinterpret_cast<memset_fn>(dlsym(RTLD_NEXT, "cudaMemset"));
++  static synchronize_fn real_synchronize = reinterpret_cast<synchronize_fn>(
++      dlsym(RTLD_NEXT, "cudaDeviceSynchronize"));
++  static route_fn route = reinterpret_cast<route_fn>(
++      dlsym(RTLD_DEFAULT, "lupine_cuda_device_route_id"));
++  static std::once_flag prime_once;
++  static void *remote_runtime_anchor = nullptr;
++  static thread_local bool priming = false;
++
++  if (real_set == nullptr) return 999; // cudaErrorUnknown
++  if (priming) return real_set(device);
++  const char *local_rank = std::getenv("LOCAL_RANK");
++  bool rank_process = local_rank != nullptr && local_rank[0] != '\0';
++  bool debug = std::getenv("LUPINE_CUDART_COMPAT_DEBUG") != nullptr;
++  if (debug) {
++    std::fprintf(stderr, "lupine-cudart: cudaSetDevice(%d) route=%d rank=%d\n",
++                 device, route == nullptr ? -99 : route(device), rank_process);
++  }
++  if (!rank_process && route != nullptr && route(device) == -1) {
++    std::call_once(prime_once, [&] {
++      int remote_device = -1;
++      for (int ordinal = 0; ordinal < 64; ++ordinal) {
++        int route_id = route(ordinal);
++        if (route_id >= 0) {
++          remote_device = ordinal;
++          break;
++        }
++        if (route_id < -1) break;
++      }
++      if (remote_device < 0 || real_malloc == nullptr)
++        return;
++      priming = true;
++      int remote_set_result = real_set(remote_device);
++      if (debug) {
++        std::fprintf(stderr,
++                     "lupine-cudart: prime remote=%d set_result=%d\n",
++                     remote_device, remote_set_result);
++      }
++      if (remote_set_result == 0) {
++        void *pointer = nullptr;
++        int malloc_result = real_malloc(&pointer, 1);
++        if (debug) {
++          std::fprintf(stderr,
++                       "lupine-cudart: prime malloc_result=%d pointer=%p\n",
++                       malloc_result, pointer);
++        }
++        if (malloc_result == 0 && pointer != nullptr) {
++          remote_runtime_anchor = pointer;
++          int memset_result = real_memset == nullptr
++                                  ? 999
++                                  : real_memset(pointer, 0, 1);
++          int launch_result = lupine_launch_runtime_anchor_kernel();
++          int synchronize_result = real_synchronize == nullptr
++                                       ? 999
++                                       : real_synchronize();
++          if (debug) {
++            std::fprintf(stderr,
++                         "lupine-cudart: prime memset=%d launch=%d "
++                         "synchronize=%d\n",
++                         memset_result, launch_result, synchronize_result);
++          }
++        }
++      }
++      int restore_result = real_set(device);
++      if (debug) {
++        std::fprintf(stderr, "lupine-cudart: prime restore=%d result=%d\n",
++                     device, restore_result);
++      }
++      priming = false;
++    });
++  }
++  int result = real_set(device);
++  if (result == 0) lupine_runtime_device = device;
++  if (debug) {
++    std::fprintf(stderr, "lupine-cudart: cudaSetDevice(%d) result=%d\n",
++                 device, result);
++  }
++  return result;
++}
+diff --git a/routing.cpp b/routing.cpp
+index 9093bf8..8a65931 100644
+--- a/routing.cpp
++++ b/routing.cpp
+@@ -83,6 +83,21 @@ extern "C" int lupine_cuda_current_route_is_remote() {
+   return lupine_route_for_current_context().kind == LUPINE_ROUTE_REMOTE ? 1 : 0;
+ }
+ 
++extern "C" int lupine_cuda_current_route_id() {
++  lupine_route route = lupine_route_for_current_context();
++  if (route.kind == LUPINE_ROUTE_LOCAL) return -1;
++  if (route.kind == LUPINE_ROUTE_REMOTE) return lupine_conn_index(route.conn);
++  return -2;
++}
++
++extern "C" int lupine_cuda_device_route_id(int ordinal) {
++  CUdevice device = static_cast<CUdevice>(ordinal);
++  lupine_route route = lupine_route_for_device(&device);
++  if (route.kind == LUPINE_ROUTE_LOCAL) return -1;
++  if (route.kind == LUPINE_ROUTE_REMOTE) return lupine_conn_index(route.conn);
++  return -2;
++}
++
+ extern "C" conn_t *lupine_route_remote_conn(lupine_route route) {
+   return route.kind == LUPINE_ROUTE_REMOTE ? route.conn : nullptr;
+ }
+diff --git a/external/lupine-v1/cudart_prime_kernel.cu b/cudart_prime_kernel.cu
+new file mode 100644
+index 0000000..0fa3dcc
+--- /dev/null
++++ b/cudart_prime_kernel.cu
+@@ -0,0 +1,12 @@
++#include <cuda_runtime_api.h>
++
++// A real Runtime-registered kernel is needed to initialize libcudart's private
++// per-context launch state. Driver-only work (and even cudaMemset) does not
++// establish all of the state PyTorch later expects when a process transitions
++// between local and remotely routed primary contexts.
++__global__ void lupine_runtime_anchor_kernel() {}
++
++extern "C" int lupine_launch_runtime_anchor_kernel() {
++  lupine_runtime_anchor_kernel<<<1, 1>>>();
++  return static_cast<int>(cudaGetLastError());
++}

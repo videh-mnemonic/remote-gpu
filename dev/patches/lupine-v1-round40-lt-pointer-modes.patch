@@ -1,0 +1,32 @@
+diff --git a/manual_server.cpp b/manual_server.cpp
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -6255,12 +6255,22 @@ void LupineServer::manual_cublas(const lupine_cublas_request &request,
+     memcpy(aligned_alpha, request.alpha_data, sizeof(aligned_alpha));
+     memcpy(aligned_beta, request.beta_data, sizeof(aligned_beta));
+     const bool explicit_scalar_presence = (request.value & 0x100) != 0;
+-    const void *alpha = explicit_scalar_presence && (request.value & 1) == 0
+-                            ? nullptr
+-                            : static_cast<const void *>(aligned_alpha);
+-    const void *beta = explicit_scalar_presence && (request.value & 2) == 0
+-                           ? nullptr
+-                           : static_cast<const void *>(aligned_beta);
++    const bool host_alpha = request.pointer_mode == 0;
++    const bool host_beta = request.pointer_mode == 0 || request.pointer_mode == 4;
++    const void *alpha = host_alpha
++                            ? (explicit_scalar_presence &&
++                                       (request.value & 1) == 0
++                                   ? nullptr
++                                   : static_cast<const void *>(aligned_alpha))
++                            : reinterpret_cast<const void *>(request.preference);
++    const void *beta = host_beta
++                           ? (explicit_scalar_presence &&
++                                      (request.value & 2) == 0
++                                  ? nullptr
++                                  : static_cast<const void *>(aligned_beta))
++                           : request.pointer_mode == 3
++                                 ? nullptr
++                                 : reinterpret_cast<const void *>(request.rows);
+     response.status =
+         call == nullptr || request.scalar_size > sizeof(request.alpha_data)
+             ? 13

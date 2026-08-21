@@ -1,0 +1,292 @@
+diff --git a/client.cpp b/client.cpp
+index 0f48df8..621a9b4 100644
+--- a/client.cpp
++++ b/client.cpp
+@@ -61,6 +61,8 @@
+ #include "rpc.h"
+ #include "third_party/libcuckoo/libcuckoo/cuckoohash_map.hh"
+ 
++extern "C" void lupine_invalidate_ctx_limit_cache();
++
+ pthread_mutex_t conn_mutex;
+ conn_t conns[16];
+ int nconns = 0;
+@@ -2068,6 +2070,7 @@ extern "C" CUresult cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
+           route, "cuDevicePrimaryCtxRelease_v2", &return_value, remote_dev)) {
+     if (return_value == CUDA_SUCCESS) {
+       lupine_invalidate_current_context_cache();
++      lupine_invalidate_ctx_limit_cache();
+     }
+     return return_value;
+   }
+@@ -2082,6 +2085,7 @@ extern "C" CUresult cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
+   }
+   if (return_value == CUDA_SUCCESS) {
+     lupine_invalidate_current_context_cache();
++    lupine_invalidate_ctx_limit_cache();
+   }
+   return return_value;
+ }
+@@ -2168,6 +2172,7 @@ extern "C" CUresult cuDevicePrimaryCtxReset_v2(CUdevice dev) {
+           route, "cuDevicePrimaryCtxReset_v2", &return_value, remote_dev)) {
+     if (return_value == CUDA_SUCCESS) {
+       lupine_invalidate_current_context_cache();
++      lupine_invalidate_ctx_limit_cache();
+     }
+     return return_value;
+   }
+@@ -2182,6 +2187,7 @@ extern "C" CUresult cuDevicePrimaryCtxReset_v2(CUdevice dev) {
+   }
+   if (return_value == CUDA_SUCCESS) {
+     lupine_invalidate_current_context_cache();
++    lupine_invalidate_ctx_limit_cache();
+   }
+   return return_value;
+ }
+@@ -4955,7 +4961,6 @@ cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX,
+   }
+ 
+   conn_t *conn = lupine_route_remote_conn(route);
+-  CUresult return_value;
+   if (conn == nullptr ||
+       rpc_write_start_request(conn, RPC_cuLaunchCooperativeKernel) < 0 ||
+       rpc_write(conn, &f, sizeof(f)) < 0 ||
+@@ -4971,12 +4976,10 @@ cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX,
+       rpc_write(conn, &payload_size, sizeof(payload_size)) < 0 ||
+       rpc_write_kernel_param_values(conn, layout.count, layout.sizes.data(),
+                                     rpc_params.data()) < 0 ||
+-      rpc_wait_for_response(conn) < 0 ||
+-      rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
+-      rpc_read_end(conn) < 0) {
++      rpc_write_end_deferred(conn) < 0) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   }
+-  return return_value;
++  return CUDA_SUCCESS;
+ }
+ 
+ #ifdef cuLaunchCooperativeKernel_ptsz
+@@ -6726,6 +6729,12 @@ static bool lupine_is_writable_user_pointer(const void *ptr, size_t size) {
+   return false;
+ }
+ 
++// Stream captures started by this client and not yet terminated. A stream can
++// only be capturing if we started the capture, so capture-state queries can
++// answer NONE locally while this is zero.
++static std::atomic<int> lupine_active_stream_captures{0};
++static bool lupine_stream_handle_is_known(CUstream hStream);
++
+ static CUresult lupine_cuStreamGetCaptureInfo(
+     CUstream stream, CUstreamCaptureStatus *captureStatus_out,
+     cuuint64_t *id_out, CUgraph *graph_out,
+@@ -6736,6 +6745,23 @@ static CUresult lupine_cuStreamGetCaptureInfo(
+   lupine_route route = stream != nullptr ? lupine_route_for_stream(stream)
+                                          : lupine_route_for_default();
+ 
++  if (lupine_active_stream_captures.load() == 0 &&
++      lupine_stream_handle_is_known(stream)) {
++    if (captureStatus_out != nullptr)
++      *captureStatus_out = CU_STREAM_CAPTURE_STATUS_NONE;
++    if (id_out != nullptr)
++      *id_out = 0;
++    if (graph_out != nullptr)
++      *graph_out = nullptr;
++    if (dependencies_out != nullptr)
++      *dependencies_out = nullptr;
++    if (edgeData_out != nullptr)
++      *edgeData_out = nullptr;
++    if (numDependencies_out != nullptr)
++      *numDependencies_out = 0;
++    return CUDA_SUCCESS;
++  }
++
+ #if CUDA_VERSION >= 12000
+   {
+     CUresult local_result;
+@@ -6858,11 +6884,6 @@ static CUresult lupine_cuStreamGetCaptureInfo(
+   return return_value;
+ }
+ 
+-// Stream captures started by this client and not yet terminated. A stream can
+-// only be capturing if we started the capture, so cuStreamIsCapturing can
+-// answer NONE locally while this is zero.
+-static std::atomic<int> lupine_active_stream_captures{0};
+-
+ class lupine_capture_begin_guard {
+ public:
+   lupine_capture_begin_guard() { lupine_checkpoint::capture_begin(); }
+diff --git a/codegen/codegen.py b/codegen/codegen.py
+index 19f2d70..c9dfc34 100644
+--- a/codegen/codegen.py
++++ b/codegen/codegen.py
+@@ -839,6 +839,7 @@ def write_client_post_call(f, function: Function, metadata: FunctionAnnotationMe
+         "cuDevicePrimaryCtxReset_v2",
+     }:
+         f.write("    if (return_value == CUDA_SUCCESS) lupine_invalidate_current_context_cache();\n")
++        f.write("    if (return_value == CUDA_SUCCESS) lupine_invalidate_ctx_limit_cache();\n")
+     if function.name.format() in {
+         "cuCtxDestroy_v2",
+         "cuMemAddressFree",
+diff --git a/codegen/gen_client.cpp b/codegen/gen_client.cpp
+index bc6b1a9..274ef9e 100644
+--- a/codegen/gen_client.cpp
++++ b/codegen/gen_client.cpp
+@@ -8,6 +8,7 @@
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstring>
++#include <mutex>
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
+@@ -73,6 +74,7 @@ lupine_cuMemcpyDtoD_via_client(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
+                                size_t ByteCount, CUstream hStream, bool async);
+ 
+ extern "C" void lupine_invalidate_current_context_cache();
++extern "C" void lupine_invalidate_ctx_limit_cache();
+ extern "C" void lupine_forget_destroyed_context(CUcontext ctx);
+ extern "C" void lupine_invalidate_function_caches();
+ extern "C" void lupine_invalidate_pointer_attribute_cache();
+@@ -98,6 +100,50 @@ extern "C" CUresult lupine_sync_mapped_device_to_host();
+ extern "C" void lupine_ensure_mapped_host_readable(const void *host,
+                                                    size_t size);
+ 
++// Context limits are stable until cuCtxSetLimit mutates them.  PyTorch asks
++// for the same limits repeatedly while selecting kernels, so serving those
++// queries from the client avoids an otherwise unavoidable network round trip.
++struct lupine_ctx_limit_cache_key {
++  int route_id;
++  CUcontext context;
++  CUlimit limit;
++
++  bool operator==(const lupine_ctx_limit_cache_key &other) const {
++    return route_id == other.route_id && context == other.context &&
++           limit == other.limit;
++  }
++};
++
++struct lupine_ctx_limit_cache_hash {
++  size_t operator()(const lupine_ctx_limit_cache_key &key) const {
++    size_t value = std::hash<int>{}(key.route_id);
++    value ^= std::hash<void *>{}(key.context) + 0x9e3779b9 + (value << 6) +
++             (value >> 2);
++    value ^= std::hash<int>{}(static_cast<int>(key.limit)) + 0x9e3779b9 +
++             (value << 6) + (value >> 2);
++    return value;
++  }
++};
++
++static std::mutex &lupine_ctx_limit_cache_mutex() {
++  static auto *mutex = new std::mutex();
++  return *mutex;
++}
++
++static std::unordered_map<lupine_ctx_limit_cache_key, size_t,
++                          lupine_ctx_limit_cache_hash> &
++lupine_ctx_limit_cache() {
++  static auto *cache =
++      new std::unordered_map<lupine_ctx_limit_cache_key, size_t,
++                             lupine_ctx_limit_cache_hash>();
++  return *cache;
++}
++
++extern "C" void lupine_invalidate_ctx_limit_cache() {
++  std::lock_guard<std::mutex> lock(lupine_ctx_limit_cache_mutex());
++  lupine_ctx_limit_cache().clear();
++}
++
+ CUresult cuDriverGetVersion(int *driverVersion) {
+   lupine_route route = lupine_route_for_default();
+   CUresult return_value;
+@@ -381,6 +427,8 @@ CUresult cuCtxDestroy_v2(CUcontext ctx) {
+       lupine_forget_destroyed_context(ctx);
+     if (return_value == CUDA_SUCCESS)
+       lupine_invalidate_current_context_cache();
++    if (return_value == CUDA_SUCCESS)
++      lupine_invalidate_ctx_limit_cache();
+     if (return_value == CUDA_SUCCESS)
+       lupine_invalidate_pointer_attribute_cache();
+     return return_value;
+@@ -397,6 +445,8 @@ CUresult cuCtxDestroy_v2(CUcontext ctx) {
+     lupine_forget_destroyed_context(ctx);
+   if (return_value == CUDA_SUCCESS)
+     lupine_invalidate_current_context_cache();
++  if (return_value == CUDA_SUCCESS)
++    lupine_invalidate_ctx_limit_cache();
+   if (return_value == CUDA_SUCCESS)
+     lupine_invalidate_pointer_attribute_cache();
+   return return_value;
+@@ -483,6 +533,8 @@ CUresult cuCtxSetLimit(CUlimit limit, size_t value) {
+       rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+       rpc_read_end(conn) < 0)
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
++  if (return_value == CUDA_SUCCESS)
++    lupine_invalidate_ctx_limit_cache();
+   return return_value;
+ }
+ 
+@@ -494,6 +546,18 @@ CUresult cuCtxGetLimit(size_t *pvalue, CUlimit limit) {
+           route, "cuCtxGetLimit", &return_value, pvalue, limit)) {
+     return return_value;
+   }
++  if (pvalue == nullptr)
++    return CUDA_ERROR_INVALID_VALUE;
++  const lupine_ctx_limit_cache_key cache_key{
++      lupine_route_identity(route), lupine_current_context_hint(), limit};
++  {
++    std::lock_guard<std::mutex> lock(lupine_ctx_limit_cache_mutex());
++    auto cached = lupine_ctx_limit_cache().find(cache_key);
++    if (cached != lupine_ctx_limit_cache().end()) {
++      *pvalue = cached->second;
++      return CUDA_SUCCESS;
++    }
++  }
+   conn_t *conn = lupine_route_remote_conn(route);
+   if (conn == nullptr || rpc_write_start_request(conn, RPC_cuCtxGetLimit) < 0 ||
+       rpc_write(conn, &limit, sizeof(CUlimit)) < 0 ||
+@@ -502,6 +566,10 @@ CUresult cuCtxGetLimit(size_t *pvalue, CUlimit limit) {
+       rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+       rpc_read_end(conn) < 0)
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
++  if (return_value == CUDA_SUCCESS) {
++    std::lock_guard<std::mutex> lock(lupine_ctx_limit_cache_mutex());
++    lupine_ctx_limit_cache().insert_or_assign(cache_key, *pvalue);
++  }
+   return return_value;
+ }
+ 
+@@ -629,6 +697,8 @@ CUresult cuCtxDetach(CUcontext ctx) {
+                                                   &return_value, ctx)) {
+     if (return_value == CUDA_SUCCESS)
+       lupine_invalidate_current_context_cache();
++    if (return_value == CUDA_SUCCESS)
++      lupine_invalidate_ctx_limit_cache();
+     return return_value;
+   }
+   conn_t *conn = lupine_route_remote_conn(route);
+@@ -640,6 +710,8 @@ CUresult cuCtxDetach(CUcontext ctx) {
+     return CUDA_ERROR_DEVICE_UNAVAILABLE;
+   if (return_value == CUDA_SUCCESS)
+     lupine_invalidate_current_context_cache();
++  if (return_value == CUDA_SUCCESS)
++    lupine_invalidate_ctx_limit_cache();
+   return return_value;
+ }
+ 
+diff --git a/manual_server.cpp b/manual_server.cpp
+index caea144..c9860c6 100644
+--- a/manual_server.cpp
++++ b/manual_server.cpp
+@@ -2288,10 +2288,8 @@ int handle_manual_cuLaunchCooperativeKernel(conn_t *conn) {
+         sharedMemBytes, hStream, param_count == 0 ? nullptr : params.data());
+   }
+ 
+-  if (rpc_write_start_response(conn, request_id) < 0 ||
+-      rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
+-    return -1;
+-  }
++  (void)request_id;
++  (void)result;
+   return 0;
+ }
+ 

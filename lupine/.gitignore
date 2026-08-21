@@ -1,0 +1,19 @@
+a.out
+venv/
+build/
+
+*.o
+*.so
+gdb.txt
+test/cuda-samples/cuda-samples/
+test/cuda-samples/results/
+
+CMakeFiles
+cmake_*
+CMakeCache.txt
+Makefile
+
+# Python bytecode cache (codegen.py imports codegen/ops.py)
+__pycache__/
+*.pyc
+build-sanitize-*/

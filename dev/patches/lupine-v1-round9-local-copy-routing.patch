@@ -1,0 +1,37 @@
+diff --git a/client.cpp b/client.cpp
+--- a/client.cpp
++++ b/client.cpp
+@@ -5242,8 +5242,15 @@ extern "C" CUresult cuMemcpyAtoH(void *dstHost, CUarray srcArray,
+ 
+ extern "C" CUresult cuMemcpyDtoHAsync_v2(void *dstHost, CUdeviceptr srcDevice,
+                                          size_t ByteCount, CUstream hStream) {
++  lupine_route route = lupine_route_for_deviceptr(srcDevice);
++  if (lupine_route_is_local(route)) {
++    using real_fn_t = CUresult (*)(void *, CUdeviceptr, size_t, CUstream);
++    auto real = lupine_real_cuda_fn<real_fn_t>("cuMemcpyDtoHAsync_v2");
++    return real == nullptr ? CUDA_ERROR_DEVICE_UNAVAILABLE
++                           : real(dstHost, srcDevice, ByteCount, hStream);
++  }
+   lupine_note_async_dtoh_copy();
+-  conn_t *conn = lupine_rpc_conn_for_deviceptr(srcDevice);
++  conn_t *conn = lupine_route_remote_conn(route);
+   if (conn == nullptr ||
+       rpc_write_start_request(conn, RPC_cuMemcpyDtoHAsync_v2) < 0 ||
+       rpc_write(conn, &dstHost, sizeof(dstHost)) < 0 ||
+@@ -5580,6 +5587,16 @@ extern "C" CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src,
+ 
+   conn_t *conn = lupine_rpc_conn_for_deviceptr(dst);
+   conn_t *src_conn = lupine_rpc_conn_for_deviceptr(src);
++  if (conn == nullptr && src_conn == nullptr) {
++    lupine_route dst_route = lupine_route_for_deviceptr(dst);
++    lupine_route src_route = lupine_route_for_deviceptr(src);
++    if (lupine_route_is_local(dst_route) && lupine_route_is_local(src_route)) {
++      using real_fn_t = CUresult (*)(CUdeviceptr, CUdeviceptr, size_t, CUstream);
++      auto real = lupine_real_cuda_fn<real_fn_t>("cuMemcpyAsync");
++      return real == nullptr ? CUDA_ERROR_DEVICE_UNAVAILABLE
++                             : real(dst, src, ByteCount, hStream);
++    }
++  }
+   if (conn != src_conn) {
+     return lupine_cuMemcpyDtoD_via_client(dst, src, ByteCount, hStream, true);
+   }

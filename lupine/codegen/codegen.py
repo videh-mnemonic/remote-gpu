@@ -1,0 +1,2064 @@
+from cxxheaderparser.simple import parse_file, ParsedData, ParserOptions
+from cxxheaderparser.preprocessor import make_gcc_preprocessor
+from cxxheaderparser.types import Type, Pointer, Parameter, Function, Array
+from typing import Optional, Union
+from dataclasses import dataclass
+import io
+import os
+import glob
+import zlib
+from ops import (
+    NullableOperation,
+    ArrayOperation,
+    InOutCountOperation,
+    OptionalArrayOperation,
+    DeepStructOperation,
+    NullTerminatedOperation,
+    OpaqueTypeOperation,
+    DereferenceOperation,
+    Operation,
+    OwnerAnnotation,
+    CrossServerCopyAnnotation,
+    DevicePtrTranslationAnnotation,
+    FunctionAnnotationMetadata,
+    RoutingFallbackAnnotation,
+    SynchronizeAnnotation,
+)
+
+# this table is manually generated from the cuda.h headers
+MANUAL_REMAPPINGS = [
+    ("cuDeviceTotalMem", "cuDeviceTotalMem_v2"),
+    ("cuDeviceGetUuid", "cuDeviceGetUuid_v2"),
+    ("cuDevicePrimaryCtxRelease", "cuDevicePrimaryCtxRelease_v2"),
+    ("cuDevicePrimaryCtxSetFlags", "cuDevicePrimaryCtxSetFlags_v2"),
+    ("cuDevicePrimaryCtxReset", "cuDevicePrimaryCtxReset_v2"),
+    ("cuCtxDestroy", "cuCtxDestroy_v2"),
+    ("cuCtxPopCurrent", "cuCtxPopCurrent_v2"),
+    ("cuCtxPushCurrent", "cuCtxPushCurrent_v2"),
+    ("cuModuleGetGlobal", "cuModuleGetGlobal_v2"),
+    ("cuMemAlloc", "cuMemAlloc_v2"),
+    ("cuMemAllocPitch", "cuMemAllocPitch_v2"),
+    ("cuMemcpyHtoD", "cuMemcpyHtoD_v2"),
+    ("cuMemcpyHtoDAsync", "cuMemcpyHtoDAsync_v2"),
+    ("cuMemcpyDtoH", "cuMemcpyDtoH_v2"),
+    ("cuMemcpyDtoHAsync", "cuMemcpyDtoHAsync_v2"),
+    ("cuMemcpyDtoD", "cuMemcpyDtoD_v2"),
+    ("cuMemcpyDtoDAsync", "cuMemcpyDtoDAsync_v2"),
+    ("cuMemsetD8", "cuMemsetD8_v2"),
+    ("cuMemsetD2D8", "cuMemsetD2D8_v2"),
+    ("cuMemsetD2D16", "cuMemsetD2D16_v2"),
+    ("cuMemsetD2D32", "cuMemsetD2D32_v2"),
+    ("cuIpcOpenMemHandle", "cuIpcOpenMemHandle_v2"),
+    ("cuStreamBeginCapture", "cuStreamBeginCapture_v2"),
+    ("cuGraphExecUpdate", "cuGraphExecUpdate_v2"),
+    ("cuMemcpy_ptds", "cuMemcpy"),
+    ("cuMemcpyAsync_ptsz", "cuMemcpyAsync"),
+    ("cuMemcpyPeer_ptds", "cuMemcpyPeer"),
+    ("cuMemcpyPeerAsync_ptsz", "cuMemcpyPeerAsync"),
+    ("cuMemcpy3DPeer_ptds", "cuMemcpy3DPeer"),
+    ("cuMemcpy3DPeerAsync_ptsz", "cuMemcpy3DPeerAsync"),
+    ("cuMemPrefetchAsync_ptsz", "cuMemPrefetchAsync"),
+    ("cuMemsetD8Async_ptsz", "cuMemsetD8Async"),
+    ("cuMemsetD16Async_ptsz", "cuMemsetD16Async"),
+    ("cuMemsetD32Async_ptsz", "cuMemsetD32Async"),
+    ("cuMemsetD2D8Async_ptsz", "cuMemsetD2D8Async"),
+    ("cuMemsetD2D16Async_ptsz", "cuMemsetD2D16Async"),
+    ("cuMemsetD2D32Async_ptsz", "cuMemsetD2D32Async"),
+    ("cuStreamGetPriority_ptsz", "cuStreamGetPriority"),
+    ("cuStreamGetId_ptsz", "cuStreamGetId"),
+    ("cuStreamGetFlags_ptsz", "cuStreamGetFlags"),
+    ("cuStreamGetCtx_ptsz", "cuStreamGetCtx"),
+    ("cuStreamWaitEvent_ptsz", "cuStreamWaitEvent"),
+    ("cuStreamEndCapture_ptsz", "cuStreamEndCapture"),
+    ("cuStreamIsCapturing_ptsz", "cuStreamIsCapturing"),
+    ("cuStreamUpdateCaptureDependencies_ptsz", "cuStreamUpdateCaptureDependencies"),
+    ("cuStreamAddCallback_ptsz", "cuStreamAddCallback"),
+    ("cuStreamAttachMemAsync_ptsz", "cuStreamAttachMemAsync"),
+    ("cuStreamQuery_ptsz", "cuStreamQuery"),
+    ("cuStreamSynchronize_ptsz", "cuStreamSynchronize"),
+    ("cuEventRecord_ptsz", "cuEventRecord"),
+    ("cuEventRecordWithFlags_ptsz", "cuEventRecordWithFlags"),
+    ("cuLaunchKernel_ptsz", "cuLaunchKernel"),
+    ("cuLaunchKernelEx_ptsz", "cuLaunchKernelEx"),
+    ("cuLaunchHostFunc_ptsz", "cuLaunchHostFunc"),
+    ("cuGraphicsMapResources_ptsz", "cuGraphicsMapResources"),
+    ("cuGraphicsUnmapResources_ptsz", "cuGraphicsUnmapResources"),
+    ("cuSignalExternalSemaphoresAsync_ptsz", "cuSignalExternalSemaphoresAsync"),
+    ("cuWaitExternalSemaphoresAsync_ptsz", "cuWaitExternalSemaphoresAsync"),
+    ("cuGraphInstantiateWithParams_ptsz", "cuGraphInstantiateWithParams"),
+    ("cuGraphUpload_ptsz", "cuGraphUpload"),
+    ("cuGraphLaunch_ptsz", "cuGraphLaunch"),
+    ("cuStreamCopyAttributes_ptsz", "cuStreamCopyAttributes"),
+    ("cuStreamGetAttribute_ptsz", "cuStreamGetAttribute"),
+    ("cuStreamSetAttribute_ptsz", "cuStreamSetAttribute"),
+    ("cuMemMapArrayAsync_ptsz", "cuMemMapArrayAsync"),
+    ("cuMemFreeAsync_ptsz", "cuMemFreeAsync"),
+    ("cuMemAllocAsync_ptsz", "cuMemAllocAsync"),
+    ("cuMemAllocFromPoolAsync_ptsz", "cuMemAllocFromPoolAsync"),
+]
+
+KERNEL_PARAM_LAYOUT_INVALIDATORS = {
+    "cuLibraryUnload",
+    "cuModuleUnload",
+}
+
+MANUAL_REMAPPING_GUARDS = {
+    "cuGraphExecUpdate": "CUDA_VERSION >= 12000",
+}
+
+NVML_RPC_FUNCTIONS = [
+    "nvmlInit_v2",
+    "nvmlInitWithFlags",
+    "nvmlShutdown",
+    "nvmlSystemGetDriverVersion",
+    "nvmlSystemGetNVMLVersion",
+    "nvmlSystemGetCudaDriverVersion",
+    "nvmlSystemGetCudaDriverVersion_v2",
+    "nvmlDeviceGetCount_v2",
+    "nvmlDeviceGetHandleByIndex_v2",
+    "nvmlDeviceGetHandleByUUID",
+    "nvmlDeviceGetHandleByPciBusId_v2",
+    "nvmlDeviceGetName",
+    "nvmlDeviceGetUUID",
+    "nvmlDeviceGetIndex",
+    "nvmlDeviceGetMinorNumber",
+    "nvmlDeviceGetPciInfo_v3",
+    "nvmlDeviceGetMemoryInfo",
+    "nvmlDeviceGetUtilizationRates",
+    "nvmlDeviceGetTemperature",
+    "nvmlDeviceGetPowerUsage",
+    "nvmlDeviceGetPowerManagementLimit",
+    "nvmlDeviceGetClockInfo",
+    "nvmlDeviceGetMaxClockInfo",
+    "nvmlDeviceGetPerformanceState",
+    "nvmlDeviceGetComputeMode",
+    "nvmlDeviceGetPersistenceMode",
+    "nvmlDeviceGetFanSpeed",
+    "nvmlDeviceGetBrand",
+    "nvmlDeviceGetVbiosVersion",
+    "nvmlDeviceGetSerial",
+    "nvmlDeviceGetBoardPartNumber",
+    "nvmlDeviceGetDisplayMode",
+    "nvmlDeviceGetDisplayActive",
+    "nvmlDeviceGetCurrPcieLinkGeneration",
+    "nvmlDeviceGetCurrPcieLinkWidth",
+    "nvmlDeviceGetMaxPcieLinkGeneration",
+    "nvmlDeviceGetMaxPcieLinkWidth",
+    "nvmlDeviceGetPcieThroughput",
+    "nvmlDeviceGetPcieReplayCounter",
+    "nvmlDeviceGetComputeRunningProcesses",
+    "nvmlDeviceGetComputeRunningProcesses_v2",
+    "nvmlDeviceGetGraphicsRunningProcesses",
+    "nvmlDeviceGetGraphicsRunningProcesses_v2",
+    "nvmlDeviceGetMPSComputeRunningProcesses",
+    "nvmlDeviceGetMPSComputeRunningProcesses_v2",
+    "nvmlEventSetCreate",
+    "nvmlEventSetFree",
+    "nvmlEventSetWait_v2",
+    "nvmlDeviceRegisterEvents",
+    "nvmlDeviceGetMaxMigDeviceCount",
+    "nvmlDeviceGetTotalEccErrors",
+    "nvmlDeviceGetDetailedEccErrors",
+    "nvmlDeviceGetMemoryErrorCounter",
+    "nvmlDeviceGetEccMode",
+    "nvmlDeviceGetTemperatureV",
+    "nvmlDeviceGetEnforcedPowerLimit",
+    "nvmlDeviceGetMemoryInfo_v2",
+    "nvmlDeviceGetMigMode",
+    "nvmlDeviceGetVirtualizationMode",
+    "nvmlDeviceIsMigDeviceHandle",
+    "nvmlDeviceGetNvLinkRemoteDeviceType",
+    "nvmlDeviceGetNvLinkRemotePciInfo_v2",
+]
+
+NVML_MANUAL_SERVER_FUNCTIONS = {
+    "nvmlDeviceGetComputeRunningProcesses",
+    "nvmlDeviceGetComputeRunningProcesses_v2",
+    "nvmlDeviceGetGraphicsRunningProcesses",
+    "nvmlDeviceGetGraphicsRunningProcesses_v2",
+    "nvmlDeviceGetMPSComputeRunningProcesses",
+    "nvmlDeviceGetMPSComputeRunningProcesses_v2",
+}
+
+PRIVATE_RPC_FUNCTIONS = [
+    "cuGetExportTableMetadata",
+    "cuGraphAddNode_v2",
+    "cuGraphConditionalHandleCreate",
+    "cuMemPrefetchAsync",
+    "cuPrivateGetModuleNode",
+    "cuStreamBeginCaptureToGraph",
+    "cuStreamGetCaptureInfo_v3",
+    "lupineDeviceSnapshot",
+    "lupineManagedHostFlush",
+    "lupineModuleGetFunctionWithLayout",
+]
+
+
+def rpc_id(name: str) -> int:
+    return zlib.crc32(name.encode("utf-8")) & 0x7FFFFFFF
+
+
+def annotated_rpc_names(annotations: ParsedData) -> list[str]:
+    names: set[str] = set()
+    for function in annotations.namespace.functions:
+        name = function.name.format()
+        if len(name) > 2 and name.startswith("cu") and name[2].isupper():
+            names.add(name)
+    return sorted(names)
+
+
+SKIP_FUNCTIONS = {
+    "cuStreamUpdateCaptureDependencies_v2",
+    "cuGraphGetEdges_v2",
+    "cuGraphNodeGetDependencies_v2",
+    "cuGraphNodeGetDependentNodes_v2",
+    "cuGraphAddDependencies_v2",
+    "cuGraphRemoveDependencies_v2",
+}
+
+
+
+def annotation_param(params: list[Parameter], name: str) -> Parameter:
+    try:
+        return next(p for p in params if p.name == name)
+    except StopIteration:
+        raise NotImplementedError(f"Parameter {name} not found")
+
+
+def infer_routing_key(
+    params: list[Parameter],
+) -> tuple[Optional[str], Optional[Parameter]]:
+    for param in params:
+        if isinstance(param.type, (Pointer, Array)):
+            continue
+        type_name = param.type.format().replace("const ", "").strip()
+        if type_name == "nvmlDevice_t":
+            return "NVML_DEVICE", param
+        if type_name == "CUdevice":
+            return "DEVICE", param
+        if type_name == "CUcontext":
+            return "CONTEXT", param
+        if type_name == "CUmodule":
+            return "MODULE", param
+        if type_name == "CUlibrary":
+            return "LIBRARY", param
+        if type_name == "CUfunction":
+            return "FUNCTION", param
+        if type_name == "CUstream":
+            return "STREAM", param
+        if type_name == "CUevent":
+            return "EVENT", param
+        if type_name == "CUmemoryPool":
+            return "MEMORY_POOL", param
+        if type_name == "CUgraph":
+            return "GRAPH", param
+        if type_name == "CUgraphNode":
+            return "GRAPH_NODE", param
+        if type_name == "CUgraphExec":
+            return "GRAPH_EXEC", param
+        if type_name == "CUdeviceptr":
+            return "DEVICEPTR", param
+    return None, None
+
+
+# Parses a function annotation into marshalling operations and metadata.
+def parse_annotation(
+    annotation: str, params: list[Parameter]
+) -> FunctionAnnotationMetadata:
+    operations: list[Operation] = []
+    metadata = FunctionAnnotationMetadata(operations=operations)
+    # @deeparray <param> <array_member> <count_member> entries, grouped by the
+    # struct-pointer param they describe (see DeepStructOperation).
+    deep_arrays: dict[str, list[tuple[str, str]]] = {}
+
+    if not annotation:
+        metadata.routing_kind, metadata.routing_parameter = infer_routing_key(params)
+        return metadata
+    for line in annotation.split("\n"):
+        # Disabled annotations can apply to client generation, server
+        # generation, or both. Bare @disabled keeps the historical behavior
+        # by setting both scoped flags.
+        if "@disabled" in line or "@DISABLED" in line:
+            disabled_parts = line.lower().lstrip(" *").split()
+            scope = disabled_parts[1] if len(disabled_parts) > 1 else "both"
+            if scope == "client":
+                metadata.disabled_client = True
+                continue
+            elif scope == "server":
+                metadata.disabled_server = True
+                continue
+            else:
+                metadata.disabled_client = True
+                metadata.disabled_server = True
+                return metadata
+        if line.startswith("/**"):
+            continue
+        if line.startswith("*/"):
+            continue
+        if line.startswith("*"):
+            line = line[2:]
+        if line.strip().startswith("@async"):
+            metadata.async_fire_forget = True
+            continue
+        if line.strip().startswith("@synchronize"):
+            parts = line.split()
+            options = set(parts[1:])
+            unknown = options - {"DEFERRED_DTOH", "STDOUT"}
+            if unknown:
+                raise NotImplementedError(
+                    "Unknown @synchronize option(s): " + ", ".join(sorted(unknown))
+                )
+            metadata.synchronize = SynchronizeAnnotation(
+                deferred_dtoh="DEFERRED_DTOH" in options,
+                stdout="STDOUT" in options,
+            )
+            continue
+        if line.startswith("@routingkey"):
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            metadata.routing_kind = parts[1].upper()
+            if len(parts) >= 3:
+                metadata.routing_parameter = annotation_param(params, parts[2])
+            continue
+        if line.startswith("@routingfallback"):
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            metadata.routing_fallback = RoutingFallbackAnnotation(
+                kind=parts[1].upper(),
+                parameter=annotation_param(params, parts[2]),
+            )
+            continue
+        if line.startswith("@recordowner"):
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            param = annotation_param(params, parts[2])
+            metadata.record_owners.append(OwnerAnnotation(parts[1].upper(), param))
+            continue
+        if line.startswith("@crossservercopy"):
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            stream_arg = next(
+                (arg for arg in parts[4:] if arg.startswith("STREAM:")), None
+            )
+            metadata.cross_server_copy = CrossServerCopyAnnotation(
+                dst=annotation_param(params, parts[1]),
+                src=annotation_param(params, parts[2]),
+                bytes=annotation_param(params, parts[3]),
+                stream=(
+                    annotation_param(params, stream_arg.split(":", 1)[1])
+                    if stream_arg is not None
+                    else None
+                ),
+                async_="ASYNC" in parts[4:],
+            )
+            continue
+        if line.startswith("@deeparray"):
+            # @deeparray <param> <array_member> <count_member>
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            deep_arrays.setdefault(parts[1], []).append((parts[2], parts[3]))
+            continue
+        if line.startswith("@param"):
+            parts = line.split()
+
+            if len(parts) < 3:
+                continue
+            param = annotation_param(params, parts[1])
+            args = parts[3:]
+            send = parts[2] == "SEND_ONLY" or parts[2] == "SEND_RECV"
+            recv = parts[2] == "RECV_ONLY" or parts[2] == "SEND_RECV"
+
+            if "TRANSLATE_DEVICEPTR" in args:
+                metadata.translate_deviceptrs.append(
+                    DevicePtrTranslationAnnotation(parameter=param)
+                )
+            # if there's a length or size arg, use the type, otherwise use the ptr_to type
+            length_arg = next((arg for arg in args if arg.startswith("LENGTH:")), None)
+
+            if isinstance(param.type, Pointer):
+                if param.type.ptr_to.const:
+                    recv = False
+
+                size_arg = next((arg for arg in args if arg.startswith("SIZE:")), None)
+                iter_arg = next((arg for arg in args if arg.startswith("ITER:")), None)
+                null_terminated = "NULL_TERMINATED" in args
+                nullable = "NULLABLE" in args
+                deref = "DEREF" in args
+
+                # validate that only one of the arguments is present
+                if (
+                    sum([bool(length_arg), bool(size_arg), null_terminated, nullable])
+                    > 1
+                ):
+                    raise NotImplementedError(
+                        "Only one of LENGTH, SIZE, NULL_TERMINATED, or NULLABLE can be specified"
+                    )
+
+                if deref:
+                    operations.append(
+                        DereferenceOperation(
+                            send=send,
+                            recv=recv,
+                            parameter=param,
+                            type_=param.type,
+                        )
+                    )
+                elif length_arg:
+                    # if it has a length, it's an array operation with variable length
+                    length_param = next(
+                        p for p in params if p.name == length_arg.split(":")[1]
+                    )
+                    if "OPTIONAL" in args:
+                        # optional out-array sized by an in/out count param (the
+                        # cuGraphGetNodes query pattern); linked to its count in
+                        # the post-pass below.
+                        operations.append(
+                            OptionalArrayOperation(
+                                parameter=param,
+                                ptr=param.type,
+                                count=length_param,
+                            )
+                        )
+                    else:
+                        operations.append(
+                            ArrayOperation(
+                                send=send,
+                                recv=recv,
+                                parameter=param,
+                                ptr=param.type,
+                                length=length_param,
+                                iter=False,
+                                compressible="COMPRESSIBLE" in args,
+                            )
+                        )
+                elif size_arg:
+                    # if it has a size, it's an array operation with constant length
+                    operations.append(
+                        ArrayOperation(
+                            send=send,
+                            recv=recv,
+                            parameter=param,
+                            ptr=param.type,
+                            length=int(size_arg.split(":")[1]),
+                            iter=False
+                        )
+                    )
+                elif iter_arg:
+                    print(f"ITER FOUND!! {param}")
+                    length_param = next(
+                        p for p in params if p.name == iter_arg.split(":")[1]
+                    )
+                    operations.append(
+                        ArrayOperation(
+                            send=send,
+                            recv=recv,
+                            parameter=param,
+                            ptr=param.type,
+                            length=length_param,
+                            iter=True
+                        )
+                    )
+                elif null_terminated:
+                    if recv:
+                        raise NotImplementedError(
+                            "NULL_TERMINATED parameters cannot be received; use LENGTH or SIZE for output buffers"
+                        )
+                    # if it's null terminated, it's a null terminated operation
+                    operations.append(
+                        NullTerminatedOperation(
+                            send=send,
+                            recv=recv,
+                            parameter=param,
+                            ptr=param.type,
+                        )
+                    )
+                elif nullable:
+                    # if it's nullable, it's a nullable operation
+                    operations.append(
+                        NullableOperation(
+                            send=send,
+                            recv=recv,
+                            parameter=param,
+                            ptr=param.type,
+                        )
+                    )
+                else:
+                    # otherwise, it's a pointer to a single value or another pointer
+                    if recv:
+                        if param.type.ptr_to.format() == "void":
+                            raise NotImplementedError(
+                                "Cannot dereference a void pointer"
+                            )
+                        # this is an out parameter so use the base type as the server declaration
+                        operations.append(
+                            DereferenceOperation(
+                                send=send,
+                                recv=recv,
+                                parameter=param,
+                                type_=param.type,
+                            )
+                        )
+                    else:
+                        # otherwise, treat it as an opaque type
+                        operations.append(
+                            OpaqueTypeOperation(
+                                send=send,
+                                recv=recv,
+                                parameter=param,
+                                type_=param.type,
+                            )
+                        )
+            elif isinstance(param.type, Type):
+                if param.type.const:
+                    recv = False
+                operations.append(
+                    OpaqueTypeOperation(
+                        send=send,
+                        recv=recv,
+                        parameter=param,
+                        type_=param.type,
+                    )
+                )
+            elif isinstance(param.type, Array):
+                length_param = next(
+                    p for p in params if p.name == length_arg.split(":")[1]
+                )
+                if param.type.const:
+                    recv = False
+                operations.append(
+                    ArrayOperation(
+                        send=send,
+                        recv=recv,
+                        parameter=param,
+                        ptr=param.type,
+                        length=length_param,
+                    )
+                )
+            elif size_arg:
+                # if it has a size, it's an array operation with constant length
+                operations.append(
+                    ArrayOperation(
+                        send=send,
+                        recv=recv,
+                        parameter=param,
+                        ptr=param.type,
+                        length=int(size_arg.split(":")[1]),
+                    )
+                )
+            elif null_terminated:
+                # if it's null terminated, it's a null terminated operation
+                operations.append(
+                    NullTerminatedOperation(
+                        send=send,
+                        recv=recv,
+                        parameter=param,
+                        ptr=param.type,
+                    )
+                )
+            elif nullable:
+                # if it's nullable, it's a nullable operation
+                operations.append(
+                    NullableOperation(
+                        send=send,
+                        recv=recv,
+                        parameter=param,
+                        ptr=param.type,
+                    )
+                )
+            else:
+                # otherwise, it's a pointer to a single value or another pointer
+                if recv:
+                    if param.type.ptr_to.format() == "void":
+                        raise NotImplementedError("Cannot dereference a void pointer")
+                    # this is an out parameter so use the base type as the server declaration
+                    operations.append(
+                        DereferenceOperation(
+                            send=send,
+                            recv=recv,
+                            parameter=param,
+                            type_=param.type,
+                        )
+                    )
+                else:
+                    # otherwise, treat it as an opaque type
+                    operations.append(
+                        OpaqueTypeOperation(
+                            send=send,
+                            recv=recv,
+                            parameter=param,
+                            type_=param.type,
+                        )
+                    )
+        elif isinstance(param.type, Type):
+            if param.type.const:
+                recv = False
+            operations.append(
+                OpaqueTypeOperation(
+                    send=send,
+                    recv=recv,
+                    parameter=param,
+                    type_=param.type,
+                )
+            )
+        elif isinstance(param.type, Array):
+            length_param = next(p for p in params if p.name == length_arg.split(":")[1])
+            if param.type.array_of.const:
+                recv = False
+            operations.append(
+                ArrayOperation(
+                    send=send,
+                    recv=recv,
+                    parameter=param,
+                    ptr=param.type,
+                    length=length_param,
+                )
+            )
+        else:
+            raise NotImplementedError("Unknown type")
+    # Promote the count param of any optional out-array to an
+    # InOutCountOperation. Several arrays may share one count (cuGraphGetEdges);
+    # the first one is the anchor whose presence the client uses to decide
+    # between a count-only query and a fill.
+    optional_ops = [op for op in operations if isinstance(op, OptionalArrayOperation)]
+    if optional_ops:
+        anchors: dict[str, str] = {}
+        for op in optional_ops:
+            anchors.setdefault(op.count.name, op.parameter.name)
+        for count_name, anchor in anchors.items():
+            for i, op in enumerate(operations):
+                if op.parameter.name == count_name and isinstance(
+                    op, DereferenceOperation
+                ):
+                    operations[i] = InOutCountOperation(
+                        send=True,
+                        recv=True,
+                        parameter=op.parameter,
+                        anchor=anchor,
+                    )
+                    break
+    # Promote any param with @deeparray entries to a DeepStructOperation,
+    # inheriting the send/recv direction from its @param line.
+    for pname, members in deep_arrays.items():
+        for i, op in enumerate(operations):
+            if op.parameter.name == pname:
+                operations[i] = DeepStructOperation(
+                    send=getattr(op, "send", True),
+                    recv=getattr(op, "recv", False),
+                    parameter=op.parameter,
+                    ptr=op.parameter.type,
+                    members=members,
+                )
+                break
+    # An array is sized from another parameter, so that parameter has to be on
+    # the wire before the array. Parameter order does not guarantee it, and the
+    # server would otherwise size its buffer from an unread variable. Move each
+    # length source ahead of the first array that depends on it; both sides walk
+    # this same list, so they stay symmetric.
+    for i, op in enumerate(operations):
+        length = getattr(op, "length", None)
+        if not isinstance(length, Parameter):
+            continue
+        source = next(
+            (j for j, other in enumerate(operations)
+             if other.parameter.name == length.name),
+            None,
+        )
+        if source is not None and source > i:
+            operations.insert(i, operations.pop(source))
+
+    if metadata.routing_kind is None:
+        metadata.routing_kind, metadata.routing_parameter = infer_routing_key(params)
+    return metadata
+
+
+def client_translated_deviceptr_names(
+    metadata: FunctionAnnotationMetadata,
+) -> set[str]:
+    return {translation.parameter.name for translation in metadata.translate_deviceptrs}
+
+
+def client_param_expr(metadata: FunctionAnnotationMetadata, param: Parameter) -> str:
+    if param.name in client_translated_deviceptr_names(metadata):
+        return f"{param.name}_rpc"
+    return param.name
+
+
+def client_routing_key_expr(
+    kind: Optional[str], param: Optional[Parameter], metadata: FunctionAnnotationMetadata
+) -> str:
+    if kind is None:
+        return "lupine_route_for_default()"
+    if kind == "CURRENT_CONTEXT":
+        return "lupine_route_for_current_context()"
+    if param is None:
+        raise NotImplementedError(f"Routing key {kind} requires a parameter")
+    name = client_param_expr(metadata, param)
+    if kind == "DEVICE":
+        return f"lupine_route_for_device(&{name})"
+    if kind == "CONTEXT":
+        return f"lupine_route_for_context({name})"
+    if kind == "MODULE":
+        return f"lupine_route_for_module({name})"
+    if kind == "LIBRARY":
+        return f"lupine_route_for_library({name})"
+    if kind == "FUNCTION":
+        return f"lupine_route_for_function({name})"
+    if kind == "STREAM":
+        if metadata.routing_fallback is not None:
+            fallback = client_routing_key_expr(
+                metadata.routing_fallback.kind,
+                metadata.routing_fallback.parameter,
+                metadata,
+            )
+            return f"({name} != nullptr ? lupine_route_for_stream({name}) : {fallback})"
+        return f"({name} != nullptr ? lupine_route_for_stream({name}) : lupine_route_for_default())"
+    if kind == "EVENT":
+        return f"lupine_route_for_event({name})"
+    if kind == "MEMORY_POOL":
+        return f"lupine_route_for_memory_pool({name})"
+    if kind == "GRAPH":
+        return f"lupine_route_for_graph({name})"
+    if kind == "GRAPH_NODE":
+        return f"lupine_route_for_graph_node({name})"
+    if kind == "GRAPH_EXEC":
+        return f"lupine_route_for_graph_exec({name})"
+    if kind == "DEVICEPTR":
+        return f"lupine_route_for_deviceptr({name})"
+    raise NotImplementedError(f"Unknown routing key kind: {kind}")
+
+
+def client_routing_route_expr(metadata: FunctionAnnotationMetadata) -> str:
+    return client_routing_key_expr(
+        metadata.routing_kind, metadata.routing_parameter, metadata
+    )
+
+
+def client_call_args(function: Function, metadata: FunctionAnnotationMetadata) -> list[str]:
+    return [
+        client_param_expr(metadata, param)
+        for param in function.parameters
+        if param.name
+    ]
+
+
+def write_client_rpc_write(
+    f,
+    operation: Operation,
+    metadata: FunctionAnnotationMetadata,
+    function: Optional[Function] = None,
+):
+    function_name = function.name.format() if function is not None else ""
+    parameter_name = operation.parameter.name
+    vmm_override = {
+        ("cuMemCreate", "prop"): (
+            "        rpc_write(conn, &remote_prop, sizeof(remote_prop)) < 0 ||\n"
+        ),
+        ("cuMemSetAccess", "desc"): (
+            "        (count * sizeof(const CUmemAccessDesc) != 0 && "
+            "rpc_write(conn, remote_desc.data(), count * sizeof(const CUmemAccessDesc)) < 0) ||\n"
+        ),
+        ("cuMemGetAccess", "location"): (
+            "        rpc_write(conn, &remote_location, sizeof(remote_location)) < 0 ||\n"
+        ),
+        ("cuMemGetAllocationGranularity", "prop"): (
+            "        rpc_write(conn, &remote_prop, sizeof(remote_prop)) < 0 ||\n"
+        ),
+        ("cuMemAddressReserve", "addr"): (
+            "        rpc_write(conn, &remote_addr_hint, sizeof(remote_addr_hint)) < 0 ||\n"
+        ),
+    }.get((function_name, parameter_name))
+    if vmm_override is not None:
+        f.write(vmm_override)
+        return
+    if (
+        isinstance(operation, OpaqueTypeOperation)
+        and operation.send
+        and operation.parameter.name in client_translated_deviceptr_names(metadata)
+    ):
+        f.write(
+            "        rpc_write(conn, &{param_name}_rpc, sizeof({param_type})) < 0 ||\n".format(
+                param_name=operation.parameter.name,
+                param_type=operation.type_.format(),
+            )
+        )
+        return
+    operation.client_rpc_write(f)
+
+
+def write_client_vmm_location_translation(f, function: Function):
+    """Translate virtual CUDA ordinals embedded in VMM descriptor structs."""
+    name = function.name.format()
+    if name == "cuMemAddressReserve":
+        f.write("    CUdeviceptr remote_addr_hint = addr;\n")
+        f.write("    if (remote_addr_hint == 0) {\n")
+        f.write("        const uint64_t route_number = static_cast<uint64_t>(lupine_route_identity(route) + 1);\n")
+        f.write("        remote_addr_hint = static_cast<CUdeviceptr>(route_number << 48);\n")
+        f.write("    }\n")
+    elif name in {"cuMemCreate", "cuMemGetAllocationGranularity"}:
+        f.write("    if (conn == nullptr) return CUDA_ERROR_DEVICE_UNAVAILABLE;\n")
+        f.write("    if (prop == nullptr) return CUDA_ERROR_INVALID_VALUE;\n")
+        f.write("    CUmemAllocationProp remote_prop = *prop;\n")
+        f.write("    if (remote_prop.location.type == CU_MEM_LOCATION_TYPE_DEVICE) {\n")
+        f.write("        CUdevice remote_device = static_cast<CUdevice>(remote_prop.location.id);\n")
+        f.write("        if (!lupine_translate_device_for_conn(conn, &remote_device)) return CUDA_ERROR_INVALID_DEVICE;\n")
+        f.write("        remote_prop.location.id = static_cast<int>(remote_device);\n")
+        f.write("    }\n")
+    elif name == "cuMemSetAccess":
+        f.write("    if (conn == nullptr) return CUDA_ERROR_DEVICE_UNAVAILABLE;\n")
+        f.write("    std::vector<CUmemAccessDesc> remote_desc;\n")
+        f.write("    if (count != 0 && desc != nullptr) {\n")
+        f.write("        remote_desc.assign(desc, desc + count);\n")
+        f.write("        for (CUmemAccessDesc &entry : remote_desc) {\n")
+        f.write("            if (entry.location.type != CU_MEM_LOCATION_TYPE_DEVICE) continue;\n")
+        f.write("            CUdevice remote_device = static_cast<CUdevice>(entry.location.id);\n")
+        f.write("            if (!lupine_translate_device_for_conn(conn, &remote_device)) return CUDA_ERROR_INVALID_DEVICE;\n")
+        f.write("            entry.location.id = static_cast<int>(remote_device);\n")
+        f.write("        }\n")
+        f.write("    }\n")
+    elif name == "cuMemGetAccess":
+        f.write("    if (conn == nullptr) return CUDA_ERROR_DEVICE_UNAVAILABLE;\n")
+        f.write("    if (location == nullptr) return CUDA_ERROR_INVALID_VALUE;\n")
+        f.write("    CUmemLocation remote_location = *location;\n")
+        f.write("    if (remote_location.type == CU_MEM_LOCATION_TYPE_DEVICE) {\n")
+        f.write("        CUdevice remote_device = static_cast<CUdevice>(remote_location.id);\n")
+        f.write("        if (!lupine_translate_device_for_conn(conn, &remote_device)) return CUDA_ERROR_INVALID_DEVICE;\n")
+        f.write("        remote_location.id = static_cast<int>(remote_device);\n")
+        f.write("    }\n")
+
+
+def client_record_owner_stmt(owner: OwnerAnnotation) -> str:
+    kind = owner.kind
+    name = owner.parameter.name
+    value = f"*{name}" if isinstance(owner.parameter.type, Pointer) else name
+    null_guard = f" && {name} != nullptr" if isinstance(owner.parameter.type, Pointer) else ""
+    if kind == "CONTEXT":
+        fn = "lupine_note_context_owner"
+    elif kind == "MODULE":
+        fn = "lupine_note_module_owner"
+    elif kind == "LIBRARY":
+        fn = "lupine_note_library_owner"
+    elif kind == "FUNCTION":
+        fn = "lupine_note_function_owner"
+    elif kind == "STREAM":
+        fn = "lupine_note_stream_owner"
+    elif kind == "EVENT":
+        fn = "lupine_note_event_owner"
+    elif kind == "MEMORY_POOL":
+        fn = "lupine_note_memory_pool_owner"
+    elif kind == "GRAPH":
+        fn = "lupine_note_graph_owner"
+    elif kind == "GRAPH_NODE":
+        fn = "lupine_note_graph_node_owner"
+    elif kind == "GRAPH_EXEC":
+        fn = "lupine_note_graph_exec_owner"
+    elif kind == "DEVICEPTR":
+        fn = "lupine_note_deviceptr_owner"
+    else:
+        raise NotImplementedError(f"Unknown owner kind: {kind}")
+    return (
+        f"    if (return_value == CUDA_SUCCESS{null_guard}) {{\n"
+        f"        {fn}_route({value}, route);\n"
+        "    }\n"
+    )
+
+
+def write_client_post_call(f, function: Function, metadata: FunctionAnnotationMetadata):
+    if function.name.format() == "cuDriverGetVersion":
+        f.write("    if (driverVersion != nullptr) {\n")
+        f.write("        const char *override_version = getenv(\"LUPINE_DRIVER_VERSION_OVERRIDE\");\n")
+        f.write("        if (override_version != nullptr) *driverVersion = atoi(override_version);\n")
+        f.write("    }\n")
+
+    for owner in metadata.record_owners:
+        f.write(client_record_owner_stmt(owner))
+
+    if function.name.format() == "cuMemAlloc_v2":
+        f.write("    if (return_value == CUDA_SUCCESS && dptr != nullptr) lupine_note_deviceptr_allocation_route(*dptr, bytesize, route);\n")
+    if function.name.format() == "cuMemAllocPitch_v2":
+        f.write("    if (return_value == CUDA_SUCCESS && dptr != nullptr) {\n")
+        f.write("        size_t allocation_size = 0;\n")
+        f.write("        if (pPitch != nullptr) allocation_size = (*pPitch) * Height;\n")
+        f.write("        else allocation_size = WidthInBytes * Height;\n")
+        f.write("        lupine_note_deviceptr_allocation_route(*dptr, allocation_size, route);\n")
+        f.write("    }\n")
+    if function.name.format() == "cuMemAddressReserve":
+        f.write("    if (return_value == CUDA_SUCCESS && ptr != nullptr) lupine_note_deviceptr_allocation_route(*ptr, size, route);\n")
+    if function.name.format() == "cuMemAddressFree":
+        f.write("    if (return_value == CUDA_SUCCESS) lupine_forget_deviceptr_owner(ptr);\n")
+    if function.name.format() in {"cuMemAllocAsync", "cuMemAllocFromPoolAsync"}:
+        f.write("    if (return_value == CUDA_SUCCESS && dptr != nullptr) lupine_note_deviceptr_allocation_route(*dptr, bytesize, route);\n")
+    if function.name.format() == "cuMemFreeAsync":
+        f.write("    if (return_value == CUDA_SUCCESS) lupine_forget_deviceptr_owner(dptr);\n")
+        f.write("    if (return_value == CUDA_SUCCESS) lupine_invalidate_pointer_attribute_cache();\n")
+    if function.name.format() == "cuStreamDestroy_v2":
+        f.write("    if (return_value == CUDA_SUCCESS) lupine_forget_stream_owner(hStream);\n")
+    if function.name.format() == "cuEventDestroy_v2":
+        f.write("    if (return_value == CUDA_SUCCESS) {\n")
+        f.write("        lupine_note_event_destroyed(hEvent);\n")
+        f.write("        lupine_forget_event_owner(hEvent);\n")
+        f.write("    }\n")
+    # Record the global's size so offset pointers into it route by range.
+    if function.name.format() in {"cuModuleGetGlobal_v2", "cuLibraryGetGlobal", "cuLibraryGetManaged"}:
+        f.write("    if (return_value == CUDA_SUCCESS && dptr != nullptr && bytes != nullptr) lupine_note_deviceptr_allocation_route(*dptr, *bytes, route);\n")
+    if metadata.synchronize:
+        f.write("    if (return_value == CUDA_SUCCESS) return_value = lupine_sync_mapped_device_to_host();\n")
+
+    if function.name.format() == "cuCtxDestroy_v2":
+        f.write("    if (return_value == CUDA_SUCCESS) lupine_forget_destroyed_context(ctx);\n")
+    if function.name.format() == "cuCtxGetLimit":
+        f.write("    if (return_value == CUDA_SUCCESS && pvalue != nullptr) lupine_ctx_limit_cache_store(lupine_route_identity(route), lupine_ctx_limit_context, limit, *pvalue);\n")
+    if function.name.format() == "cuCtxSetLimit":
+        f.write("    if (return_value == CUDA_SUCCESS) lupine_invalidate_ctx_limit_cache();\n")
+    if function.name.format() in {
+        "cuCtxDestroy_v2",
+        "cuCtxDetach",
+        "cuDevicePrimaryCtxRelease_v2",
+        "cuDevicePrimaryCtxReset_v2",
+    }:
+        f.write("    if (return_value == CUDA_SUCCESS) lupine_invalidate_current_context_cache();\n")
+        f.write("    if (return_value == CUDA_SUCCESS) lupine_invalidate_ctx_limit_cache();\n")
+    if function.name.format() in {
+        "cuCtxDestroy_v2",
+        "cuMemAddressFree",
+        "cuMemMap",
+        "cuMemUnmap",
+        "cuMemSetAccess",
+    }:
+        f.write("    if (return_value == CUDA_SUCCESS) lupine_invalidate_pointer_attribute_cache();\n")
+    if function.name.format() in KERNEL_PARAM_LAYOUT_INVALIDATORS:
+        f.write("    if (return_value == CUDA_SUCCESS) lupine_invalidate_function_caches();\n")
+    if function.name.format() == "cuKernelSetAttribute":
+        f.write("    if (return_value == CUDA_SUCCESS) lupine_kernel_attribute_cache_store(lupine_route_identity(route), kernel, (int)attrib, (int)dev, val);\n")
+    if function.name.format() == "cuFuncGetAttribute":
+        f.write("    if (return_value == CUDA_SUCCESS) lupine_function_attribute_cache_insert(lupine_route_identity(route), hfunc_rpc, attrib, *pi);\n")
+    if function.name.format() == "cuFuncSetAttribute":
+        f.write("    if (return_value == CUDA_SUCCESS) lupine_invalidate_kernel_attribute_cache();\n")
+    if function.name.format() == "cuModuleGetFunction":
+        f.write("    if (return_value == CUDA_SUCCESS && hfunc != nullptr) return_value = lupine_record_module_function(*hfunc, hmod, name, route);\n")
+    if function.name.format() == "cuLibraryGetKernel":
+        f.write("    if (return_value == CUDA_SUCCESS && pKernel != nullptr) return_value = lupine_record_library_kernel(*pKernel, library, name, route);\n")
+
+
+def error_const(return_type: str) -> str:
+    if return_type == "nvmlReturn_t":
+        return "NVML_ERROR_GPU_IS_LOST"
+    if return_type == "CUresult":
+        return "CUDA_ERROR_DEVICE_UNAVAILABLE"
+    if return_type == "cudaError_t":
+        return "cudaErrorDevicesUnavailable"
+    if return_type == "cublasStatus_t":
+        return "CUBLAS_STATUS_NOT_INITIALIZED"
+    if return_type == "cudnnStatus_t":
+        return "CUDNN_STATUS_NOT_INITIALIZED"
+    if return_type == "size_t":
+        return "size_t"
+    if return_type == "const char*":
+        return "const char*"
+    if return_type == "void":
+        return "void"
+    if return_type == "struct cudaChannelFormatDesc":
+        return "struct cudaChannelFormatDesc"
+    raise NotImplementedError("Unknown return type: %s" % return_type)
+
+
+def invalid_device_const(return_type: str) -> str:
+    if return_type == "CUresult":
+        return "CUDA_ERROR_INVALID_DEVICE"
+    if return_type == "cudaError_t":
+        return "cudaErrorInvalidDevice"
+    raise NotImplementedError(
+        "No invalid-device error for return type: %s" % return_type
+    )
+
+
+def invalid_argument_const(return_type: str) -> str:
+    if return_type == "nvmlReturn_t":
+        return "NVML_ERROR_INVALID_ARGUMENT"
+    if return_type == "CUresult":
+        return "CUDA_ERROR_INVALID_VALUE"
+    if return_type == "cudaError_t":
+        return "cudaErrorInvalidValue"
+    if return_type == "cublasStatus_t":
+        return "CUBLAS_STATUS_INVALID_VALUE"
+    if return_type == "cudnnStatus_t":
+        return "CUDNN_STATUS_BAD_PARAM"
+    return error_const(return_type)
+
+
+def prefix_std(type: str) -> str:
+    # if type in ["size_t", "std::size_t"]:
+    #     return "std::size_t"
+    return type
+
+
+def format_function_params(function: Function) -> list[str]:
+    params = []
+    for param in function.parameters:
+        if param.name and "[]" in param.type.format():
+            params.append(
+                "{type} {name}".format(
+                    type=param.type.format().replace("[]", ""),
+                    name=param.name + "[]",
+                )
+            )
+        elif param.name:
+            params.append(
+                "{type} {name}".format(
+                    type=param.type.format(),
+                    name=param.name,
+                )
+            )
+        else:
+            params.append(param.type.format())
+    return params
+
+
+def format_call_args(function: Function) -> list[str]:
+    return [param.name for param in function.parameters if param.name]
+
+
+def server_call_name(function_name: str) -> str:
+    if function_name == "cuEventElapsedTime_v2":
+        return "cuEventElapsedTime"
+    return function_name
+
+
+def collect_nvml_functions(annotations: ParsedData):
+    by_name = {
+        function.name.format(): function
+        for function in annotations.namespace.functions
+    }
+    result = []
+    for name in NVML_RPC_FUNCTIONS:
+        if name in NVML_MANUAL_SERVER_FUNCTIONS:
+            continue
+        function = by_name.get(name)
+        if function is None:
+            raise RuntimeError(f"NVML annotation for {name} not found")
+        metadata = parse_annotation(function.doxygen, function.parameters)
+        for operation in metadata.operations:
+            if isinstance(operation, NullTerminatedOperation):
+                # Preserve the existing NVML wire format. CUDA RPC strings use
+                # size_t lengths, while the NVML protocol historically used
+                # unsigned int lengths.
+                operation.length_type = "unsigned int"
+        result.append((function, function, metadata.operations, metadata))
+    return result
+
+
+def write_nvml_client_validation(f, operations):
+    checks = []
+    for operation in operations:
+        name = operation.parameter.name
+        if isinstance(operation, NullTerminatedOperation) and operation.send:
+            checks.append(f"{name} == nullptr")
+        elif isinstance(operation, DereferenceOperation):
+            checks.append(f"{name} == nullptr")
+        elif isinstance(operation, ArrayOperation):
+            checks.append(
+                f"({operation.transfer_size_expr()} != 0 && {name} == nullptr)"
+            )
+    if checks:
+        f.write("  if (" + " ||\n      ".join(checks) + ") {\n")
+        f.write("    return NVML_ERROR_INVALID_ARGUMENT;\n")
+        f.write("  }\n")
+
+
+def write_nvml_client_rpc(f, function, operations):
+    name = function.name.format()
+    params = ", ".join(format_function_params(function))
+    f.write(f"static nvmlReturn_t lupine_rpc_{name}(conn_t *conn")
+    if params:
+        f.write(f", {params}")
+    f.write(") {\n")
+    f.write("  nvmlReturn_t return_value = rpc_error();\n")
+    for operation in operations:
+        if isinstance(operation, NullTerminatedOperation):
+            f.write(
+                "  {length_type} {name}_len = static_cast<{length_type}>("
+                "std::strlen({name}) + 1);\n".format(
+                    length_type=operation.length_type,
+                    name=operation.parameter.name,
+                )
+            )
+        elif isinstance(operation, NullableOperation) and operation.recv:
+            f.write(
+                "  {type_} {name}_null_check = nullptr;\n".format(
+                    type_=operation.ptr.format(), name=operation.parameter.name
+                )
+            )
+
+    f.write("  if (conn == nullptr ||\n")
+    f.write(f"      rpc_write_start_request(conn, RPC_{name}) < 0 ||\n")
+    for operation in operations:
+        operation.client_rpc_write(f)
+    f.write("      rpc_wait_for_response(conn) < 0 ||\n")
+    for operation in operations:
+        operation.client_rpc_read(f)
+    f.write("      rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||\n")
+    f.write("      rpc_read_end(conn) < 0) {\n")
+    f.write("    return rpc_error();\n")
+    f.write("  }\n")
+    f.write("  return return_value;\n")
+    f.write("}\n\n")
+
+
+def write_nvml_client_wrapper(f, function, operations, metadata):
+    if metadata.disabled_client:
+        return
+
+    name = function.name.format()
+    params = ", ".join(format_function_params(function))
+    f.write(f'extern "C" nvmlReturn_t {name}({params}) {{\n')
+    write_nvml_client_validation(f, operations)
+
+    call_args = format_call_args(function)
+    param_types = ", ".join(
+        parameter.type.format() for parameter in function.parameters
+    )
+    if metadata.routing_kind == "ALL":
+        owners = [
+            owner
+            for owner in metadata.record_owners
+            if owner.kind == "NVML_DEVICE"
+        ]
+        if len(owners) != 1 or not isinstance(owners[0].parameter.type, Pointer):
+            raise RuntimeError(
+                f"{name}: ALL-routed NVML lookup requires one NVML_DEVICE output"
+            )
+        output_name = owners[0].parameter.name
+        if name == "nvmlDeviceGetHandleByPciBusId_v2":
+            f.write("  const char *lupine_pci_separator = std::strchr(pciBusId, ':');\n")
+            f.write("  if (lupine_pci_separator != nullptr) {\n")
+            f.write("    char *lupine_domain_end = nullptr;\n")
+            f.write("    unsigned long lupine_domain = std::strtoul(pciBusId, &lupine_domain_end, 16);\n")
+            f.write("    if (lupine_domain_end == lupine_pci_separator && lupine_domain >= 0x1000UL) {\n")
+            f.write("      nvmlReturn_t lupine_devices_result = ensure_devices();\n")
+            f.write("      if (lupine_devices_result != NVML_SUCCESS) return lupine_devices_result;\n")
+            f.write("      const unsigned int lupine_target_connection = static_cast<unsigned int>(lupine_domain - 0x1000UL);\n")
+            f.write("      for (auto &lupine_candidate : devices) {\n")
+            f.write("        if (lupine_candidate.local || lupine_candidate.conn_index != lupine_target_connection) continue;\n")
+            f.write("        nvmlDevice_t lupine_virtual_device = reinterpret_cast<nvmlDevice_t>(&lupine_candidate);\n")
+            f.write("        nvmlPciInfo_t lupine_pci = {};\n")
+            f.write("        nvmlReturn_t lupine_pci_result = nvmlDeviceGetPciInfo_v3(lupine_virtual_device, &lupine_pci);\n")
+            f.write("        const char *lupine_candidate_separator = std::strchr(lupine_pci.busId, ':');\n")
+            f.write("        if (lupine_pci_result == NVML_SUCCESS && lupine_candidate_separator != nullptr && std::strcmp(lupine_candidate_separator, lupine_pci_separator) == 0) {\n")
+            f.write(f"          *{output_name} = lupine_virtual_device;\n")
+            f.write("          return NVML_SUCCESS;\n")
+            f.write("        }\n")
+            f.write("      }\n")
+            f.write("      return NVML_ERROR_NOT_FOUND;\n")
+            f.write("    }\n")
+            f.write("  }\n")
+        lambda_args = [
+            "remote_device" if arg == output_name else arg for arg in call_args
+        ]
+        local_args = [
+            "&lupine_local_device" if arg == output_name else arg
+            for arg in call_args
+        ]
+        f.write(f"  using lupine_local_fn_t = nvmlReturn_t (*)({param_types});\n")
+        f.write(
+            f'  auto lupine_local_fn = local_nvml_function<lupine_local_fn_t>("{name}");\n'
+        )
+        f.write("  if (lupine_local_fn != nullptr) {\n")
+        f.write("    nvmlDevice_t lupine_local_device = nullptr;\n")
+        f.write(
+            f"    nvmlReturn_t lupine_local_result = lupine_local_fn({', '.join(local_args)});\n"
+        )
+        f.write("    if (lupine_local_result == NVML_SUCCESS) {\n")
+        f.write(
+            f"      return map_local_device(lupine_local_device, {output_name});\n"
+        )
+        f.write("    }\n")
+        f.write("  }\n")
+        f.write(
+            f"  return lookup_device_on_all_connections({output_name},\n"
+            "      [&](conn_t *conn, nvmlDevice_t *remote_device) {\n"
+            f"        return lupine_rpc_{name}(conn, {', '.join(lambda_args)});\n"
+            "      });\n"
+        )
+    else:
+        if metadata.routing_kind == "NVML_DEVICE":
+            if metadata.routing_parameter is None:
+                raise RuntimeError(f"{name}: NVML_DEVICE routing requires a parameter")
+            route_name = metadata.routing_parameter.name
+            f.write(f"  if (translate_local_device(&{route_name})) {{\n")
+            f.write(
+                f"    using lupine_local_fn_t = nvmlReturn_t (*)({param_types});\n"
+            )
+            f.write(
+                f'    auto lupine_local_fn = local_nvml_function<lupine_local_fn_t>("{name}");\n'
+            )
+            f.write(
+                "    return lupine_local_fn == nullptr\n"
+                "        ? NVML_ERROR_FUNCTION_NOT_FOUND\n"
+                f"        : lupine_local_fn({', '.join(call_args)});\n"
+            )
+            f.write("  }\n")
+            f.write(f"  conn_t *conn = connection_for_device(&{route_name});\n")
+        elif metadata.routing_kind is None:
+            f.write("  conn_t *conn = connection();\n")
+        else:
+            raise RuntimeError(
+                f"{name}: unsupported NVML routing key {metadata.routing_kind}"
+            )
+        suffix = f", {', '.join(call_args)}" if call_args else ""
+        if name == "nvmlDeviceGetPciInfo_v3":
+            f.write(f"  nvmlDevice_t lupine_virtual_device = {route_name};\n")
+            f.write(f"  nvmlReturn_t result = lupine_rpc_{name}(conn{suffix});\n")
+            f.write("  if (result == NVML_SUCCESS) {\n")
+            f.write(
+                "    virtualize_remote_pci_identity(lupine_virtual_device, pci);\n"
+            )
+            f.write("  }\n")
+            f.write("  return result;\n")
+        else:
+            f.write(f"  return lupine_rpc_{name}(conn{suffix});\n")
+    f.write("}\n\n")
+
+
+def write_server_buffer_cleanup(f, owned_buffers, indent):
+    for buffer_name in reversed(owned_buffers):
+        f.write(f"{indent}free((void *){buffer_name});\n")
+
+
+def write_nvml_server_handler(f, function, operations):
+    name = function.name.format()
+    fn_params = ", ".join(
+        parameter.type.format() for parameter in function.parameters
+    )
+    f.write(f"int handle_{name}(conn_t *conn) {{\n")
+    owned_buffers = []
+    for operation in operations:
+        f.write(operation.server_declaration)
+        if (
+            isinstance(operation, DereferenceOperation)
+            and operation.recv
+            and not operation.send
+        ):
+            f.write(f"  {operation.parameter.name} = {{}};\n")
+    f.write("  int request_id;\n")
+    f.write("  nvmlReturn_t return_value;\n")
+    f.write(f"  using fn_t = nvmlReturn_t (*)({fn_params});\n")
+    f.write("  fn_t fn = nullptr;\n")
+    f.write("  if (\n")
+    for operation in operations:
+        if owned_buffer := operation.server_rpc_read(f):
+            owned_buffers.append(owned_buffer)
+    f.write("      false)\n")
+    f.write("    goto ERROR_0;\n\n")
+    f.write("  request_id = rpc_read_end(conn);\n")
+    f.write("  if (request_id < 0)\n")
+    f.write("    goto ERROR_0;\n\n")
+
+    call_args = []
+    for parameter in function.parameters:
+        operation = next(
+            op for op in operations if op.parameter.name == parameter.name
+        )
+        call_args.append(operation.server_reference)
+    f.write(f'  fn = nvml_symbol<fn_t>("{name}");\n')
+    f.write(
+        "  return_value = fn == nullptr ? function_not_found()\n"
+        f"                               : fn({', '.join(call_args)});\n\n"
+    )
+    f.write("  if (rpc_write_start_response(conn, request_id) < 0 ||\n")
+    for operation in operations:
+        operation.server_rpc_write(f)
+    f.write("      rpc_write(conn, &return_value, sizeof(return_value)) < 0 ||\n")
+    f.write("      rpc_write_end(conn) < 0)\n")
+    f.write("    goto ERROR_0;\n")
+    write_server_buffer_cleanup(f, owned_buffers, "  ")
+    f.write("  return 0;\n")
+    f.write("ERROR_0:\n")
+    write_server_buffer_cleanup(f, owned_buffers, "  ")
+    f.write("  return -1;\n")
+    f.write("}\n\n")
+
+
+# List of possible directories to search for header files
+COMMON_INCLUDE_DIRS = [
+    "./",
+    "/usr/local/cuda/include/",
+    "/opt/cuda/include/",
+    "/usr/local/include/",
+    "/usr/include/",
+    "/usr/include/nvidia/",
+]
+
+
+# Function to locate a file in common include directories
+def find_header_file(filename):
+    configured = os.getenv("CUDA_INCLUDE_PATH")
+    include_dirs = ([configured] if configured else []) + COMMON_INCLUDE_DIRS
+    for include_dir in include_dirs:
+        matches = glob.glob(os.path.join(include_dir, "**", filename), recursive=True)
+        if matches:
+            return matches[0]
+    raise FileNotFoundError(
+        f"Header file '{filename}' not found in common include directories."
+    )
+
+
+def validate_async_annotation(
+    function: Function, metadata: FunctionAnnotationMetadata
+) -> None:
+    if not metadata.async_fire_forget:
+        return
+    name = function.name.format()
+    return_type = function.return_type.format()
+    if return_type != "CUresult":
+        raise RuntimeError(
+            f"{name}: @async requires a CUresult return type, got {return_type}"
+        )
+    for operation in metadata.operations:
+        # OptionalArrayOperation is an out-parameter with no send/recv flags.
+        if getattr(operation, "recv", True):
+            raise RuntimeError(
+                f"{name}: @async requires every parameter to be SEND_ONLY, "
+                f"but {operation.parameter.name} is received back"
+            )
+
+
+def main():
+    cuda_include_path = os.getenv("CUDA_INCLUDE_PATH", "/usr/local/cuda/include")
+    options = ParserOptions(
+        preprocessor=make_gcc_preprocessor(
+            include_paths=[cuda_include_path],
+        ),
+    )
+
+    try:
+        cuda_header = find_header_file("cuda.h")
+        annotations_header = find_header_file("annotations.h")
+    except FileNotFoundError as e:
+        print(e)
+        return
+
+    # Parse the files
+    cuda_ast: ParsedData = parse_file(cuda_header, options=options)
+    annotations: ParsedData = parse_file(annotations_header, options=options)
+    functions = [
+        function
+        for function in cuda_ast.namespace.functions
+        if function.name.format().startswith("cu")
+        and function.name.format() not in SKIP_FUNCTIONS
+    ]
+
+    functions_with_annotations: list[
+        tuple[Function, Function, list[Operation], FunctionAnnotationMetadata]
+    ] = []
+
+    dupes = {}
+
+    for function in functions:
+        # ensure duplicate functions can't be written
+        if dupes.get(function.name.format()):
+            continue
+
+        dupes[function.name.format()] = True
+
+        try:
+            annotation = next(
+                f for f in annotations.namespace.functions if f.name == function.name
+            )
+        except StopIteration:
+            print(f"Annotation for {function.name} not found")
+            continue
+        try:
+            metadata = parse_annotation(annotation.doxygen, function.parameters)
+        except Exception as e:
+            print(f"Error parsing annotation for {function.name}: {e}")
+            continue
+        validate_async_annotation(function, metadata)
+        functions_with_annotations.append(
+            (function, annotation, metadata.operations, metadata)
+        )
+
+    nvml_functions_with_annotations = collect_nvml_functions(annotations)
+
+    annotated_names = annotated_rpc_names(annotations)
+
+    with open("gen_api.h", "w") as f:
+        f.write("// Generated by codegen.py. Do not edit by hand.\n")
+        f.write("// RPC ids are stable 31-bit CRC32 hashes of their operation names.\n\n")
+
+        seen_rpc_ids: dict[int, str] = {}
+        emitted_macros: set[str] = set()
+
+        def write_rpc_define(macro_name: str, operation_name: str) -> None:
+            if macro_name in emitted_macros:
+                return
+            value = rpc_id(operation_name)
+            if value in seen_rpc_ids:
+                raise RuntimeError(
+                    f"RPC id collision: {operation_name} and {seen_rpc_ids[value]} "
+                    f"both hash to {value}"
+                )
+            seen_rpc_ids[value] = operation_name
+            emitted_macros.add(macro_name)
+            f.write(f"#define {macro_name} {value}\n")
+
+        for function, _, _, _ in functions_with_annotations:
+            name = function.name.format()
+            write_rpc_define(f"RPC_{name}", name)
+        for name in annotated_names:
+            write_rpc_define(f"RPC_{name}", name)
+        for name in NVML_RPC_FUNCTIONS:
+            write_rpc_define(f"RPC_{name}", name)
+        f.write("\n")
+        for name in PRIVATE_RPC_FUNCTIONS:
+            write_rpc_define(f"LUPINE_RPC_{name}", name)
+
+    with open("gen_nvml_client.inc", "w") as f:
+        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
+        for function, _, operations, metadata in nvml_functions_with_annotations:
+            if metadata.disabled_client:
+                continue
+            write_nvml_client_rpc(f, function, operations)
+            write_nvml_client_wrapper(f, function, operations, metadata)
+
+    # Development mode for NVML fan-out work: avoid rewriting the much larger
+    # CUDA client/server outputs when only the NVML wrapper template changed.
+    if os.getenv("LUPINE_CODEGEN_NVML_CLIENT_ONLY") == "1":
+        return
+
+    with open("gen_nvml_server.inc", "w") as f:
+        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
+        for function, _, operations, metadata in nvml_functions_with_annotations:
+            if metadata.disabled_server:
+                continue
+            write_nvml_server_handler(f, function, operations)
+
+    with open("gen_nvml_server.h", "w") as f:
+        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
+        for function, _, _, metadata in nvml_functions_with_annotations:
+            if metadata.disabled_server:
+                continue
+            f.write(f"int handle_{function.name.format()}(conn_t *conn);\n")
+
+    with open("gen_client.cpp", "w") as f:
+        f.write(
+            "#include <cuda.h>\n"
+            "\n"
+            "#define LUPINE_CUDA_COMPAT_TYPES_ONLY\n"
+            '#include "cuda_compat.h"\n'
+            "#undef LUPINE_CUDA_COMPAT_TYPES_ONLY\n"
+            "\n"
+            "#include <algorithm>\n"
+            "#include <cstdint>\n"
+            "#include <cstdio>\n"
+            "#include <cstring>\n"
+            "#include <string>\n"
+            "#include <unordered_map>\n"
+            "#include <vector>\n\n"
+            '#include "gen_api.h"\n\n'
+            '#include "client_routing.h"\n'
+            '#include "rpc.h"\n\n'
+            "extern int rpc_size();\n"
+            "extern conn_t *rpc_client_get_connection(unsigned int index);\n"
+            "extern void rpc_close(conn_t *conn);\n"
+            'extern "C" void lupine_deep_cache_reset(const void *key);\n'
+            'extern "C" void *lupine_deep_cache_add(const void *key, '
+            "size_t bytes);\n\n"
+            'extern "C" conn_t *lupine_rpc_conn_for_device(CUdevice *device);\n'
+            'extern "C" conn_t *lupine_rpc_conn_for_current_context();\n'
+            'extern "C" conn_t *lupine_rpc_conn_for_context(CUcontext ctx);\n'
+            'extern "C" conn_t *lupine_rpc_conn_for_module(CUmodule module);\n'
+            'extern "C" conn_t *lupine_rpc_conn_for_function(CUfunction function);\n'
+            'extern "C" conn_t *lupine_rpc_conn_for_stream(CUstream stream);\n'
+            'extern "C" conn_t *lupine_rpc_conn_for_event(CUevent event);\n'
+            'extern "C" conn_t *lupine_rpc_conn_for_deviceptr(CUdeviceptr ptr);\n'
+            'extern "C" CUfunction lupine_translate_private_function_for_rpc(CUfunction function);\n'
+            'extern "C" void lupine_note_context_owner(CUcontext ctx, conn_t *conn);\n'
+            'extern "C" void lupine_note_module_owner(CUmodule module, conn_t *conn);\n'
+            'extern "C" void lupine_note_library_owner(CUlibrary library, conn_t *conn);\n'
+            'extern "C" void lupine_note_function_owner(CUfunction function, conn_t *conn);\n'
+            'extern "C" void lupine_note_stream_owner(CUstream stream, conn_t *conn);\n'
+            'extern "C" void lupine_note_event_owner(CUevent event, conn_t *conn);\n'
+            'extern "C" void lupine_note_memory_pool_owner(CUmemoryPool pool, conn_t *conn);\n'
+            'extern "C" void lupine_note_graph_owner(CUgraph graph, conn_t *conn);\n'
+            'extern "C" void lupine_note_graph_node_owner(CUgraphNode node, conn_t *conn);\n'
+            'extern "C" void lupine_note_graph_exec_owner(CUgraphExec exec, conn_t *conn);\n'
+            'extern "C" void lupine_note_deviceptr_owner(CUdeviceptr ptr, conn_t *conn);\n\n'
+            'extern "C" void lupine_note_deviceptr_allocation(CUdeviceptr ptr, size_t size, conn_t *conn);\n\n'
+            'extern "C" void lupine_forget_deviceptr_owner(CUdeviceptr ptr);\n\n'
+            'extern "C" void lupine_forget_stream_owner(CUstream stream);\n\n'
+            'extern "C" void lupine_forget_event_owner(CUevent event);\n'
+            'extern void lupine_note_event_destroyed(CUevent event);\n\n'
+            'extern "C" CUresult lupine_record_library_kernel(CUkernel kernel, CUlibrary library, const char *name, lupine_route route);\n\n'
+            'extern "C" CUresult lupine_record_module_function(CUfunction function, CUmodule module, const char *name, lupine_route route);\n\n'
+            'extern "C" void lupine_prepare_host_range_write(void *host, size_t size);\n'
+            'extern "C" void lupine_mark_host_range_clean(void *host, size_t size);\n'
+            'extern "C" bool lupine_deviceptrs_share_route(CUdeviceptr first, CUdeviceptr second);\n'
+            'extern "C" bool lupine_translate_managed_host_ptr(CUdeviceptr ptr, CUdeviceptr *translated);\n'
+            'extern "C" CUresult lupine_cuMemcpyDtoD_via_client(CUdeviceptr dstDevice,\n'
+            '                                                   CUdeviceptr srcDevice,\n'
+            '                                                   size_t ByteCount,\n'
+            '                                                   CUstream hStream,\n'
+            '                                                   bool async);\n\n'
+            'extern "C" void lupine_invalidate_current_context_cache();\n'
+            'extern "C" void lupine_invalidate_ctx_limit_cache();\n'
+            'extern "C" bool lupine_ctx_limit_cache_lookup(int route_id, CUcontext context, CUlimit limit, size_t *value);\n'
+            'extern "C" void lupine_ctx_limit_cache_store(int route_id, CUcontext context, CUlimit limit, size_t value);\n'
+            'extern "C" void lupine_forget_destroyed_context(CUcontext ctx);\n'
+            'extern "C" void lupine_invalidate_function_caches();\n'
+            'extern "C" void lupine_invalidate_pointer_attribute_cache();\n'
+            'extern "C" bool lupine_function_attribute_cache_lookup(int route_id, CUfunction function, CUfunction_attribute attribute, int *value);\n'
+            'extern "C" void lupine_function_attribute_cache_insert(int route_id, CUfunction function, CUfunction_attribute attribute, int value);\n'
+            'extern "C" void lupine_invalidate_kernel_attribute_cache();\n'
+            'extern "C" void lupine_kernel_attribute_cache_erase(int route_id, CUkernel kernel, int attrib, int dev);\n'
+            'extern "C" bool lupine_kernel_attribute_cache_matches(int route_id, CUkernel kernel, int attrib, int dev, int value);\n'
+            'extern "C" void lupine_kernel_attribute_cache_store(int route_id, CUkernel kernel, int attrib, int dev, int value);\n'
+            'extern "C" CUresult lupine_flush_dirty_host_pages_to_server();\n\n'
+            'extern "C" int lupine_read_deferred_dtoh_copies(conn_t *conn);\n'
+            'extern "C" int lupine_forward_remote_stdout(conn_t *conn);\n'
+            'extern "C" CUresult lupine_sync_mapped_device_to_host();\n'
+            'extern "C" void lupine_ensure_mapped_host_readable(const void *host, size_t size);\n\n'
+        )
+        for function, annotation, operations, metadata in functions_with_annotations:
+            # We don't generate client function definitions for client-disabled
+            # functions; their RPC/server definitions may still be generated.
+            if metadata.disabled_client:
+                continue
+
+            joined_params = ", ".join(format_function_params(function))
+
+            f.write(
+                "{return_type} {name}({params})\n".format(
+                    return_type=function.return_type.format(),
+                    name=function.name.format(),
+                    params=joined_params,
+                )
+            )
+            f.write("{\n")
+
+            if metadata.synchronize:
+                f.write(
+                    "    CUresult lupine_sync_result = "
+                    "lupine_flush_dirty_host_pages_to_server();\n"
+                    "    if (lupine_sync_result != CUDA_SUCCESS) {\n"
+                    "        return lupine_sync_result;\n"
+                    "    }\n"
+                )
+
+            for translation in metadata.translate_deviceptrs:
+                name = translation.parameter.name
+                f.write("    CUdeviceptr {name}_rpc = {name};\n".format(name=name))
+                f.write(
+                    "    bool {name}_is_managed_host = "
+                    "lupine_translate_managed_host_ptr({name}, &{name}_rpc);\n".format(
+                        name=name
+                    )
+                )
+            if metadata.translate_deviceptrs:
+                translated_condition = " || ".join(
+                    "{name}_is_managed_host".format(name=item.parameter.name)
+                    for item in metadata.translate_deviceptrs
+                )
+                f.write("    if ({condition}) {{\n".format(condition=translated_condition))
+                f.write(
+                    "        CUresult managed_result = "
+                    "lupine_flush_dirty_host_pages_to_server();\n"
+                )
+                f.write("        if (managed_result != CUDA_SUCCESS) {\n")
+                f.write("            return managed_result;\n")
+                f.write("        }\n")
+                f.write("    }\n")
+
+            all_output = metadata.routing_parameter
+            if metadata.routing_kind == "ALL":
+                if (
+                    function.return_type.format() != "CUresult"
+                    or all_output is None
+                    or not isinstance(all_output.type, Pointer)
+                    or all_output.type.ptr_to.format() != "CUdevice"
+                ):
+                    raise RuntimeError(
+                        f"{function.name.format()}: ALL routing requires a CUdevice * output"
+                    )
+                if metadata.async_fire_forget:
+                    raise RuntimeError(
+                        f"{function.name.format()}: ALL routing cannot be fire-and-forget"
+                    )
+
+                output_name = all_output.name
+                checks = [f"{output_name} == nullptr"]
+                for operation in operations:
+                    if isinstance(operation, NullTerminatedOperation) and operation.send:
+                        checks.append(f"{operation.parameter.name} == nullptr")
+                    elif (
+                        isinstance(operation, DereferenceOperation)
+                        and operation.parameter.name != output_name
+                    ):
+                        checks.append(f"{operation.parameter.name} == nullptr")
+                    elif isinstance(operation, ArrayOperation):
+                        checks.append(
+                            f"({operation.transfer_size_expr()} != 0 && "
+                            f"{operation.parameter.name} == nullptr)"
+                        )
+                f.write("    if (" + " || ".join(checks) + ") {\n")
+                f.write("        return CUDA_ERROR_INVALID_VALUE;\n")
+                f.write("    }\n")
+                if function.name.format() == "cuDeviceGetByPCIBusId":
+                    # Remote PCI domains are virtualized as 0x1000 + route id.
+                    # Resolve a synthetic BDF against the virtual table instead
+                    # of forwarding it to a physical driver that cannot know it.
+                    f.write("    const char *lupine_pci_separator = std::strchr(pciBusId, ':');\n")
+                    f.write("    if (lupine_pci_separator != nullptr) {\n")
+                    f.write("        char *lupine_domain_end = nullptr;\n")
+                    f.write("        unsigned long lupine_domain = std::strtoul(pciBusId, &lupine_domain_end, 16);\n")
+                    f.write("        if (lupine_domain_end == lupine_pci_separator && lupine_domain >= 0x1000UL) {\n")
+                    f.write("            const int lupine_target_route = static_cast<int>(lupine_domain - 0x1000UL);\n")
+                    f.write("            int lupine_device_count = 0;\n")
+                    f.write("            CUresult lupine_count_result = lupine_virtual_device_count(&lupine_device_count);\n")
+                    f.write("            if (lupine_count_result != CUDA_SUCCESS) return lupine_count_result;\n")
+                    f.write("            for (int lupine_ordinal = 0; lupine_ordinal < lupine_device_count; ++lupine_ordinal) {\n")
+                    f.write("                CUdevice lupine_candidate = static_cast<CUdevice>(lupine_ordinal);\n")
+                    f.write("                CUdevice lupine_route_device = lupine_candidate;\n")
+                    f.write("                lupine_route lupine_candidate_route = lupine_route_for_device(&lupine_route_device);\n")
+                    f.write("                if (lupine_route_identity(lupine_candidate_route) != lupine_target_route) continue;\n")
+                    f.write("                char lupine_candidate_pci[32] = {};\n")
+                    f.write("                CUresult lupine_pci_result = cuDeviceGetPCIBusId(lupine_candidate_pci, sizeof(lupine_candidate_pci), lupine_candidate);\n")
+                    f.write("                const char *lupine_candidate_separator = std::strchr(lupine_candidate_pci, ':');\n")
+                    f.write("                if (lupine_pci_result == CUDA_SUCCESS && lupine_candidate_separator != nullptr && std::strcmp(lupine_candidate_separator, lupine_pci_separator) == 0) {\n")
+                    f.write("                    *dev = lupine_candidate;\n")
+                    f.write("                    return CUDA_SUCCESS;\n")
+                    f.write("                }\n")
+                    f.write("            }\n")
+                    f.write("            return CUDA_ERROR_INVALID_DEVICE;\n")
+                    f.write("        }\n")
+                    f.write("    }\n")
+                f.write(
+                    f"    return lupine_lookup_device_on_all_routes({output_name},\n"
+                    "        [&](lupine_route route, CUdevice *route_output) {\n"
+                    f"            {all_output.type.format()} {output_name} = route_output;\n"
+                )
+            else:
+                f.write(
+                    "    lupine_route route = {route_expr};\n".format(
+                        route_expr=client_routing_route_expr(metadata)
+                    )
+                )
+                if metadata.routing_kind == "DEVICE":
+                    f.write("    if (route.kind == LUPINE_ROUTE_UNKNOWN_DEVICE)\n")
+                    f.write(
+                        "        return {error_return};\n".format(
+                            error_return=invalid_device_const(
+                                function.return_type.format()
+                            )
+                        )
+                    )
+                if function.name.format() == "cuKernelSetAttribute":
+                    f.write("    if (lupine_kernel_attribute_cache_matches(lupine_route_identity(route), kernel, (int)attrib, (int)dev, val)) return CUDA_SUCCESS;\n")
+                if function.name.format() == "cuCtxGetLimit":
+                    f.write("    if (pvalue == nullptr) return CUDA_ERROR_INVALID_VALUE;\n")
+                    f.write("    CUcontext lupine_ctx_limit_context = lupine_current_context_hint();\n")
+                    f.write("    if (lupine_ctx_limit_cache_lookup(lupine_route_identity(route), lupine_ctx_limit_context, limit, pvalue)) return CUDA_SUCCESS;\n")
+            if metadata.cross_server_copy is not None:
+                copy = metadata.cross_server_copy
+                stream_arg = (
+                    client_param_expr(metadata, copy.stream)
+                    if copy.stream is not None
+                    else "nullptr"
+                )
+                async_arg = "true" if copy.async_ else "false"
+                f.write(
+                    "    if (!lupine_deviceptrs_share_route({dst}, {src})) {{\n".format(
+                        dst=client_param_expr(metadata, copy.dst),
+                        src=client_param_expr(metadata, copy.src),
+                    )
+                )
+                f.write(
+                    "        return lupine_cuMemcpyDtoD_via_client({dst}, {src}, {bytes}, {stream}, {async_});\n".format(
+                        dst=client_param_expr(metadata, copy.dst),
+                        src=client_param_expr(metadata, copy.src),
+                        bytes=client_param_expr(metadata, copy.bytes),
+                        stream=stream_arg,
+                        async_=async_arg,
+                    )
+                )
+                f.write("    }\n")
+            f.write(
+                "    {return_type} return_value;\n".format(
+                    return_type=function.return_type.format()
+                )
+            )
+            if function.name.format() == "cuCtxDestroy_v2":
+                # Destroying the current context implicitly pops it; mirror
+                # that in the client's virtual context state before the call.
+                f.write("    CUcontext lupine_current_before_destroy = nullptr;\n")
+                f.write("    if (cuCtxGetCurrent(&lupine_current_before_destroy) ==\n")
+                f.write("            CUDA_SUCCESS &&\n")
+                f.write("        lupine_current_before_destroy == ctx) {\n")
+                f.write("        cuCtxSetCurrent(nullptr);\n")
+                f.write("    }\n")
+            f.write(
+                "    using real_fn_t = {return_type} (*)({params});\n".format(
+                    return_type=function.return_type.format(),
+                    params=", ".join([param.type.format() for param in function.parameters]),
+                )
+            )
+            call_args = ", ".join(client_call_args(function, metadata))
+            helper_args = f", {call_args}" if call_args else ""
+            f.write(
+                "    if (lupine_call_local_cuda_if_routed<real_fn_t>(\n"
+                "            route, \"{name}\", &return_value{args})) {{\n".format(
+                    name=function.name.format(),
+                    args=helper_args,
+                )
+            )
+            if function.name.format() == "cuFuncGetAttribute":
+                # The translated private function handle is declared only for
+                # the remote branch. A local call uses the real local handle.
+                f.write("    if (return_value == CUDA_SUCCESS && pi != nullptr) lupine_function_attribute_cache_insert(lupine_route_identity(route), hfunc, attrib, *pi);\n")
+            else:
+                write_client_post_call(f, function, metadata)
+            f.write("        return return_value;\n")
+            f.write("    }\n")
+            f.write("    conn_t *conn = lupine_route_remote_conn(route);\n")
+
+            write_client_vmm_location_translation(f, function)
+
+            for operation in operations:
+                if isinstance(operation, OpaqueTypeOperation):
+                    f.write(operation.client_declaration())
+                if (
+                    isinstance(operation, InOutCountOperation)
+                    or isinstance(operation, OptionalArrayOperation)
+                    or isinstance(operation, DeepStructOperation)
+                ):
+                    f.write(operation.client_declaration())
+
+            if function.name.format() == "cuFuncGetAttribute":
+                f.write("    if (pi == nullptr) return CUDA_ERROR_INVALID_VALUE;\n")
+                f.write("    if (lupine_function_attribute_cache_lookup(lupine_route_identity(route), hfunc_rpc, attrib, pi)) return CUDA_SUCCESS;\n")
+
+            # compute the strlen's for null-terminated operations.
+            for operation in operations:
+                if isinstance(operation, NullTerminatedOperation):
+                    if operation.send:
+                        f.write(
+                            "    std::size_t {param_name}_len = std::strlen({param_name}) + 1;\n".format(
+                                param_name=operation.parameter.name
+                            )
+                        )
+                    else:
+                        f.write(
+                            "    std::size_t {param_name}_len;\n".format(
+                                param_name=operation.parameter.name
+                            )
+                        )
+                if isinstance(operation, NullableOperation) and operation.recv:
+                    f.write(
+                        "    {server_type} {param_name}_null_check;\n".format(
+                            server_type=operation.ptr.format(),
+                            param_name=operation.parameter.name,
+                        )
+                    )
+
+            # Reject invalid send buffers before rpc_write_start_request()
+            # acquires the connection's call/write locks. Conditions in the
+            # builder below may skip optional writes, but only rpc_write* calls
+            # themselves are allowed to fail the builder.
+            for operation in operations:
+                if isinstance(operation, ArrayOperation):
+                    operation.client_preflight(
+                        f, invalid_argument_const(function.return_type.format())
+                    )
+
+            if metadata.async_fire_forget:
+                error_return = error_const(function.return_type.format())
+                f.write(
+                    "    if (conn == nullptr ||\n"
+                    "        rpc_write_start_request(conn, RPC_{name}) < 0 ||\n".format(
+                        name=function.name.format()
+                    )
+                )
+                for operation in operations:
+                    write_client_rpc_write(f, operation, metadata, function)
+                f.write("        rpc_write_end_deferred(conn) < 0) {\n")
+                f.write("        return {r};\n".format(r=error_return))
+                f.write("    }\n")
+                post_call = io.StringIO()
+                write_client_post_call(post_call, function, metadata)
+                if post_call.getvalue():
+                    f.write("    return_value = CUDA_SUCCESS;\n")
+                    f.write(post_call.getvalue())
+                    f.write("    return return_value;\n")
+                else:
+                    f.write("    return CUDA_SUCCESS;\n")
+                f.write("}\n\n")
+                continue
+
+            f.write(
+                "    if (conn == nullptr ||\n"
+                "        rpc_write_start_request(conn, RPC_{name}) < 0 ||\n".format(
+                    name=function.name.format()
+                )
+            )
+
+            for operation in operations:
+                write_client_rpc_write(f, operation, metadata, function)
+
+            f.write("        rpc_wait_for_response(conn) < 0 ||\n")
+
+            if metadata.synchronize and metadata.synchronize.deferred_dtoh:
+                f.write("        lupine_read_deferred_dtoh_copies(conn) < 0 ||\n")
+            if metadata.synchronize and metadata.synchronize.stdout:
+                f.write("        lupine_forward_remote_stdout(conn) < 0 ||\n")
+
+            for operation in operations:
+                if isinstance(operation, ArrayOperation):
+                    operation.client_prepare_rpc_read(f)
+
+            for operation in operations:
+                operation.client_rpc_read(f)
+
+            f.write(
+                "        rpc_read(conn, &return_value, sizeof({return_type})) < 0 ||\n".format(
+                    return_type=function.return_type.format()
+                )
+            )
+            f.write("        rpc_read_end(conn) < 0)\n")
+            f.write(
+                "        return {error_return};\n".format(
+                    error_return=error_const(function.return_type.format())
+                )
+            )
+
+            write_client_post_call(f, function, metadata)
+            if function.name.format() == "cuDeviceGetPCIBusId":
+                f.write("    if (return_value == CUDA_SUCCESS && pciBusId != nullptr && len > 0) {\n")
+                f.write("        const char *lupine_separator = std::strchr(pciBusId, ':');\n")
+                f.write("        if (lupine_separator != nullptr) {\n")
+                f.write("            char lupine_physical_suffix[24] = {};\n")
+                f.write("            std::snprintf(lupine_physical_suffix, sizeof(lupine_physical_suffix), \"%s\", lupine_separator);\n")
+                f.write("            const unsigned int lupine_virtual_domain = 0x1000u + static_cast<unsigned int>(lupine_route_identity(route));\n")
+                f.write("            std::snprintf(pciBusId, static_cast<std::size_t>(len), \"%08x%s\", lupine_virtual_domain, lupine_physical_suffix);\n")
+                f.write("        }\n")
+                f.write("    }\n")
+            for operation in operations:
+                if isinstance(operation, ArrayOperation):
+                    operation.client_post_rpc_read_success(f)
+
+            f.write("    return return_value;\n")
+            if metadata.routing_kind == "ALL":
+                f.write("        });\n")
+            f.write("}\n\n")
+
+        function_by_name = {
+            function.name.format(): function
+            for function, _, _, metadata in functions_with_annotations
+            if not metadata.disabled_client
+        }
+        for alias, target in MANUAL_REMAPPINGS:
+            if alias in function_by_name or target not in function_by_name:
+                continue
+            target_function = function_by_name[target]
+            guard = MANUAL_REMAPPING_GUARDS.get(alias)
+            if guard is not None:
+                f.write("#if {guard}\n".format(guard=guard))
+            f.write("#ifdef {name}\n#undef {name}\n#endif\n".format(name=alias))
+            f.write(
+                'extern "C" {return_type} {name}({params})\n'.format(
+                    return_type=target_function.return_type.format(),
+                    name=alias,
+                    params=", ".join(format_function_params(target_function)),
+                )
+            )
+            f.write("{\n")
+            call = "{target}({args})".format(
+                target=target,
+                args=", ".join(format_call_args(target_function)),
+            )
+            if target_function.return_type.format() == "void":
+                f.write("    {call};\n".format(call=call))
+                f.write("}\n\n")
+            else:
+                f.write("    return {call};\n".format(call=call))
+                f.write("}\n\n")
+            if guard is not None:
+                f.write("#endif\n\n")
+
+        f.write("std::unordered_map<std::string, void *> functionMap = {\n")
+        for function, _, _, metadata in functions_with_annotations:
+            if metadata.disabled_client and metadata.disabled_server:
+                continue
+
+            f.write(
+                '    {{"{name}", (void *){name}}},\n'.format(
+                    name=function.name.format()
+                )
+            )
+        # write manual overrides
+        function_names = set(
+            f.name.format()
+            for f, _, _, metadata in functions_with_annotations
+            if not metadata.disabled_client
+        )
+        for x, y in MANUAL_REMAPPINGS:
+            # ensure y exists in the function list
+            if y not in function_names:
+                print(f"Skipping manual remapping {x} -> {y}")
+                continue
+            f.write(
+                '    {{"{x}", (void *){y}}},\n'.format(
+                    x=x,
+                    y=y,
+                )
+            )
+        f.write("};\n\n")
+
+        f.write("void *get_function_pointer(const char *name)\n")
+        f.write("{\n")
+        f.write("    auto it = functionMap.find(name);\n")
+        f.write("    if (it == functionMap.end())\n")
+        f.write("        return nullptr;\n")
+        f.write("    return it->second;\n")
+        f.write("}\n")
+
+    with open("gen_server.cpp", "w") as f:
+        f.write(
+            "#include <iostream>\n"
+            "#include <cuda.h>\n"
+            '#include "cuda_compat.h"\n'
+            "\n"
+            "#include <cstring>\n"
+            "#include <string>\n"
+            "#include <unordered_map>\n\n"
+            '#include "gen_api.h"\n\n'
+            '#include <vector>\n\n'
+            '#include <cstdio>\n\n'
+            '#include "gen_server.h"\n\n'
+            '#include <cstdio>\n\n'
+            '#include "rpc.h"\n\n'
+            '#include "nvml_server.h"\n\n'
+        )
+        for function, annotation, operations, metadata in functions_with_annotations:
+            if metadata.disabled_server:
+                continue
+
+            # parse the annotation doxygen
+            f.write(
+                "int handle_{name}(conn_t *conn)\n".format(
+                    name=function.name.format(),
+                )
+            )
+            f.write("{\n")
+
+            owned_buffers = []
+
+            for operation in operations:
+                f.write(operation.server_declaration)
+
+            f.write("    int request_id;\n")
+
+            # we only generate return from non-void types
+            if metadata.async_fire_forget:
+                pass
+            elif function.return_type.format() != "void":
+                f.write(
+                    "    {return_type} lupine_intercept_result;\n".format(
+                        return_type=function.return_type.format()
+                    )
+                )
+            else:
+                f.write("    void* lupine_intercept_result;\n")
+
+            f.write("    if (\n")
+            for operation in operations:
+                if owned_buffer := operation.server_rpc_read(f):
+                    owned_buffers.append(owned_buffer)
+            f.write("        false)\n")
+            f.write("        goto ERROR_0;\n")
+
+            f.write("\n")
+
+            f.write("    request_id = rpc_read_end(conn);\n")
+            f.write("    if (request_id < 0)\n")
+            f.write("        goto ERROR_0;\n")
+
+            params: list[str] = []
+            # these need to be in function param order, not operation order.
+            for param in function.parameters:
+                for op in operations:
+                    if op.parameter.name == param.name:
+                        params.append(op.server_reference)
+
+            if metadata.async_fire_forget or function.return_type.format() == "void":
+                f.write(
+                    "    {name}({params});\n\n".format(
+                        name=server_call_name(function.name.format()),
+                        params=", ".join(params),
+                    )
+                )
+            else:
+                f.write(
+                    "    lupine_intercept_result = {name}({params});\n\n".format(
+                        name=server_call_name(function.name.format()),
+                        params=", ".join(params),
+                    )
+                )
+
+            if metadata.async_fire_forget:
+                write_server_buffer_cleanup(f, owned_buffers, "    ")
+                f.write("    return 0;\n")
+                f.write("ERROR_0:\n")
+                write_server_buffer_cleanup(f, owned_buffers, "    ")
+                f.write("    return -1;\n")
+                f.write("}\n\n")
+                continue
+
+            f.write("    if (rpc_write_start_response(conn, request_id) < 0 ||\n")
+
+            for operation in operations:
+                operation.server_rpc_write(f)
+
+            f.write(
+                "        rpc_write(conn, &lupine_intercept_result, sizeof({return_type})) < 0 ||\n".format(
+                    return_type=function.return_type.format()
+                )
+            )
+            f.write("        rpc_write_end(conn) < 0)\n")
+            f.write("        goto ERROR_0;\n")
+            f.write("\n")
+            write_server_buffer_cleanup(f, owned_buffers, "    ")
+            f.write("    return 0;\n")
+
+            f.write("ERROR_0:\n")
+            write_server_buffer_cleanup(f, owned_buffers, "    ")
+            f.write("    return -1;\n")
+            f.write("}\n\n")
+
+        f.write("static const std::unordered_map<int, RequestHandler> opHandlers = {\n")
+        for function, _, _, metadata in functions_with_annotations:
+            if metadata.disabled_server:
+                continue
+            else:
+                f.write(
+                    "    {{RPC_{name}, handle_{name}}},\n".format(
+                        name=function.name.format()
+                    )
+                )
+        for name in NVML_RPC_FUNCTIONS:
+            f.write("    {{RPC_{name}, handle_{name}}},\n".format(name=name))
+        f.write("};\n\n")
+
+        f.write("RequestHandler get_handler(const int op)\n")
+        f.write("{\n")
+        f.write("    auto it = opHandlers.find(op);\n")
+        f.write("    if (it == opHandlers.end())\n")
+        f.write("        return nullptr;\n")
+        f.write("    return it->second;\n")
+        f.write("}\n")
+
+
+if __name__ == "__main__":
+    main()
