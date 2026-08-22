@@ -267,6 +267,8 @@ lupine_manual_handlers() {
       {RPC_cuGraphInstantiateWithParams,
        {handle_manual_cuGraphInstantiateWithParams,
         "cuGraphInstantiateWithParams"}},
+      {RPC_cuGraphExecUpdate_v2,
+       {handle_manual_cuGraphExecUpdate, "cuGraphExecUpdate_v2"}},
       {RPC_cuGraphExecDestroy,
        {handle_manual_cuGraphExecDestroy, "cuGraphExecDestroy"}},
       {RPC_cuGraphDestroy, {handle_manual_cuGraphDestroy, "cuGraphDestroy"}},

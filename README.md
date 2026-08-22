@@ -5,10 +5,14 @@ were local. It supports a contained `rgpu run` mode and an experimental
 host-wide mode in which ordinary `nvidia-smi` and PyTorch processes see the
 remote GPU without a wrapper.
 
-> **Status:** experimental release `0.1.0`, validated on two Ubuntu
+> **Status:** experimental release `0.2.0`, validated on two Ubuntu
 > workstations with RTX 5090 GPUs, CUDA 13, PyTorch 2.12, Docker, NVIDIA
 > Container Toolkit, and direct 10 GbE. Do not deploy it on an untrusted
 > network.
+
+The current Qwen3.8 27B CUDA Graph benchmark reaches 197.43 tok/s remotely
+versus 204.26 tok/s natively on the same GPU, with identical deterministic
+streamed output. Startup remains bounded by transferring model weights.
 
 ## Quick start
 

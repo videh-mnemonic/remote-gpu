@@ -1,7 +1,7 @@
 # rgpu host
 
 This is the deployable server side for a machine that provides an NVIDIA GPU.
-Its versioned product artifact is the `remote-gpu-host:0.1.0`
+Its versioned product artifact is the `remote-gpu-host:0.2.0`
 OCI image, containing the LUPINE server built from `../lupine/` plus the CUDA
 userspace libraries needed by opaque-library RPC.
 
@@ -14,5 +14,5 @@ after admission control succeeds.
 After loading the image, validate the host without starting a GPU workload:
 
 ```bash
-./check.sh --image remote-gpu-host:0.1.0
+./check.sh --image remote-gpu-host:0.2.0
 ```

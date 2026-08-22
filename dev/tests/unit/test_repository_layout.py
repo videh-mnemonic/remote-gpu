@@ -31,12 +31,12 @@ def test_build_uses_canonical_lupine_without_patch_replay() -> None:
 
 def test_release_artifacts_share_one_version() -> None:
     version = (ROOT / "rgpu-client/remote_gpu/version.py").read_text(encoding="utf-8")
-    assert '__version__ = "0.1.0"' in version
-    assert 'WIRE_PROTOCOL_VERSION = "5"' in version
+    assert '__version__ = "0.2.0"' in version
+    assert 'WIRE_PROTOCOL_VERSION = "6"' in version
 
     transport = (ROOT / "lupine/h2.cpp").read_text(encoding="utf-8")
-    assert 'kLupineProtocolVersion[] = "5"' in transport
-    assert 'kLupineClientProtocolVersion[] = "5"' in transport
+    assert 'kLupineProtocolVersion[] = "6"' in transport
+    assert 'kLupineClientProtocolVersion[] = "6"' in transport
 
     cli = (ROOT / "rgpu-client/remote_gpu/cli.py").read_text(encoding="utf-8")
     assert 'f"remote-gpu-client:{__version__}"' in cli

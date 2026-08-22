@@ -78,6 +78,34 @@ def test_device_only_async_2d_copy_is_fire_and_forget_on_both_sides() -> None:
     assert "result = cuMemcpy2DAsync_v2(&copy, stream)" in handler
 
 
+def test_runtime_memory_queries_preload_one_symbol_per_fatbin() -> None:
+    compat = (LUPINE_ROOT / "cudart_compat.cpp").read_text()
+
+    assert 'extern "C" void __cudaRegisterFunction(' in compat
+    assert 'extern "C" void __cudaUnregisterFatBinary(' in compat
+    assert 'extern "C" int cudaMemGetInfo(' in compat
+    assert "return item.fatbin == entry.fatbin" in compat
+    assert "if (entry.fatbin == item.fatbin) entry.warmed = true" in compat
+    assert "preload == nullptr || preload[0] != '0'" in compat
+    assert 'dlsym(RTLD_NEXT, "cudaFuncGetAttributes")' in compat
+
+
+def test_graph_replay_refreshes_host_inputs_and_tracks_updated_resources() -> None:
+    client = (LUPINE_ROOT / "client.cpp").read_text()
+    copies = (LUPINE_ROOT / "copy_pipeline.cpp").read_text()
+    memory = (LUPINE_ROOT / "memcpy.cpp").read_text()
+    server = (LUPINE_ROOT / "manual_server.cpp").read_text()
+    dispatch = (LUPINE_ROOT / "server.cpp").read_text()
+
+    assert "lupine_flush_dirty_host_pages_to_server();" in client
+    assert "lupine_prepare_graph_host_source(" in copies
+    assert "rpc_write(conn, &graph_host_source" in copies
+    assert "lupine_enable_dirty_tracking_locked(it->first" in memory
+    assert "lupine_begin_stream_capture_resources(stream)" in server
+    assert "lupine_graph_exec_resource_map().insert_or_assign(exec, resources)" in server
+    assert "handle_manual_cuGraphExecUpdate" in dispatch
+
+
 def test_extended_dot_rpc_is_defined_on_both_sides() -> None:
     protocol = (LUPINE_ROOT / "lupine_cublas.h").read_text()
     server = (LUPINE_ROOT / "manual_server.cpp").read_text()

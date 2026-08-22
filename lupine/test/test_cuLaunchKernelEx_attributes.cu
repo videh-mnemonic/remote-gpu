@@ -1,6 +1,7 @@
 // Exercises remote cuLaunchKernelEx attribute forwarding.
 // Auto-discovered by test/run_custom_tests.sh via the test_*.cu glob.
 #include <cuda.h>
+#include <cuda_runtime_api.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -14,6 +15,10 @@ int main() {
   return 0;
 }
 #else
+
+__global__ void runtime_set_value(uint32_t *output, uint32_t value) {
+  *output = value;
+}
 
 static const char kSetValuePtx[] =
     ".version 6.4\n"
@@ -149,6 +154,44 @@ int main() {
   if (!check(cuLaunchKernelEx(&legacy_config, function, params, nullptr),
              "cuLaunchKernelEx(no attributes)") ||
       !check(cuCtxSynchronize(), "sync no-attribute launch") ||
+      !output_is(output, value)) {
+    return 1;
+  }
+
+  // Exercise the CUDA Runtime spelling used by modern PyTorch extensions.
+  // Unlike the driver-API cases below, this passes a registered host kernel
+  // symbol through libcudart before the launch reaches Lupine's driver shim.
+  cudaLaunchConfig_t runtime_config = {};
+  runtime_config.gridDim = dim3(1, 1, 1);
+  runtime_config.blockDim = dim3(1, 1, 1);
+  cudaLaunchAttribute runtime_cooperative = {};
+  runtime_cooperative.id = cudaLaunchAttributeCooperative;
+  runtime_cooperative.val.cooperative = 1;
+  runtime_config.attrs = &runtime_cooperative;
+  runtime_config.numAttrs = 1;
+  uint32_t runtime_value = 44;
+  cudaError_t runtime_result = cudaLaunchKernelEx(
+      &runtime_config, runtime_set_value,
+      reinterpret_cast<uint32_t *>(static_cast<uintptr_t>(output)),
+      runtime_value);
+  if (runtime_result != cudaSuccess) {
+    fprintf(stderr, "cudaLaunchKernelEx(runtime cooperative) failed: %s (%d)\n",
+            cudaGetErrorName(runtime_result), static_cast<int>(runtime_result));
+    return 1;
+  }
+  if (!check(cuCtxSynchronize(), "sync runtime cooperative launch") ||
+      !output_is(output, runtime_value)) {
+    return 1;
+  }
+
+  CUlaunchAttribute cooperative = {};
+  cooperative.id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
+  cooperative.value.cooperative = 1;
+  CUlaunchConfig cooperative_config = config_for(&cooperative);
+  value = 45;
+  if (!check(cuLaunchKernelEx(&cooperative_config, function, params, nullptr),
+             "cuLaunchKernelEx(driver cooperative)") ||
+      !check(cuCtxSynchronize(), "sync driver cooperative launch") ||
       !output_is(output, value)) {
     return 1;
   }

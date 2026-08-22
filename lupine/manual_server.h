@@ -77,6 +77,7 @@ int handle_manual_cuStreamEndCapture(conn_t *conn);
 int handle_manual_cuGraphClone(conn_t *conn);
 int handle_manual_cuGraphInstantiateWithFlags(conn_t *conn);
 int handle_manual_cuGraphInstantiateWithParams(conn_t *conn);
+int handle_manual_cuGraphExecUpdate(conn_t *conn);
 int handle_manual_cuGraphExecDestroy(conn_t *conn);
 int handle_manual_cuGraphDestroy(conn_t *conn);
 int handle_manual_cuMemcpyAsync(conn_t *conn);

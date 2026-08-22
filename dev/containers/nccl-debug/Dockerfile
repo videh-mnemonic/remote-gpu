@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=remote-gpu-lupine-pytorch:nccl-rpc-v5
+ARG BASE_IMAGE=remote-gpu-lupine-pytorch:nccl-rpc-v6
 FROM ${BASE_IMAGE}
 
 USER root

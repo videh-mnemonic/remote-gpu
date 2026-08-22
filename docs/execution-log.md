@@ -1,5 +1,37 @@
 # Execution log
 
+## 2026-08-22 — correct, near-native NInfer CUDA Graph replay
+
+- Fixed NInfer's graph startup failure without changing NInfer. The client now
+  materializes one registered kernel per CUDA fatbin before the application's
+  memory query, so lazy remote module allocation is included in its normal
+  budget. Reported graph memory fell from 96 MiB (over the 82 MiB limit) to
+  2 MiB, and model initialization completes in 23.492 seconds remotely.
+- Minimized a CUDA Graph correctness defect to a standalone native/remote test:
+  graph replay reused the host-to-device staging bytes captured on the first
+  launch. Pinned host allocations now have stable server mirrors and client
+  dirty-page tracking; dirty ranges are propagated before each graph launch.
+  The test covers changing inputs, two captures on one stream, graph-exec
+  update, and device-to-host results.
+- Isolated graph-owned copy resources per capture and rebind them after a
+  successful graph-exec update. This removed NInfer's subsequent paged-KV trim
+  failure and prevents one stream's captures from sharing stale resource
+  metadata.
+- Five matched 257-token prompt/512-token generation requests measure 197.43
+  tok/s remote versus 204.26 tok/s native, with 2.648 versus 2.555 seconds
+  median wall time. Remote graph decode is 3.26 times the original broken
+  60.56 tok/s result and is now 3.3% below native throughput. A separate
+  deterministic 64-token run produced the exact same streamed-output SHA-256
+  digest natively and remotely.
+- Advanced the client/server contract to release 0.2.0 and wire protocol 6 for
+  the graph host-source packet extension. Matching packaged client/host images
+  pass the graph regression and an eight-check PyTorch smoke; a protocol-6
+  client rejects the live protocol-1 daemon with HTTP 426 before CUDA dispatch.
+  The live persistent attachment was intentionally not restarted.
+- The complete GPU-free suite passes 90/90. Versioned client, host, and default
+  workload images build successfully, and the normal local `ali` service was
+  restored healthy after every bounded benchmark.
+
 ## 2026-08-21 — Qwen3.8 27B NInfer serving optimization
 
 - Ran the unmodified private `ali` Qwen3.8 27B NVFP4 serving image natively on

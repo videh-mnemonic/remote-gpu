@@ -421,11 +421,11 @@ constexpr char kLupineCompressHeader[] = "x-lupine-compress";
 constexpr char kLupineCompressLz4[] = "lz4";
 constexpr char kLupineCudaVersionHeader[] = "x-lupine-cuda-version";
 constexpr char kLupineProtocolHeader[] = "x-lupine-protocol";
-constexpr char kLupineProtocolVersion[] = "5";
+constexpr char kLupineProtocolVersion[] = "6";
 #ifdef LUPINE_H2_PROTOCOL_MISMATCH_TEST
 constexpr char kLupineClientProtocolVersion[] = "mismatch-test";
 #else
-constexpr char kLupineClientProtocolVersion[] = "5";
+constexpr char kLupineClientProtocolVersion[] = "6";
 #endif
 constexpr char kLupineSessionHeader[] = "x-lupine-session";
 #ifdef LUPINE_CUDA_VERSION

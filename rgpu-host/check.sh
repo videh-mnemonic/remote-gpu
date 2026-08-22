@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-image=remote-gpu-host:0.1.0
+image=remote-gpu-host:0.2.0
 
 usage() {
   echo "usage: $0 [--image IMAGE]" >&2

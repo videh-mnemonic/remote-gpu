@@ -1,5 +1,5 @@
-ARG SHIM_IMAGE=remote-gpu-lupine-client:nccl-rpc-v5
-ARG RUNTIME_IMAGE=remote-gpu-lupine-pytorch:nccl-rpc-v5
+ARG SHIM_IMAGE=remote-gpu-lupine-client:nccl-rpc-v6
+ARG RUNTIME_IMAGE=remote-gpu-lupine-pytorch:nccl-rpc-v6
 
 FROM ${RUNTIME_IMAGE} AS runtime
 FROM ${SHIM_IMAGE}

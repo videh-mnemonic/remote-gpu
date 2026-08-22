@@ -94,6 +94,19 @@ extern "C" CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice,
     return CUDA_ERROR_INVALID_VALUE;
   }
   lupine_ensure_mapped_host_readable(srcHost, ByteCount);
+  CUdeviceptr graph_host_source = 0;
+  CUstreamCaptureStatus capture_status = CU_STREAM_CAPTURE_STATUS_NONE;
+  CUresult capture_result = cuStreamIsCapturing(hStream, &capture_status);
+  if (capture_result != CUDA_SUCCESS) {
+    return capture_result;
+  }
+  if (capture_status != CU_STREAM_CAPTURE_STATUS_NONE) {
+    CUresult graph_source_result = lupine_prepare_graph_host_source(
+        srcHost, ByteCount, &graph_host_source);
+    if (graph_source_result != CUDA_SUCCESS) {
+      return graph_source_result;
+    }
+  }
   // CUDA UVA permits host-mapped pointers to be embedded directly in device
   // control structures. The client's shadow mapping has a different virtual
   // address from the server's CUDA mapping, so relocate those shallow pointer
@@ -120,6 +133,7 @@ extern "C" CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice,
       rpc_write(conn, &dstDevice, sizeof(dstDevice)) < 0 ||
       rpc_write(conn, &ByteCount, sizeof(ByteCount)) < 0 ||
       rpc_write(conn, &hStream, sizeof(hStream)) < 0 ||
+      rpc_write(conn, &graph_host_source, sizeof(graph_host_source)) < 0 ||
       (ByteCount != 0 && rpc_write_payload(conn, payload, ByteCount) < 0)) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }

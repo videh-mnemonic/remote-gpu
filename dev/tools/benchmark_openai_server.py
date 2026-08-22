@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import statistics
 import time
@@ -18,7 +19,7 @@ def request_once(
     output_tokens: int,
     timeout: float,
     fixed_prompt: bool,
-) -> dict[str, float | int]:
+) -> dict[str, float | int | str]:
     nonce = "fixed" if fixed_prompt else uuid.uuid4().hex
     filler = " ".join(f"word{i % 997}" for i in range(input_words))
     prompt = (
@@ -43,6 +44,7 @@ def request_once(
     started = time.perf_counter()
     first_token = None
     final = None
+    output_parts: list[str] = []
     with urllib.request.urlopen(request, timeout=timeout) as response:
         for raw_line in response:
             line = raw_line.decode().strip()
@@ -54,6 +56,11 @@ def request_once(
                 "response.output_text.delta",
             }:
                 first_token = time.perf_counter()
+            if event.get("type") in {
+                "response.reasoning_text.delta",
+                "response.output_text.delta",
+            } and isinstance(event.get("delta"), str):
+                output_parts.append(event["delta"])
             if event.get("type") in {"response.completed", "response.incomplete"}:
                 final = event.get("response")
     finished = time.perf_counter()
@@ -72,6 +79,9 @@ def request_once(
         "wall_s": wall,
         "input_tokens_per_s_to_first": input_count / ttft,
         "output_tokens_per_s_after_first": max(output_count - 1, 0) / decode_window,
+        "output_sha256": hashlib.sha256(
+            "".join(output_parts).encode("utf-8")
+        ).hexdigest(),
     }
 
 

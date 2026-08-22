@@ -1,4 +1,4 @@
-ARG SERVER_IMAGE=remote-gpu-lupine-server:nccl-rpc-v5
+ARG SERVER_IMAGE=remote-gpu-lupine-server:nccl-rpc-v6
 ARG WORKLOAD_IMAGE=remote-gpu-pytorch-native:2.12.0-cu130
 
 FROM ${SERVER_IMAGE} AS server

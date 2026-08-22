@@ -591,6 +591,35 @@ extern "C" void lupine_prepare_host_range_write(void *host, size_t size) {
                             protect_size, PROT_READ | PROT_WRITE);
 }
 
+extern "C" CUresult lupine_prepare_graph_host_source(
+    const void *host, size_t size, CUdeviceptr *server_host) {
+  if (server_host == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  *server_host = 0;
+  if (host == nullptr || size == 0) {
+    return CUDA_SUCCESS;
+  }
+
+  std::lock_guard<std::mutex> lock(lupine_host_allocation_mutex());
+  auto it = lupine_find_host_allocation_locked(const_cast<void *>(host));
+  if (it == lupine_mutable_host_allocations_locked().end() ||
+      it->second.local_cuda || it->second.server_host_ptr == 0) {
+    return CUDA_SUCCESS;
+  }
+  uintptr_t base = reinterpret_cast<uintptr_t>(it->first);
+  uintptr_t start = reinterpret_cast<uintptr_t>(host);
+  if (start < base || start - base > it->second.size ||
+      size > it->second.size - (start - base)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (!lupine_enable_dirty_tracking_locked(it->first, &it->second)) {
+    return CUDA_ERROR_OUT_OF_MEMORY;
+  }
+  *server_host = it->second.server_host_ptr + (start - base);
+  return CUDA_SUCCESS;
+}
+
 static CUresult lupine_flush_dirty_host_pages_to_route(size_t route_id) {
   auto &queue = lupine_dirty_host_range_queues[route_id];
   std::lock_guard<std::mutex> route_lock(queue.mutex);

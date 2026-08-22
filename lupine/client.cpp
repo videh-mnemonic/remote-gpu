@@ -6477,6 +6477,10 @@ static bool lupine_defer_graph_launch_enabled() {
 }
 
 extern "C" CUresult cuGraphLaunch(CUgraphExec hGraphExec, CUstream hStream) {
+  CUresult flush_result = lupine_flush_dirty_host_pages_to_server();
+  if (flush_result != CUDA_SUCCESS) {
+    return flush_result;
+  }
   lupine_route route = lupine_route_for_graph_exec(hGraphExec);
   CUresult return_value = CUDA_ERROR_DEVICE_UNAVAILABLE;
   using real_fn_t = CUresult (*)(CUgraphExec, CUstream);

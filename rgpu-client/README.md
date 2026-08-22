@@ -9,8 +9,8 @@ GPUs. It provides:
 - CUDA-library interposers for cuBLAS/cuBLASLt, cuSOLVER, cuFFT, and NCCL; and
 - container definitions used to package and inject the LUPINE CUDA/NVML shim.
 
-Release `0.1.0` installs the Python commands from a wheel and injects the
-self-contained `remote-gpu-client:0.1.0` artifact. The artifact includes the
+Release `0.2.0` installs the Python commands from a wheel and injects the
+self-contained `remote-gpu-client:0.2.0` artifact. The artifact includes the
 LUPINE CUDA/NVML libraries plus cuBLAS, cuSOLVER, cuFFT, NCCL, and strict
 unsupported-call guards; a workload image does not need `/opt/rgpu` baked in.
 

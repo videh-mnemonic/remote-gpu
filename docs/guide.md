@@ -1,6 +1,6 @@
 # rgpu deployment and engineering guide
 
-This document explains release `0.1.0`: how to deploy it, how the system is
+This document explains release `0.2.0`: how to deploy it, how the system is
 constructed, which semantics are currently supported, where performance comes
 from, and how to recover safely. For a first run, start with the concise
 [README](../README.md).
@@ -86,18 +86,18 @@ client.
 
 ## Release artifacts
 
-Release `0.1.0` consists of artifacts that share one version and wire-protocol
+Release `0.2.0` consists of artifacts that share one version and wire-protocol
 contract:
 
 | Artifact | Role |
 |---|---|
-| `remote_gpu-0.1.0-py3-none-any.whl` | `rgpu`, `rgpu-rescue`, orchestration, and safe attachment logic |
-| `remote-gpu-client:0.1.0` | Self-contained injectable CUDA/NVML shim plus math-library and NCCL interposers |
-| `remote-gpu-host:0.1.0` | GPU-side LUPINE server and compatible CUDA userspace |
-| `remote-gpu-workload:0.1.0` | Validated default PyTorch workload; optional when supplying another image |
+| `remote_gpu-0.2.0-py3-none-any.whl` | `rgpu`, `rgpu-rescue`, orchestration, and safe attachment logic |
+| `remote-gpu-client:0.2.0` | Self-contained injectable CUDA/NVML shim plus math-library and NCCL interposers |
+| `remote-gpu-host:0.2.0` | GPU-side LUPINE server and compatible CUDA userspace |
+| `remote-gpu-workload:0.2.0` | Validated default PyTorch workload; optional when supplying another image |
 
 `python3 dev/tools/build_release.py` rebuilds those images, builds the wheel,
-and writes a manifest and SHA-256 checksums under `dev/releases/0.1.0`.
+and writes a manifest and SHA-256 checksums under `dev/releases/0.2.0`.
 `--export-images` also emits compressed OCI archives for an offline/private
 release. The CLI refuses a client/server image mismatch and protocol revision
 mismatch before dispatching GPU work.
@@ -133,7 +133,7 @@ loaded images:
 ./rgpu-client/install.sh \
   --host mnemonic-1@10.77.77.1 \
   --skip-build \
-  --wheel dev/releases/0.1.0/wheels/remote_gpu-0.1.0-py3-none-any.whl
+  --wheel dev/releases/0.2.0/wheels/remote_gpu-0.2.0-py3-none-any.whl
 ```
 
 Upgrade while detached: run `rgpu detach` if host-wide mode is active, install
@@ -272,6 +272,9 @@ plane. `rgpu native-python` remains available as a differential control.
   rejected with HTTP 426 before CUDA RPC dispatch.
 - Transparent asynchronous CUDA Graph launch with
   `LUPINE_SYNC_GRAPH_LAUNCH=1` as the immediate-result compatibility fallback.
+- Dynamic pinned-host graph inputs remain live across replay through stable
+  server mirrors and dirty-range propagation. Separate captures on one stream
+  and successful graph-exec updates retain their own copy resources.
 - Native two-host NCCL and five-step Transformer DDP through `rgpu
   native-python`; 64 MiB all-reduce reaches 9.83 Gbit/s over the 10GbE link.
 - Transparent local-plus-remote NCCL reduce, reduce-scatter, all-gather,
@@ -284,6 +287,11 @@ The latest optimized examples include whole-training-step replay at 1.469 ms
 remote versus 1.408 ms native for Llama, 3.022 versus 2.973 ms for LitGPT,
 and 6.539 versus 6.348 ms for TorchTitan/FlexAttention. See
 [the timing summary](timing-summary.md) for scopes and caveats.
+
+For Qwen3.8 27B serving, NInfer's default CUDA Graph path measures 197.43 tok/s
+remote versus 204.26 tok/s native, with identical deterministic streamed
+output. Model initialization remains transfer-bound because 19.73 GiB of
+weights cross the 10 GbE link.
 
 Compiled model-plus-optimizer execution is the strongest current performance
 path for modern training code: TorchTitan Qwen3 measures 4.606 ms remote versus

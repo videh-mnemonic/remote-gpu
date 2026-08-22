@@ -1,6 +1,6 @@
 # Native and remote GPU timing summary
 
-Last updated: 2026-08-21
+Last updated: 2026-08-22
 
 “Native” is direct execution on the RTX 5090 in `ws-5090-1`. “Remote” is
 execution from `ws-5090-2` on that same GPU through the current optimized
@@ -15,19 +15,25 @@ so close results should be interpreted as ranges rather than absolute rankings.
 This comparison uses the private `ali` serving setup without modifying it:
 Qwen3.8 27B NVFP4 weights, INT8 KV cache, and three-token MTP. Native ran on
 the local RTX 5090 in `ws-5090-2`; remote ran unchanged from that machine on
-the RTX 5090 in `ws-5090-1` over direct 10 GbE. Both measured servers disabled
-CUDA Graphs and prefix reuse. Five deterministic requests generated identical
-token sequences, eliminating speculative-acceptance and cache noise.
+the RTX 5090 in `ws-5090-1` over direct 10 GbE. The current primary comparison
+uses NInfer's default CUDA Graph path with prefix reuse disabled. Five
+deterministic requests generated identical token sequences. A separate short
+run also hashed the complete streamed output and obtained the same SHA-256
+digest natively and remotely.
 
 | Profile | Metric | Native | Remote | Remote/native | Result |
 |---|---|---:|---:|---:|---|
-| 257-token prompt, 512-token generation | Decode throughput | 202.65 tok/s | 176.07 tok/s | 0.869× | Pass; host-control/RTT bound |
+| 257-token prompt, 512-token generation, CUDA Graphs | Decode throughput | 204.26 tok/s | 197.43 tok/s | 0.967× | Pass; 3.3% below native |
+| Same | Time to first token | 53.72 ms | 59.88 ms | 1.115× | Pass |
+| Same | Request wall time | 2.555 s | 2.648 s | 1.036× | Pass |
+| Model initialization, CUDA Graphs | Model loaded | 4.534 s | 23.492 s | 5.182× | Pass; 19.73 GiB weights cross 10 GbE |
+| Prior no-graph baseline, 257 + 512 tokens | Decode throughput | 202.65 tok/s | 176.07 tok/s | 0.869× | Pass; retained for comparison |
 | Same | Time to first token | 53.90 ms | 58.80 ms | 1.091× | Pass |
 | Same | Request wall time | 2.577 s | 2.960 s | 1.149× | Pass |
 | 15,613-token prompt, 16-token generation | Prefill throughput to first token | 8,358.53 tok/s | 8,294.75 tok/s | 0.992× | Pass; near native |
 | Same | Time to first token | 1.868 s | 1.882 s | 1.008× | Pass |
 | Same | Request wall time | 1.934 s | 1.960 s | 1.013× | Pass |
-| Model initialization | Model loaded | 3.614 s | 21.679 s | 5.999× | Pass; 19.73 GiB weights cross 10 GbE |
+| Prior no-graph model initialization | Model loaded | 3.614 s | 21.679 s | 5.999× | Pass; retained for comparison |
 
 ## Current performance-focused results
 
@@ -156,6 +162,15 @@ the performance rows above use matched optimized profiles and longer measured
 windows.
 
 ## Optimization outcomes
+
+- Remote CUDA Graph decode for Qwen3.8 27B now reaches 197.43 tok/s versus
+  204.26 tok/s native. This is 3.26× the original broken graph result of
+  60.56 tok/s and faster than the prior 176.07 tok/s no-graph remote path.
+- Registered CUDA fatbins are materialized once before graph-memory accounting,
+  reducing NInfer's observed graph reservation from 96 MiB to 2 MiB. Dynamic
+  pinned-host inputs are mirrored with dirty-page propagation before replay;
+  graph updates now rebind their capture resources. This preserves changing
+  inputs across replay and update instead of replaying stale staging data.
 
 - Device-only `cuMemcpy2DAsync` now remains asynchronous across the RPC
   boundary instead of synchronizing the remote stream for every copy. This

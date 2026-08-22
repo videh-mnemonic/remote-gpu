@@ -1,15 +1,127 @@
 #include <cuda.h>
 #include <dlfcn.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <cstdio>
 #include <mutex>
+#include <vector>
 
 extern "C" int lupine_launch_runtime_anchor_kernel();
 extern "C" int lupine_restore_default_context_hint();
 extern "C" int lupine_repair_current_context_device(int device);
 
 static thread_local int lupine_runtime_device = -1;
+
+struct lupine_registered_runtime_function {
+  void **fatbin = nullptr;
+  const void *host_function = nullptr;
+  bool warmed = false;
+};
+
+static std::mutex &lupine_registered_runtime_function_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+static std::vector<lupine_registered_runtime_function> &
+lupine_registered_runtime_functions() {
+  static std::vector<lupine_registered_runtime_function> functions;
+  return functions;
+}
+
+// Remember compiler-registered host symbols so runtime memory queries can
+// materialize each fatbin before reporting free memory while the remote driver
+// itself remains in lazy mode. Set LUPINE_PRELOAD_REGISTERED_KERNELS=0 to opt
+// out. This keeps allocators and graph builders from charging later module
+// initialization to their own memory budget.
+extern "C" void __cudaRegisterFunction(
+    void **fatbin, const char *host_function, char *device_function,
+    const char *device_name, int thread_limit, void *thread_id,
+    void *block_id, void *block_dim, void *grid_dim, int *warp_size) {
+  using real_fn_t = void (*)(void **, const char *, char *, const char *, int,
+                             void *, void *, void *, void *, int *);
+  static real_fn_t real = reinterpret_cast<real_fn_t>(
+      dlsym(RTLD_NEXT, "__cudaRegisterFunction"));
+  if (real != nullptr) {
+    real(fatbin, host_function, device_function, device_name, thread_limit,
+         thread_id, block_id, block_dim, grid_dim, warp_size);
+  }
+  if (fatbin != nullptr && host_function != nullptr) {
+    std::lock_guard<std::mutex> lock(
+        lupine_registered_runtime_function_mutex());
+    lupine_registered_runtime_functions().push_back(
+        {fatbin, host_function, false});
+  }
+}
+
+extern "C" void __cudaUnregisterFatBinary(void **fatbin) {
+  using real_fn_t = void (*)(void **);
+  static real_fn_t real = reinterpret_cast<real_fn_t>(
+      dlsym(RTLD_NEXT, "__cudaUnregisterFatBinary"));
+  {
+    std::lock_guard<std::mutex> lock(
+        lupine_registered_runtime_function_mutex());
+    auto &functions = lupine_registered_runtime_functions();
+    functions.erase(
+        std::remove_if(functions.begin(), functions.end(),
+                       [fatbin](const auto &entry) {
+                         return entry.fatbin == fatbin;
+                       }),
+        functions.end());
+  }
+  if (real != nullptr) real(fatbin);
+}
+
+extern "C" int cudaMemGetInfo(size_t *free_bytes, size_t *total_bytes) {
+  using mem_info_fn_t = int (*)(size_t *, size_t *);
+  using attributes_fn_t = int (*)(void *, const void *);
+  static mem_info_fn_t real_mem_info = reinterpret_cast<mem_info_fn_t>(
+      dlsym(RTLD_NEXT, "cudaMemGetInfo"));
+  static attributes_fn_t real_attributes = reinterpret_cast<attributes_fn_t>(
+      dlsym(RTLD_NEXT, "cudaFuncGetAttributes"));
+  static thread_local bool warming = false;
+
+  const char *preload = std::getenv("LUPINE_PRELOAD_REGISTERED_KERNELS");
+  if (!warming && (preload == nullptr || preload[0] != '0') &&
+      real_attributes != nullptr) {
+    std::vector<lupine_registered_runtime_function> pending;
+    {
+      std::lock_guard<std::mutex> lock(
+          lupine_registered_runtime_function_mutex());
+      for (const auto &entry : lupine_registered_runtime_functions()) {
+        if (entry.warmed) continue;
+        const bool fatbin_pending =
+            std::any_of(pending.begin(), pending.end(), [&](const auto &item) {
+              return item.fatbin == entry.fatbin;
+            });
+        if (!fatbin_pending) pending.push_back(entry);
+      }
+    }
+    warming = true;
+    size_t warmed_count = 0;
+    for (const auto &item : pending) {
+      alignas(std::max_align_t) unsigned char attributes[1024] = {};
+      if (real_attributes(attributes, item.host_function) == 0) {
+        ++warmed_count;
+        std::lock_guard<std::mutex> lock(
+            lupine_registered_runtime_function_mutex());
+        for (auto &entry : lupine_registered_runtime_functions()) {
+          if (entry.fatbin == item.fatbin) entry.warmed = true;
+        }
+      }
+    }
+    warming = false;
+    if (std::getenv("LUPINE_CUDART_COMPAT_DEBUG") != nullptr) {
+      std::fprintf(stderr,
+                   "lupine-cudart: preloaded %zu/%zu registered fatbins\n",
+                   warmed_count, pending.size());
+    }
+  }
+  return real_mem_info == nullptr ? 999
+                                  : real_mem_info(free_bytes, total_bytes);
+}
 
 // CUDA 13 NCCL requires the query-status output from this Runtime API. With an
 // interposed libcuda, libcudart falls back to the legacy four-argument Driver

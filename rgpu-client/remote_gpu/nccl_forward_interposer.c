@@ -345,7 +345,7 @@ ncclResult_t ncclCommInitRankScalable(ncclComm_t *comm, int ranks, int rank,
                                       int id_count, ncclUniqueId *ids,
                                       ncclConfig_t *config) {
   TRACE(ncclCommInitRankScalable);
-  /* A scalable init carries a variable-length ID array, which protocol v5
+  /* A scalable init carries a variable-length ID array, which protocol v6
      cannot encode.  Never pass remote handles into the local NCCL library. */
   if (remote_enabled()) return 5; /* ncclInvalidUsage */
   return pncclCommInitRankScalable(comm, ranks, rank, id_count, ids, config);
@@ -403,7 +403,7 @@ ncclResult_t ncclCommInitAll(ncclComm_t *comms, int devices,
     if (route_id < -1) return 4;
     for (int previous = 0; route_id >= 0 && previous < rank; ++previous) {
       /* Multiple devices behind one server need a grouped server-side init,
-         which is not representable in protocol v5. */
+         which is not representable in protocol v6. */
       if (ranks[previous].route_id == route_id) return 5;
     }
     ranks[rank].comm = &comms[rank];
@@ -825,7 +825,7 @@ ncclResult_t ncclWinGetUserPtr(ncclComm_t comm, ncclWindow_t window,
 }
 
 /* Remaining extended APIs must not resolve through libnccl_real for a remote
-   communicator. Protocol v5 does not encode their arguments yet, so return a
+   communicator. Protocol v6 does not encode their arguments yet, so return a
    documented NCCL error instead of risking local dereferences of remote
    pointers or handles. */
 #define REMOTE_UNSUPPORTED(name, signature, arguments, predicate)             \

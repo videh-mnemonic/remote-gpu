@@ -56,7 +56,7 @@ def family(name: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--image", default="remote-gpu-pytorch-opinfo:nccl-rpc-v5"
+        "--image", default="remote-gpu-pytorch-opinfo:nccl-rpc-v6"
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
