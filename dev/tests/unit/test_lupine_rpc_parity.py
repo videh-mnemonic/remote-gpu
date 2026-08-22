@@ -58,6 +58,26 @@ def test_tiled_tensor_map_driver_api_has_manual_rpc_on_both_sides() -> None:
     assert "LUPINE_TENSOR_MAP_MAX_RANK = 5" in wire
 
 
+def test_repeated_tensor_maps_are_cached_by_complete_request_and_route() -> None:
+    client = (LUPINE_ROOT / "client.cpp").read_text()
+
+    assert "kMaxCachedTensorMaps" in client
+    assert "sizeof(int) + sizeof(request)" in client
+    assert "lupine_route_identity(route)" in client
+    assert "cache->insert_or_assign(std::move(cache_key), encoded)" in client
+
+
+def test_device_only_async_2d_copy_is_fire_and_forget_on_both_sides() -> None:
+    client = (LUPINE_ROOT / "client.cpp").read_text()
+    handler = (LUPINE_ROOT / "manual_server.cpp").read_text()
+
+    condition = "async && src_host_size == 0 && dst_host_size == 0"
+    assert condition in client
+    assert "return rpc_write_end_deferred(conn)" in client
+    assert "if (src_host_size == 0 && dst_host_size == 0)" in handler
+    assert "result = cuMemcpy2DAsync_v2(&copy, stream)" in handler
+
+
 def test_extended_dot_rpc_is_defined_on_both_sides() -> None:
     protocol = (LUPINE_ROOT / "lupine_cublas.h").read_text()
     server = (LUPINE_ROOT / "manual_server.cpp").read_text()

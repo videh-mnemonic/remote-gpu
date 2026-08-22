@@ -5675,8 +5675,23 @@ static CUresult lupine_cuMemcpy2D_common(const CUDA_MEMCPY2D *pCopy,
       rpc_write(conn, &src_host_size, sizeof(src_host_size)) < 0 ||
       (src_host_size != 0 && rpc_write(conn, src_host, src_host_size) < 0) ||
       rpc_write(conn, &dst_host_size, sizeof(dst_host_size)) < 0 ||
-      (async && rpc_write(conn, &stream, sizeof(stream)) < 0) ||
-      rpc_wait_for_response(conn) < 0 ||
+      (async && rpc_write(conn, &stream, sizeof(stream)) < 0)) {
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+
+  // A device-to-device async 2D copy owns no client memory and produces no
+  // immediate output. Preserve CUDA's asynchronous contract and batch it with
+  // adjacent launches instead of synchronizing the remote stream merely to
+  // return CUDA_SUCCESS. Copies involving host memory retain the synchronous
+  // compatibility path because the server-side staging buffers must remain
+  // alive until the transfer completes.
+  if (async && src_host_size == 0 && dst_host_size == 0) {
+    return rpc_write_end_deferred(conn) < 0
+               ? CUDA_ERROR_DEVICE_UNAVAILABLE
+               : CUDA_SUCCESS;
+  }
+
+  if (rpc_wait_for_response(conn) < 0 ||
       rpc_read(conn, &returned_dst_size, sizeof(returned_dst_size)) < 0) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
@@ -9022,6 +9037,29 @@ extern "C" CUresult cuTensorMapEncodeTiled(
   request.l2_promotion = static_cast<std::uint32_t>(l2Promotion);
   request.oob_fill = static_cast<std::uint32_t>(oobFill);
 
+  // Tensor-map encoding is a pure metadata operation for a given route and
+  // request. Modern attention kernels rebuild the same descriptors before
+  // nearly every launch; doing that on the server turns each rebuild into a
+  // synchronous network round trip. Cache successful descriptors locally.
+  // Include the translated global address in the key (it is part of request)
+  // and the route identity so pointer reuse and multi-GPU routing stay safe.
+  static auto *cache =
+      new std::unordered_map<std::string, CUtensorMap>();
+  static auto *cache_mutex = new std::mutex();
+  constexpr std::size_t kMaxCachedTensorMaps = 16384;
+  std::string cache_key(sizeof(int) + sizeof(request), '\0');
+  const int route_id = lupine_route_identity(route);
+  std::memcpy(cache_key.data(), &route_id, sizeof(route_id));
+  std::memcpy(cache_key.data() + sizeof(route_id), &request, sizeof(request));
+  {
+    std::lock_guard<std::mutex> lock(*cache_mutex);
+    auto cached = cache->find(cache_key);
+    if (cached != cache->end()) {
+      *tensorMap = cached->second;
+      return CUDA_SUCCESS;
+    }
+  }
+
   CUtensorMap encoded{};
   conn_t *conn = lupine_route_remote_conn(route);
   if (conn == nullptr ||
@@ -9034,6 +9072,11 @@ extern "C" CUresult cuTensorMapEncodeTiled(
   }
   if (result == CUDA_SUCCESS) {
     *tensorMap = encoded;
+    std::lock_guard<std::mutex> lock(*cache_mutex);
+    if (cache->size() >= kMaxCachedTensorMaps) {
+      cache->clear();
+    }
+    cache->insert_or_assign(std::move(cache_key), encoded);
   }
   return result;
 }

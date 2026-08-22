@@ -1,6 +1,6 @@
 # Native and remote GPU timing summary
 
-Last updated: 2026-08-20
+Last updated: 2026-08-21
 
 “Native” is direct execution on the RTX 5090 in `ws-5090-1`. “Remote” is
 execution from `ws-5090-2` on that same GPU through the current optimized
@@ -9,6 +9,25 @@ individual test is bounded below five minutes.
 
 Sub-millisecond and low-single-millisecond tests are sensitive to GPU clocks,
 so close results should be interpreted as ranges rather than absolute rankings.
+
+## Qwen3.8 27B NInfer serving
+
+This comparison uses the private `ali` serving setup without modifying it:
+Qwen3.8 27B NVFP4 weights, INT8 KV cache, and three-token MTP. Native ran on
+the local RTX 5090 in `ws-5090-2`; remote ran unchanged from that machine on
+the RTX 5090 in `ws-5090-1` over direct 10 GbE. Both measured servers disabled
+CUDA Graphs and prefix reuse. Five deterministic requests generated identical
+token sequences, eliminating speculative-acceptance and cache noise.
+
+| Profile | Metric | Native | Remote | Remote/native | Result |
+|---|---|---:|---:|---:|---|
+| 257-token prompt, 512-token generation | Decode throughput | 202.65 tok/s | 176.07 tok/s | 0.869× | Pass; host-control/RTT bound |
+| Same | Time to first token | 53.90 ms | 58.80 ms | 1.091× | Pass |
+| Same | Request wall time | 2.577 s | 2.960 s | 1.149× | Pass |
+| 15,613-token prompt, 16-token generation | Prefill throughput to first token | 8,358.53 tok/s | 8,294.75 tok/s | 0.992× | Pass; near native |
+| Same | Time to first token | 1.868 s | 1.882 s | 1.008× | Pass |
+| Same | Request wall time | 1.934 s | 1.960 s | 1.013× | Pass |
+| Model initialization | Model loaded | 3.614 s | 21.679 s | 5.999× | Pass; 19.73 GiB weights cross 10 GbE |
 
 ## Current performance-focused results
 
@@ -138,6 +157,18 @@ windows.
 
 ## Optimization outcomes
 
+- Device-only `cuMemcpy2DAsync` now remains asynchronous across the RPC
+  boundary instead of synchronizing the remote stream for every copy. This
+  raised the long-prompt NInfer prefill result from approximately 7,244 to
+  8,295 tok/s and brought it from 86.6% to 99.2% of native throughput.
+- Repeated tensor-map descriptors are cached by their complete request and GPU
+  route. In the profiled NInfer run this reduced server tensor-map encodes from
+  6,720 calls to 228, while retaining bounded storage and successful-result-only
+  caching.
+- Forced RPC coalescing windows of 0 and 20 microseconds both regressed NInfer;
+  the adaptive default remains selected. Deferred and immediate pipelining of
+  validated cooperative extended launches also produced no material decode
+  gain, so that added protocol complexity was rejected.
 - Immutable metadata caches and correct invalidation removed the original
   high-rate pointer/function query bottleneck.
 - Deferred asynchronous command coalescing remains enabled for small ordered

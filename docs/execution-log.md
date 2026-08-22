@@ -1,5 +1,37 @@
 # Execution log
 
+## 2026-08-21 — Qwen3.8 27B NInfer serving optimization
+
+- Ran the unmodified private `ali` Qwen3.8 27B NVFP4 serving image natively on
+  `ws-5090-2` and through strict rgpu execution on `ws-5090-1`. The benchmark
+  client uses bounded OpenAI-compatible streaming requests and records startup,
+  time to first token, wall time, prefill throughput, and decode throughput.
+- The first remote run exposed one compatibility issue: NInfer's CUDA Graph
+  memory budget observes 96 MiB of lazy-loaded remote modules versus its 82 MiB
+  allowance. The supported `--no-cuda-graph` mode runs successfully. A
+  server-side eager-module experiment passed the memory check but failed a
+  cooperative extended launch, so it was rejected and no eager-loading option
+  remains in the CLI.
+- RPC profiling found that device-only `cuMemcpy2DAsync` incorrectly waited for
+  a response and synchronized the remote stream. It is now fire-and-forget;
+  copies involving host memory retain synchronized staging-buffer lifetime.
+  Long-prompt prefill improved from approximately 7,244 to 8,295 tok/s, or
+  from 86.6% to 99.2% of matched native throughput.
+- Added a bounded, route-aware successful-result cache for pure tensor-map
+  encoding. It reduced profiled remote encodes from 6,720 to 228 calls. Tests
+  cover both optimizations, the complete GPU-free suite passes 88/88, and a
+  release-image remote transpose/copy checksum passes on the RTX 5090.
+- Deterministic five-run results with prefix reuse disabled are 176.07 versus
+  202.65 tok/s for decode and 8,294.75 versus 8,358.53 tok/s for long-prompt
+  prefill. The remaining decode gap is host-control bound: MTP requires a host
+  decision every speculative round over a direct link whose measured average
+  RTT was 0.34 ms. Two extended-launch pipeline variants and fixed coalescing
+  policies did not materially improve it and were removed.
+- Promoted the optimized client and host images and deployed the host image
+  without restarting the existing persistent attachment or modifying either
+  NVIDIA driver stack. The normal `ali` server was restored and its health
+  endpoint passes.
+
 ## 2026-08-21 — production-oriented source layout
 
 - Promoted the fully integrated LUPINE-derived runtime from a disposable

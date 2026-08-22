@@ -1796,6 +1796,12 @@ static int handle_manual_cuMemcpy2D_common(conn_t *conn, bool async,
 
   if (async) {
     result = cuMemcpy2DAsync_v2(&copy, stream);
+    if (src_host_size == 0 && dst_host_size == 0) {
+      // The matching client call is fire-and-forget, just like generated
+      // device-only async copies. CUDA stream ordering reports any deferred
+      // execution error at the application's next synchronization boundary.
+      return 0;
+    }
     if (result == CUDA_SUCCESS) {
       result = cuStreamSynchronize(stream);
     }
