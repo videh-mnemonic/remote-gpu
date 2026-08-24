@@ -1,5 +1,40 @@
 # Execution log
 
+## 2026-08-23 — transparent mixed host-wide release gate
+
+- Upgraded the live attachment to release 0.2.0/wire protocol 6 without
+  changing the local NVIDIA driver, kernel modules, packages, device nodes, or
+  `nvidia-smi`. Ordinary host `nvidia-smi -L` enumerates the local RTX 5090 as
+  GPU 0 and the remote RTX 5090 as GPU 1. The independent physical-stack
+  fingerprint and vendor-only health snapshot remain unchanged.
+- The live strict-remote PyTorch smoke passes all eight checks, including
+  `torch.compile` and CUDA Graph capture/replay. A deterministic NInfer
+  64-token request produced the expected output digest at 224.02 tok/s with
+  80.96 ms time to first token; model startup was 23.798 seconds.
+- Found that pip PyTorch's wheel RUNPATH can select its bundled CUDA libraries
+  ahead of the loader cache. Release 0.2.1 adds a profile-scoped Python
+  bootstrap that loads rgpu's CUDA and math-library routes only on the first
+  `torch` import. It avoids system-wide `LD_PRELOAD`; non-Torch Python remains
+  clean.
+- Fixed context-wide CUDA Graph synchronization so graph-owned device-to-host
+  copies are published after `torch.cuda.synchronize(device)`, not only after
+  explicit stream synchronization. Pending graph copies are consumed by the
+  first matching synchronization, preventing a later unrelated synchronize
+  from rewriting application-owned host memory. Dynamic pinned-host replay now
+  returns the expected changing values across repeated launches.
+- The complete 0.2.1 client/server path passes a local-loopback host-wide gate:
+  two devices enumerate, local and remote kernels agree, mixed cuBLAS training
+  is exact for float32/float16/bfloat16, remote `torch.compile` passes, and
+  dynamic CUDA Graph replay returns 22, 38, and 92. The bounded gate completes
+  in 5.21 seconds.
+- Corrected a diagnostic false alarm: the apparent 245-descriptor server was
+  remote PID 1 (`systemd`) observed through the host PID namespace. The actual
+  idle Lupine parent has four descriptors and no connection children. No
+  lifecycle patch was needed.
+- The live workstation remains attached to 0.2.0 while 0.2.1 is finalized. A
+  final live detach/reattach and remote acceptance run are still required
+  before calling 0.2.1 validated on the physical two-host path.
+
 ## 2026-08-22 — correct, near-native NInfer CUDA Graph replay
 
 - Fixed NInfer's graph startup failure without changing NInfer. The client now

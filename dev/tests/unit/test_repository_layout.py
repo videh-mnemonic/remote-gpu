@@ -16,6 +16,8 @@ def test_product_and_development_boundaries_are_explicit() -> None:
     assert (ROOT / "rgpu-host/containers/server-overlay/Dockerfile").is_file()
     assert (ROOT / "rgpu-host/check.sh").is_file()
     assert (ROOT / "lupine/CMakeLists.txt").is_file()
+    assert (ROOT / "dev/tools/hostwide_acceptance.py").is_file()
+    assert (ROOT / "dev/tests/workloads/hostwide_mixed_acceptance.py").is_file()
 
 
 def test_build_uses_canonical_lupine_without_patch_replay() -> None:
@@ -31,7 +33,7 @@ def test_build_uses_canonical_lupine_without_patch_replay() -> None:
 
 def test_release_artifacts_share_one_version() -> None:
     version = (ROOT / "rgpu-client/remote_gpu/version.py").read_text(encoding="utf-8")
-    assert '__version__ = "0.2.0"' in version
+    assert '__version__ = "0.2.1"' in version
     assert 'WIRE_PROTOCOL_VERSION = "6"' in version
 
     transport = (ROOT / "lupine/h2.cpp").read_text(encoding="utf-8")

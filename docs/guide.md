@@ -1,6 +1,6 @@
 # rgpu deployment and engineering guide
 
-This document explains release `0.2.0`: how to deploy it, how the system is
+This document explains release `0.2.1`: how to deploy it, how the system is
 constructed, which semantics are currently supported, where performance comes
 from, and how to recover safely. For a first run, start with the concise
 [README](../README.md).
@@ -74,9 +74,12 @@ There are two exposure modes:
   container. Strict mode does not pass local NVIDIA devices into that
   container; `--include-local` deliberately exposes both sets of devices.
 - `rgpu attach` installs only rgpu-owned files under `/usr/local/lib/rgpu`, an
-  endpoint file, and an isolated loader configuration. Newly launched native
-  processes then resolve the interposed CUDA/NVML libraries normally. A
-  durable transaction journal makes detach and recovery resumable.
+  endpoint file, an isolated loader configuration, and
+  `/etc/profile.d/rgpu.sh`. Newly launched native processes then resolve the
+  interposed CUDA/NVML libraries normally. Python defers loading the RPC math
+  libraries until the first `torch` import, so ordinary non-PyTorch Python
+  processes do not initialize CUDA. A durable transaction journal makes detach
+  and recovery resumable.
 
 This is userspace virtualization, not a virtual PCI device or replacement
 kernel driver. It makes NVML and CUDA consumers such as `nvidia-smi` and
@@ -86,18 +89,18 @@ client.
 
 ## Release artifacts
 
-Release `0.2.0` consists of artifacts that share one version and wire-protocol
+Release `0.2.1` consists of artifacts that share one version and wire-protocol
 contract:
 
 | Artifact | Role |
 |---|---|
-| `remote_gpu-0.2.0-py3-none-any.whl` | `rgpu`, `rgpu-rescue`, orchestration, and safe attachment logic |
-| `remote-gpu-client:0.2.0` | Self-contained injectable CUDA/NVML shim plus math-library and NCCL interposers |
-| `remote-gpu-host:0.2.0` | GPU-side LUPINE server and compatible CUDA userspace |
-| `remote-gpu-workload:0.2.0` | Validated default PyTorch workload; optional when supplying another image |
+| `remote_gpu-0.2.1-py3-none-any.whl` | `rgpu`, `rgpu-rescue`, orchestration, and safe attachment logic |
+| `remote-gpu-client:0.2.1` | Self-contained injectable CUDA/NVML shim plus math-library and NCCL interposers |
+| `remote-gpu-host:0.2.1` | GPU-side LUPINE server and compatible CUDA userspace |
+| `remote-gpu-workload:0.2.1` | Validated default PyTorch workload; optional when supplying another image |
 
 `python3 dev/tools/build_release.py` rebuilds those images, builds the wheel,
-and writes a manifest and SHA-256 checksums under `dev/releases/0.2.0`.
+and writes a manifest and SHA-256 checksums under `dev/releases/0.2.1`.
 `--export-images` also emits compressed OCI archives for an offline/private
 release. The CLI refuses a client/server image mismatch and protocol revision
 mismatch before dispatching GPU work.
@@ -133,13 +136,20 @@ loaded images:
 ./rgpu-client/install.sh \
   --host mnemonic-1@10.77.77.1 \
   --skip-build \
-  --wheel dev/releases/0.2.0/wheels/remote_gpu-0.2.0-py3-none-any.whl
+  --wheel dev/releases/0.2.1/wheels/remote_gpu-0.2.1-py3-none-any.whl
 ```
 
 Upgrade while detached: run `rgpu detach` if host-wide mode is active, install
 the new wheel and matching images, run `rgpu deploy`, then attach again. The
 image identity and protocol checks prevent a partial client/server upgrade
 from being used accidentally. Reinstalling the same version is idempotent.
+
+After a live attach, open a new terminal or start a new login shell before
+launching PyTorch. `nvidia-smi` sees the remote device immediately through the
+loader cache, but an existing shell cannot retroactively inherit the profile
+environment. rgpu deliberately does not write `/etc/ld.so.preload`: that would
+inject its libraries into every host process and create an unnecessary safety
+boundary.
 
 Installation also provides `rgpu-rescue`, a local-only recovery path for an
 interrupted host-wide transaction. It does not contact remote hosts and refuses

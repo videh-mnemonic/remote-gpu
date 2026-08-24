@@ -338,6 +338,7 @@ def prepare_shim_bundle(image: str) -> Path:
         bundle / "lib" / "libunsupported_rpc_guard.so",
         bundle / "lib" / "libnccl.so.2",
         bundle / "lib" / "libnccl_real.so.2",
+        bundle / "python" / "sitecustomize.py",
     )
     if all(path.is_file() for path in required):
         return bundle
@@ -348,6 +349,7 @@ def prepare_shim_bundle(image: str) -> Path:
     try:
         (temporary / "lib").mkdir()
         (temporary / "bin").mkdir()
+        (temporary / "python").mkdir()
         container_id = require_success(
             run_checked(["docker", "create", image, "true"]),
             f"create shim extraction container from {image}",
@@ -379,6 +381,17 @@ def prepare_shim_bundle(image: str) -> Path:
                 [
                     "docker",
                     "cp",
+                    f"{container_id}:/opt/rgpu/python/.",
+                    str(temporary / "python"),
+                ]
+            ),
+            f"extract Python bootstrap from {image}",
+        )
+        require_success(
+            run_checked(
+                [
+                    "docker",
+                    "cp",
                     f"{container_id}:/usr/bin/nvidia-smi",
                     str(temporary / "bin" / "nvidia-smi"),
                 ]
@@ -397,6 +410,7 @@ def prepare_shim_bundle(image: str) -> Path:
             temporary / "lib" / "libunsupported_rpc_guard.so",
             temporary / "lib" / "libnccl.so.2",
             temporary / "lib" / "libnccl_real.so.2",
+            temporary / "python" / "sitecustomize.py",
         )
         if not all(path.is_file() for path in extracted):
             raise RgpuError(f"shim image {image} is missing required runtime files")
@@ -847,6 +861,11 @@ def command_attach(args: argparse.Namespace) -> int:
             indent=2,
         )
     )
+    if live:
+        print(
+            "nvidia-smi is ready now; open a new terminal or start a new "
+            "login shell before launching transparent host-wide PyTorch."
+        )
     return 0
 
 

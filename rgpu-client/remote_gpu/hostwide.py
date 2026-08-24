@@ -19,8 +19,34 @@ class HostwideError(RuntimeError):
 STATE_PATH = Path("var/lib/rgpu/state.json")
 BACKUP_ROOT = Path("var/lib/rgpu/backups")
 LIB_ROOT = Path("usr/local/lib/rgpu")
+PYTHON_ROOT = LIB_ROOT / "python"
 ENDPOINT_PATH = Path("etc/rgpu/endpoints")
 LOADER_PATH = Path("etc/ld.so.conf.d/00-rgpu.conf")
+PROFILE_PATH = Path("etc/profile.d/rgpu.sh")
+
+
+def _profile_text() -> str:
+    return """# Managed by rgpu; removed transactionally by `rgpu detach`.
+if [ -d /usr/local/lib/rgpu/python ]; then
+  case ":${LD_LIBRARY_PATH-}:" in
+    *:/usr/local/lib/rgpu:*) ;;
+    *) LD_LIBRARY_PATH="/usr/local/lib/rgpu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+  esac
+  export LD_LIBRARY_PATH
+  case ":${PYTHONPATH-}:" in
+    *:/usr/local/lib/rgpu/python:*) ;;
+    *) PYTHONPATH="/usr/local/lib/rgpu/python${PYTHONPATH:+:$PYTHONPATH}" ;;
+  esac
+  export PYTHONPATH
+  RGPU_HOSTWIDE_PYTHON=${RGPU_HOSTWIDE_PYTHON:-1}
+  RGPU_MIXED_PYTORCH_PRIME=${RGPU_MIXED_PYTORCH_PRIME:-1}
+  RGPU_CUFFT_RPC=${RGPU_CUFFT_RPC:-1}
+  DISABLE_ADDMM_CUDA_LT=${DISABLE_ADDMM_CUDA_LT:-1}
+  TORCH_LINALG_PREFER_CUSOLVER=${TORCH_LINALG_PREFER_CUSOLVER:-1}
+  export RGPU_HOSTWIDE_PYTHON RGPU_MIXED_PYTORCH_PRIME RGPU_CUFFT_RPC
+  export DISABLE_ADDMM_CUDA_LT TORCH_LINALG_PREFER_CUSOLVER
+fi
+"""
 
 
 def _inside(root: Path, relative: Path) -> Path:
@@ -159,6 +185,16 @@ def install(
         LIB_ROOT / "libnvidia-ml.so.1": shim_bundle / "lib" / "libnvidia-ml.so.1",
         LIB_ROOT / "liblupine-cudart-compat.so":
             shim_bundle / "lib" / "liblupine-cudart-compat.so",
+        LIB_ROOT / "libcudart.so.13": shim_bundle / "lib" / "libcudart.so.13",
+        LIB_ROOT / "libcublas_rpc.so": shim_bundle / "lib" / "libcublas_rpc.so",
+        LIB_ROOT / "libcusolver_rpc.so": shim_bundle / "lib" / "libcusolver_rpc.so",
+        LIB_ROOT / "libcufft_rpc.so": shim_bundle / "lib" / "libcufft_rpc.so",
+        LIB_ROOT / "libunsupported_rpc_guard.so":
+            shim_bundle / "lib" / "libunsupported_rpc_guard.so",
+        LIB_ROOT / "libnccl.so.2": shim_bundle / "lib" / "libnccl.so.2",
+        LIB_ROOT / "libnccl_real.so.2": shim_bundle / "lib" / "libnccl_real.so.2",
+        PYTHON_ROOT / "sitecustomize.py":
+            shim_bundle / "python" / "sitecustomize.py",
     }
     missing = [str(source) for source in sources.values() if not source.is_file()]
     if missing:
@@ -170,6 +206,7 @@ def install(
         LIB_ROOT / "libnvidia-ml.so",
         ENDPOINT_PATH,
         LOADER_PATH,
+        PROFILE_PATH,
     ]
     backups = {str(relative): _backup(root, relative) for relative in managed}
 
@@ -182,6 +219,7 @@ def install(
         f"{endpoint_text}\n".encode("utf-8")
     )
     desired[str(LOADER_PATH)] = _fingerprint_bytes(b"/usr/local/lib/rgpu\n")
+    desired[str(PROFILE_PATH)] = _fingerprint_bytes(_profile_text().encode("utf-8"))
     state: dict[str, object] = {
         "schema": 1,
         "phase": "installing",
@@ -199,13 +237,15 @@ def install(
 
     try:
         for relative, source in sources.items():
-            _atomic_copy(source, _inside(root, relative), 0o755)
+            mode = 0o644 if relative.suffix == ".py" else 0o755
+            _atomic_copy(source, _inside(root, relative), mode)
         _atomic_symlink("libcuda.so.1", _inside(root, LIB_ROOT / "libcuda.so"))
         _atomic_symlink(
             "libnvidia-ml.so.1", _inside(root, LIB_ROOT / "libnvidia-ml.so")
         )
         _atomic_text(f"{endpoint_text}\n", _inside(root, ENDPOINT_PATH))
         _atomic_text("/usr/local/lib/rgpu\n", _inside(root, LOADER_PATH))
+        _atomic_text(_profile_text(), _inside(root, PROFILE_PATH))
         if refresh_loader:
             _refresh_loader(root)
 

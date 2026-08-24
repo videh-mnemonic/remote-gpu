@@ -5,7 +5,7 @@ were local. It supports a contained `rgpu run` mode and an experimental
 host-wide mode in which ordinary `nvidia-smi` and PyTorch processes see the
 remote GPU without a wrapper.
 
-> **Status:** experimental release `0.2.0`, validated on two Ubuntu
+> **Status:** experimental release `0.2.1`, validated on two Ubuntu
 > workstations with RTX 5090 GPUs, CUDA 13, PyTorch 2.12, Docker, NVIDIA
 > Container Toolkit, and direct 10 GbE. Do not deploy it on an untrusted
 > network.
@@ -55,10 +55,15 @@ still experimental. Stop local CUDA workloads before attaching.
 
 ```bash
 sudo "$(command -v rgpu)" attach --host USER@GPU_HOST
+# Open a new terminal (or start a new login shell) before launching Python.
 nvidia-smi
-python3 -c 'import torch; print(torch.cuda.get_device_name(0))'
+python3 -c 'import torch; print(torch.cuda.device_count()); print([torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])'
 sudo "$(command -v rgpu)" detach
 ```
+
+`nvidia-smi` is immediately transparent. PyTorch must be launched from a new
+login shell so it inherits rgpu's narrowly scoped CUDA-library path; attach
+does not inject a global `LD_PRELOAD` or alter an already-running shell.
 
 If an interrupted transaction cannot be resumed normally:
 

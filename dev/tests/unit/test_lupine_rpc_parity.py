@@ -103,6 +103,10 @@ def test_graph_replay_refreshes_host_inputs_and_tracks_updated_resources() -> No
     assert "lupine_enable_dirty_tracking_locked(it->first" in memory
     assert "lupine_begin_stream_capture_resources(stream)" in server
     assert "lupine_graph_exec_resource_map().insert_or_assign(exec, resources)" in server
+    assert "lupine_take_all_launched_graph_host_copies()" in server
+    assert "lupine_take_launched_graph_host_copies(stream)" in server
+    assert "lupine_note_launched_graph_resources(stream, resources)" in server
+    assert "lupine_write_graph_host_copies(conn, graph_copies)" in server
     assert "handle_manual_cuGraphExecUpdate" in dispatch
 
 

@@ -12,9 +12,22 @@ def shim_bundle(tmp_path: Path) -> Path:
     bundle = tmp_path / "bundle"
     library = bundle / "lib"
     library.mkdir(parents=True)
-    (library / "libcuda.so.1").write_bytes(b"remote cuda")
-    (library / "libnvidia-ml.so.1").write_bytes(b"remote nvml")
-    (library / "liblupine-cudart-compat.so").write_bytes(b"compat")
+    for name in (
+        "libcuda.so.1",
+        "libnvidia-ml.so.1",
+        "liblupine-cudart-compat.so",
+        "libcudart.so.13",
+        "libcublas_rpc.so",
+        "libcusolver_rpc.so",
+        "libcufft_rpc.so",
+        "libunsupported_rpc_guard.so",
+        "libnccl.so.2",
+        "libnccl_real.so.2",
+    ):
+        (library / name).write_bytes(f"test {name}".encode())
+    python = bundle / "python"
+    python.mkdir()
+    (python / "sitecustomize.py").write_text("# test bootstrap\n")
     return bundle
 
 
@@ -47,6 +60,10 @@ def test_sandbox_install_and_detach_are_reversible(tmp_path: Path):
     assert (root / "etc/ld.so.conf.d/00-rgpu.conf").read_text() == (
         "/usr/local/lib/rgpu\n"
     )
+    profile = (root / "etc/profile.d/rgpu.sh").read_text()
+    assert "RGPU_HOSTWIDE_PYTHON" in profile
+    assert "LD_PRELOAD" not in profile
+    assert (root / "usr/local/lib/rgpu/python/sitecustomize.py").is_file()
 
     uninstall(root, refresh_loader=False)
     assert original.read_text(encoding="utf-8") == "previous:14833\n"
@@ -166,10 +183,19 @@ def test_out_of_band_rescue_restores_without_gpu_libraries(tmp_path: Path):
         "usr/local/lib/rgpu/libcuda.so.1",
         "usr/local/lib/rgpu/libnvidia-ml.so.1",
         "usr/local/lib/rgpu/liblupine-cudart-compat.so",
+        "usr/local/lib/rgpu/libcudart.so.13",
+        "usr/local/lib/rgpu/libcublas_rpc.so",
+        "usr/local/lib/rgpu/libcusolver_rpc.so",
+        "usr/local/lib/rgpu/libcufft_rpc.so",
+        "usr/local/lib/rgpu/libunsupported_rpc_guard.so",
+        "usr/local/lib/rgpu/libnccl.so.2",
+        "usr/local/lib/rgpu/libnccl_real.so.2",
+        "usr/local/lib/rgpu/python/sitecustomize.py",
         "usr/local/lib/rgpu/libcuda.so",
         "usr/local/lib/rgpu/libnvidia-ml.so",
         "etc/rgpu/endpoints",
         "etc/ld.so.conf.d/00-rgpu.conf",
+        "etc/profile.d/rgpu.sh",
     ],
 )
 def test_install_recovers_after_each_managed_replacement_boundary(
@@ -237,10 +263,19 @@ def test_install_recovers_after_each_managed_replacement_boundary(
         "usr/local/lib/rgpu/libcuda.so.1",
         "usr/local/lib/rgpu/libnvidia-ml.so.1",
         "usr/local/lib/rgpu/liblupine-cudart-compat.so",
+        "usr/local/lib/rgpu/libcudart.so.13",
+        "usr/local/lib/rgpu/libcublas_rpc.so",
+        "usr/local/lib/rgpu/libcusolver_rpc.so",
+        "usr/local/lib/rgpu/libcufft_rpc.so",
+        "usr/local/lib/rgpu/libunsupported_rpc_guard.so",
+        "usr/local/lib/rgpu/libnccl.so.2",
+        "usr/local/lib/rgpu/libnccl_real.so.2",
+        "usr/local/lib/rgpu/python/sitecustomize.py",
         "usr/local/lib/rgpu/libcuda.so",
         "usr/local/lib/rgpu/libnvidia-ml.so",
         "etc/rgpu/endpoints",
         "etc/ld.so.conf.d/00-rgpu.conf",
+        "etc/profile.d/rgpu.sh",
     ],
 )
 def test_detach_resumes_after_each_managed_removal_boundary(

@@ -26,7 +26,46 @@ _original_import = builtins.__import__
 _torch_import_depth = 0
 _priming = False
 _primed = False
+_hostwide_preloaded = False
 _sdpa_original = None
+
+
+def _preload_hostwide_runtime() -> None:
+    """Load rgpu before a wheel-bundled CUDA RUNPATH can select libcuda.
+
+    A loader-cache entry is sufficient for ordinary ELF consumers such as
+    nvidia-smi, but pip PyTorch searches its bundled CUDA directory before the
+    cache.  Host-wide attachment opts Python into this narrowly scoped
+    bootstrap instead of using /etc/ld.so.preload, which would inject rgpu into
+    every process on the workstation.
+    """
+    if os.environ.get("RGPU_HOSTWIDE_PYTHON") != "1":
+        return
+    library_root = Path(
+        os.environ.get("RGPU_HOSTWIDE_LIB", "/usr/local/lib/rgpu")
+    )
+    libraries = (
+        "libcuda.so.1",
+        "liblupine-cudart-compat.so",
+        "libcublas_rpc.so",
+        "libcusolver_rpc.so",
+        "libcufft_rpc.so",
+        "libunsupported_rpc_guard.so",
+        "libnccl.so.2",
+    )
+    missing = [name for name in libraries if not (library_root / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            "rgpu host-wide Python runtime is incomplete: " + ", ".join(missing)
+        )
+    for name in libraries:
+        ctypes.CDLL(str(library_root / name), mode=ctypes.RTLD_GLOBAL)
+
+
+def _cublas_rpc_enabled() -> bool:
+    return os.environ.get("RGPU_HOSTWIDE_PYTHON") == "1" or (
+        "libcublas_rpc.so" in os.environ.get("LD_PRELOAD", "")
+    )
 
 
 def _enabled() -> bool:
@@ -41,7 +80,15 @@ def _enabled() -> bool:
 
 
 def _route_function():
-    library = os.environ.get("LUPINE_LIBCUDA", "/run/rgpu/lib/libcuda.so.1")
+    default_library = (
+        str(
+            Path(os.environ.get("RGPU_HOSTWIDE_LIB", "/usr/local/lib/rgpu"))
+            / "libcuda.so.1"
+        )
+        if os.environ.get("RGPU_HOSTWIDE_PYTHON") == "1"
+        else "/run/rgpu/lib/libcuda.so.1"
+    )
+    library = os.environ.get("LUPINE_LIBCUDA", default_library)
     driver = ctypes.CDLL(library)
     route = driver.lupine_cuda_device_route_id
     route.argtypes = [ctypes.c_int]
@@ -165,7 +212,7 @@ def _prime(torch) -> None:
     # The opt-in cuBLAS RPC layer also needs its remote handle/descriptor path
     # initialized before libcublas creates process-global state for a local
     # device. Use deterministic tensors so this does not initialize CUDA RNG.
-    if "libcublas_rpc.so" in os.environ.get("LD_PRELOAD", ""):
+    if _cublas_rpc_enabled():
         # MAGMA is another process-global CUDA library and cannot distinguish
         # local from remote contexts in one process. Keep mixed linalg on the
         # cuSOLVER surface that the RPC layer routes by opaque handle.
@@ -200,7 +247,7 @@ def _prime(torch) -> None:
     # operations restores PyTorch's default backend. Apply the remote-safe
     # preference after priming so small/non-square LU does not fall back to
     # MAGMA's process-global queue on a mixed local/remote process.
-    if "libcublas_rpc.so" in os.environ.get("LD_PRELOAD", ""):
+    if _cublas_rpc_enabled():
         linalg_backend = os.environ.get("RGPU_LINALG_BACKEND", "cusolver")
         if linalg_backend:
             torch.backends.cuda.preferred_linalg_library(linalg_backend)
@@ -229,8 +276,15 @@ def _cleanup_anchor() -> None:
 
 
 def _import(name, globals=None, locals=None, fromlist=(), level=0):
-    global _torch_import_depth, _primed, _priming
+    global _torch_import_depth, _primed, _priming, _hostwide_preloaded
     is_torch = name == "torch" or name.startswith("torch.")
+    if (
+        is_torch
+        and os.environ.get("RGPU_HOSTWIDE_PYTHON") == "1"
+        and not _hostwide_preloaded
+    ):
+        _preload_hostwide_runtime()
+        _hostwide_preloaded = True
     if is_torch:
         _torch_import_depth += 1
     try:
@@ -250,7 +304,7 @@ def _import(name, globals=None, locals=None, fromlist=(), level=0):
 
 
 if _enabled():
-    if "libcublas_rpc.so" in os.environ.get("LD_PRELOAD", ""):
+    if _cublas_rpc_enabled() and os.environ.get("RGPU_HOSTWIDE_PYTHON") != "1":
         # The SDPA wrapper must be installed after torch has finished assigning
         # its C-extension symbols. The general lazy import hook can fire while
         # torch.__init__ is still completing, at which point the builtin would
