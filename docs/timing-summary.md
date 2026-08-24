@@ -4,8 +4,8 @@ Last updated: 2026-08-24
 
 “Native” is direct execution on the RTX 5090 in `ws-5090-1`. “Remote” is
 execution from `ws-5090-2` on that same GPU through the current optimized
-runtime. Dependency installation and image build time are excluded. Every
-individual test is bounded below five minutes.
+runtime. Dependency installation and image build time are excluded. Tests are
+bounded below five minutes except the explicitly labeled real 1M-token runs.
 
 Sub-millisecond and low-single-millisecond tests are sensitive to GPU clocks,
 so close results should be interpreted as ranges rather than absolute rankings.
@@ -39,15 +39,28 @@ digest natively and remotely.
 
 This profile partitions the unmodified `ali` Qwen3.8 27B artifact at layer 32:
 eight full-attention KV-cache layers reside on each RTX 5090. The server reserves
-an INT8 KV cache for 1,048,576 tokens and uses a 1,024-token prefill chunk. Mixed
-two-device mode currently requires `--no-cuda-graph`; the remote half uses a
-chunked attention compatibility route because its large fused prompt kernel is
-not reliable through the RPC launch marshaller.
+an INT8 KV cache for 1,048,576 tokens. The original near-capacity result used a
+1,024-token prefill chunk; the current launcher uses the largest stable
+graph-enabled chunk of 1,536 tokens and overlaps consecutive chunks across the
+two stages. The
+remote half of each decode profile is captured and uploaded during startup;
+packed asynchronous control transfers cross the stage boundary. The remote half
+uses a chunked attention compatibility route because its large fused prompt
+kernel is not reliable through the RPC launch marshaller.
 
-| Profile | Metric | Native, one GPU | Local + remote | Pipeline/native | Result |
+| Profile | Metric | Reference | Current local + remote | Current/reference | Result |
 |---|---|---:|---:|---:|---|
+| 262,012-token prompt, 16-token generation | Prefill throughput | Sequential: 1,935.7 tok/s | Pipelined: 2,518.2 tok/s | 1.301× | Pass; exact same prompt/output counts; 135.95 s → 104.63 s wall |
+| 65,512-token prompt, 16-token generation | Prefill throughput | Sequential: 4,417.7 tok/s | Pipelined: 5,788.6 tok/s | 1.310× | Pass; 15.15 s → 11.62 s wall |
+| 4,092-token prompt, 42-token generation | Deterministic output | Sequential SHA-256: `05a1ea…3668` | Pipelined SHA-256: `05a1ea…3668` | Exact | Pass; hash covers generated text |
+| 1,048,412-token prompt, 23-token generation | Request wall time | Eager: 1,795.05 s | Graph: 1,794.43 s | 1.000× | Pass; real near-capacity prompt, identical token counts and output length |
+| Same | Prefill throughput | Eager: 584.7 tok/s | Graph: 584.9 tok/s | 1.000× | Compute-dominated; graph replay does not change quadratic prefill |
+| Same | Decode throughput at 1M frontier | Eager: 26.5 tok/s | Graph: 27.9 tok/s | 1.053× | Pass; startup-prewarmed graph avoids first-request capture cost |
+| 257-token prompt, 128-token generation | Decode throughput | Optimized eager: 66.89 tok/s | Graph: 70.93 tok/s | 1.060× | Pass; two runs, identical complete output SHA-256 |
+| Full 1M startup, graph profiles prewarmed | Model load | Eager: 10.19 s | Graph: 12.95 s | 1.271× | Pass; 2.76 s one-time prewarm avoids first-request capture |
+| Same | Observed graph memory | Eager: 0 MiB | Graph: 2 MiB | — | Pass; within the 12 MiB allowance |
 | 7,012-token prompt, one-token generation | Prefill throughput | 9,171.0 tok/s | 7,637.2 tok/s | 0.833× | Pass; identical request completes at full 1M reservation |
-| 35-token prompt, 128-token generation | Decode throughput | 74.3 tok/s | 63.1 tok/s | 0.849× | Pass; identical 128-token output |
+| Prior 35-token prompt, 128-token generation | Decode throughput | Native: 74.3 tok/s | Eager pipeline: 63.1 tok/s | 0.849× | Pass; retained as the pre-optimization comparison |
 | Full 1M startup | Local GPU memory | — | 28,202 MiB | — | Pass |
 | Full 1M startup | Remote GPU memory | — | 26,766 MiB | — | Pass |
 | Full 1M startup | Reported local slack | — | 3.66 GiB | — | Pass; 2K and 7K prompts complete |
@@ -56,7 +69,15 @@ The earlier 36/28-layer split allocated nine local cache layers and left only
 about 0.8 GiB of local slack. Rebalancing to 32/32 layers and eight cache layers
 per GPU made the full reservation usable by nontrivial prompts. Increasing the
 prefill chunk from 128 to 1,024 raised the 7K pipeline result from about 4,154 to
-7,637 tok/s; 2,048 was rejected because warmup was not stable.
+7,637 tok/s. Fusing each GDN layer's three Q/K/V extraction copies into one
+kernel made the remote prefill path reliable again, and 1,536 is now the largest
+stable graph-enabled chunk; 1,792 and 2,048 remain unstable. Pipelining
+non-terminal chunks raises measured prefill by about 30% at both 65K and 262K.
+Mixed-device
+graph replay plus packed/asynchronous controls raises the exact short decode
+gate from 66.89 to 70.93 tok/s. At a real 1M frontier it raises decode from 26.5
+to 27.9 tok/s, while end-to-end time remains dominated by 29.9 minutes of
+quadratic prefill.
 
 ## Current performance-focused results
 

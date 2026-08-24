@@ -1,0 +1,139 @@
+diff --git a/include/ninfer/ops/scatter.h b/include/ninfer/ops/scatter.h
+index bb30ba3..91a1129 100644
+--- a/include/ninfer/ops/scatter.h
++++ b/include/ninfer/ops/scatter.h
+@@ -71,4 +71,13 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
+ void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tensor& destination,
+                           cudaStream_t stream);
+ 
++/**
++ * Split one contiguous BF16 [D0+D1+D2,T] tensor into three contiguous tensors
++ * [D0,T], [D1,T], and [D2,T] in one launch. All row dimensions must be divisible
++ * by eight and every pointer must be 16-byte aligned. Copies are exact and the
++ * source must not alias any destination.
++ */
++void split_bf16_columns3(const Tensor& source, Tensor& destination0, Tensor& destination1,
++                         Tensor& destination2, cudaStream_t stream);
++
+ } // namespace ninfer::ops
+diff --git a/src/ops/kernel/scatter.cuh b/src/ops/kernel/scatter.cuh
+index 777e15a..087bd49 100644
+--- a/src/ops/kernel/scatter.cuh
++++ b/src/ops/kernel/scatter.cuh
+@@ -65,4 +65,28 @@ __global__ void scatter_bf16_batch_kernel(const uint4* __restrict__ source,
+     }
+ }
+ 
++__global__ void split_bf16_columns3_kernel(const uint4* __restrict__ source,
++                                           uint4* __restrict__ destination0,
++                                           uint4* __restrict__ destination1,
++                                           uint4* __restrict__ destination2,
++                                           std::int32_t vectors0, std::int32_t vectors1,
++                                           std::int32_t vectors2) {
++    const std::int32_t column = static_cast<std::int32_t>(blockIdx.x);
++    const std::int32_t total  = vectors0 + vectors1 + vectors2;
++    const std::int64_t source_base = static_cast<std::int64_t>(column) * total;
++    for (std::int32_t vector = static_cast<std::int32_t>(threadIdx.x); vector < total;
++         vector += static_cast<std::int32_t>(blockDim.x)) {
++        const uint4 value = source[source_base + vector];
++        if (vector < vectors0) {
++            destination0[static_cast<std::int64_t>(column) * vectors0 + vector] = value;
++        } else if (vector < vectors0 + vectors1) {
++            const std::int32_t offset = vector - vectors0;
++            destination1[static_cast<std::int64_t>(column) * vectors1 + offset] = value;
++        } else {
++            const std::int32_t offset = vector - vectors0 - vectors1;
++            destination2[static_cast<std::int64_t>(column) * vectors2 + offset] = value;
++        }
++    }
++}
++
+ } // namespace ninfer::ops
+diff --git a/src/ops/launcher/scatter.cu b/src/ops/launcher/scatter.cu
+index a7aada3..d52409c 100644
+--- a/src/ops/launcher/scatter.cu
++++ b/src/ops/launcher/scatter.cu
+@@ -46,4 +46,14 @@ void scatter_bf16_batch_launch(const Tensor& source, const Tensor& lanes,
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++void split_bf16_columns3_launch(const Tensor& source, Tensor& destination0, Tensor& destination1,
++                                Tensor& destination2, cudaStream_t stream) {
++    constexpr int block = 256;
++    split_bf16_columns3_kernel<<<source.ne[1], block, 0, stream>>>(
++        static_cast<const uint4*>(source.data), static_cast<uint4*>(destination0.data),
++        static_cast<uint4*>(destination1.data), static_cast<uint4*>(destination2.data),
++        destination0.ne[0] / 8, destination1.ne[0] / 8, destination2.ne[0] / 8);
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/launcher/scatter.h b/src/ops/launcher/scatter.h
+index 50ba2fb..a032ad0 100644
+--- a/src/ops/launcher/scatter.h
++++ b/src/ops/launcher/scatter.h
+@@ -10,4 +10,6 @@ void scatter_launch(const Tensor& src, const Tensor& indices, Tensor& dst, cudaS
+ void scatter_bf16_batch_launch(const Tensor& source, const Tensor& lanes,
+                                const Tensor& valid_columns, Tensor& destination,
+                                cudaStream_t stream);
++void split_bf16_columns3_launch(const Tensor& source, Tensor& destination0, Tensor& destination1,
++                                Tensor& destination2, cudaStream_t stream);
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/wrapper/scatter.cpp b/src/ops/wrapper/scatter.cpp
+index 9e5b58b..4844271 100644
+--- a/src/ops/wrapper/scatter.cpp
++++ b/src/ops/wrapper/scatter.cpp
+@@ -3,7 +3,9 @@
+ #include "core/device.h"
+ #include "ops/launcher/scatter.h"
+ 
++#include <array>
+ #include <cstddef>
++#include <cstdint>
+ #include <stdexcept>
+ 
+ namespace ninfer::ops {
+@@ -88,4 +90,28 @@ void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tens
+                                  cudaMemcpyDeviceToDevice, stream));
+ }
+ 
++void split_bf16_columns3(const Tensor& source, Tensor& destination0, Tensor& destination1,
++                         Tensor& destination2, cudaStream_t stream) {
++    const std::array<Tensor*, 3> destinations{&destination0, &destination1, &destination2};
++    std::int64_t rows = 0;
++    for (const Tensor* destination : destinations) {
++        if (destination->dtype != DType::BF16 || destination->ne[0] <= 0 ||
++            destination->ne[1] != source.ne[1] || destination->ne[2] != 1 ||
++            destination->ne[3] != 1 || !destination->is_contiguous() ||
++            destination->data == nullptr || (destination->ne[0] % 8) != 0 ||
++            (reinterpret_cast<std::uintptr_t>(destination->data) & 15U) != 0U) {
++            throw std::invalid_argument("split_bf16_columns3: invalid destination");
++        }
++        rows += destination->ne[0];
++    }
++    if (source.dtype != DType::BF16 || source.ne[0] != rows || source.ne[1] <= 0 ||
++        source.ne[2] != 1 || source.ne[3] != 1 || !source.is_contiguous() ||
++        source.data == nullptr || (reinterpret_cast<std::uintptr_t>(source.data) & 15U) != 0U ||
++        source.data == destination0.data || source.data == destination1.data ||
++        source.data == destination2.data) {
++        throw std::invalid_argument("split_bf16_columns3: invalid source or alias");
++    }
++    detail::split_bf16_columns3_launch(source, destination0, destination1, destination2, stream);
++}
++
+ } // namespace ninfer::ops
+diff --git a/src/targets/qwen3_6/impl/runtime/text_context_impl.h b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+index 4990f18..cff1f10 100644
+--- a/src/targets/qwen3_6/impl/runtime/text_context_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+@@ -929,9 +929,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
+         Tensor conv_state =
+             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
+         ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
+-        ops::extract_bf16_columns(qkv_c, 0, qc, s);
+-        ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
+-        ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
++        ops::split_bf16_columns3(qkv_c, qc, kc, vc, s);
+     }
+ 
+     Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});

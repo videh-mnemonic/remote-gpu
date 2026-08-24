@@ -1,0 +1,337 @@
+diff --git a/src/targets/qwen3_6/impl/runtime/program_impl.h b/src/targets/qwen3_6/impl/runtime/program_impl.h
+index 1c6a9d1..206fdf1 100644
+--- a/src/targets/qwen3_6/impl/runtime/program_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/program_impl.h
+@@ -237,9 +237,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
+         if (*stage_device == device.device) {
+             throw std::invalid_argument("pipeline stages must use distinct CUDA devices");
+         }
+-        if (speculative_backend != SpeculativeBackend::None || vision_enabled || use_cuda_graph) {
++        if (speculative_backend != SpeculativeBackend::None || vision_enabled) {
+             throw std::invalid_argument(
+-                "initial NInfer pipeline mode requires --spec none, text-only, and --no-cuda-graph");
++                "NInfer pipeline mode requires --spec none and text-only execution");
+         }
+         pipeline_device = std::make_unique<DeviceContext>(*stage_device);
+         pipeline_persistent = std::make_unique<DeviceArena>(plan.persistent.bytes);
+@@ -265,7 +265,18 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
+             schedule::TextPipelineStage{*pipeline_device, *pipeline_work, *pipeline_transfer,
+                                         pipeline_decoder->linear_attention, pipeline_io,
+                                         pipeline_prefill_hidden, pipeline_decoder->text_kv,
+-                                        *pipeline_hidden_bridge, *pipeline_control_bridge});
++                                        *pipeline_hidden_bridge, *pipeline_control_bridge, {}});
++        if (use_cuda_graph) {
++            const auto profiles = ordinary_graph_profiles(capacity);
++            validate_graph_profiles(profiles, capacity - 1, "pipeline ordinary");
++            pipeline_text_stage->decode_graphs.reserve(profiles.size());
++            for (const GraphExecutionProfile& profile : profiles) {
++                pipeline_text_stage->decode_graphs.emplace_back();
++                auto& graph                    = pipeline_text_stage->decode_graphs.back();
++                graph.min_execution_frontier   = profile.min;
++                graph.max_execution_frontier   = profile.max;
++            }
++        }
+         CUDA_CHECK(cudaMemsetAsync(pipeline_io.rope_delta.data, 0,
+                                    pipeline_io.rope_delta.bytes(), pipeline_device->stream));
+         for (Tensor& tensor : pipeline_decoder->linear_attention.conv) {
+@@ -371,6 +382,9 @@ ProgramImplCore::~ProgramImplCore() noexcept {
+     if (pipeline_device && pipeline_device->stream != nullptr) {
+         (void)cudaSetDevice(pipeline_device->device);
+         (void)cudaStreamSynchronize(pipeline_device->stream);
++        // CUDA Graph handles belong to the remote CUDA context. Destroy them while
++        // that device is current rather than relying on member destruction order.
++        pipeline_text_stage.reset();
+         (void)cudaSetDevice(device.device);
+     }
+ }
+@@ -1177,6 +1191,7 @@ void ProgramImplCore::prepare_graphs() {
+     SequenceState& sequence = sequences[0];
+ 
+     std::vector<PagedKVAllocation> text_capture_allocations;
++    std::vector<PagedKVAllocation> pipeline_text_capture_allocations;
+     std::vector<PagedKVAllocation> mtp_capture_allocations;
+     std::vector<PagedKVAllocation> dflash_capture_allocations;
+     const auto reserve_capture_rows = [&](qwen3_6::PagedKVCache& cache,
+@@ -1205,6 +1220,21 @@ void ProgramImplCore::prepare_graphs() {
+         }
+     };
+     reserve_capture_rows(decoder->text_kv, text_capture_allocations, "target KV cache");
++    if (pipeline_decoder && pipeline_device) {
++        CUDA_CHECK(cudaSetDevice(pipeline_device->device));
++        PagedKVPool& pool = pipeline_decoder->text_kv.pool();
++        pipeline_text_capture_allocations.push_back(pool.reserve(1));
++        PagedKVAllocation& allocation = pipeline_text_capture_allocations.back();
++        allocation.bind_row(0, pipeline_device->stream);
++        allocation.materialize_pages(1, pipeline_device->stream);
++        const std::int32_t page = allocation.page_ids().front();
++        std::vector<std::int32_t> repeated(pool.logical_page_capacity(), page);
++        Tensor table = pool.block_table_row(0);
++        CUDA_CHECK(cudaMemcpyAsync(table.data, repeated.data(), table.bytes(),
++                                   cudaMemcpyHostToDevice, pipeline_device->stream));
++        pipeline_device->synchronize();
++        CUDA_CHECK(cudaSetDevice(device.device));
++    }
+     if (speculative_backend == SpeculativeBackend::Mtp) {
+         reserve_capture_rows(*decoder->mtp_cache(), mtp_capture_allocations, "MTP KV cache");
+     } else if (speculative_backend == SpeculativeBackend::DFlash) {
+@@ -1371,27 +1401,41 @@ void ProgramImplCore::prepare_graphs() {
+         schedule::OrdinaryBatchContext ordinary_state{execution_core(),      decoder->text_kv,
+                                                       *io.ordinary,          *ordinary_host_ingress,
+                                                       *ordinary_host_egress, tail_hidden_store};
+-        const GraphExecutionProfile code_warm = ordinary_profiles.front();
+-        prepare_representative(code_warm.min, 1);
+-        device.synchronize();
+-        schedule::ordinary_decode_batch(ordinary_state, 1, {code_warm.min + 1, code_warm.max + 1},
+-                                        nullptr);
+-        device.synchronize();
+-
+-        ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
+-        for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
++        if (pipeline_text_stage) {
++            // Capture and upload each remote-stage graph at startup. Calling
++            // the mixed schedule eagerly cannot capture the local/remote
++            // boundary as one graph, but it gives the remote stage its stable
++            // workspace/control addresses without charging the first request.
+             for (const GraphExecutionProfile planned : ordinary_profiles) {
+-                ordinary_graphs.profiles.emplace_back();
+-                DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
+-                profile.batch_size             = batch_size;
+-                profile.min_execution_frontier = planned.min;
+-                profile.max_execution_frontier = planned.max;
+-                profile.topology_class =
+-                    planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
+-                const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
+-                schedule::capture_ordinary_decode_batch(ordinary_state,
+-                                                        static_cast<std::int32_t>(batch_size),
+-                                                        envelope, profile.definition);
++                prepare_representative(planned.min, 1);
++                device.synchronize();
++                schedule::ordinary_decode_batch(
++                    ordinary_state, 1, {planned.min + 1, planned.max + 1}, nullptr);
++                device.synchronize();
++            }
++        } else {
++            const GraphExecutionProfile code_warm = ordinary_profiles.front();
++            prepare_representative(code_warm.min, 1);
++            device.synchronize();
++            schedule::ordinary_decode_batch(
++                ordinary_state, 1, {code_warm.min + 1, code_warm.max + 1}, nullptr);
++            device.synchronize();
++
++            ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
++            for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
++                for (const GraphExecutionProfile planned : ordinary_profiles) {
++                    ordinary_graphs.profiles.emplace_back();
++                    DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
++                    profile.batch_size             = batch_size;
++                    profile.min_execution_frontier = planned.min;
++                    profile.max_execution_frontier = planned.max;
++                    profile.topology_class =
++                        planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
++                    const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
++                    schedule::capture_ordinary_decode_batch(ordinary_state,
++                                                            static_cast<std::int32_t>(batch_size),
++                                                            envelope, profile.definition);
++                }
+             }
+         }
+     }
+@@ -1536,6 +1580,15 @@ void ProgramImplCore::prepare_graphs() {
+     mtp_capture_allocations.clear();
+     for (PagedKVAllocation& allocation : text_capture_allocations) { allocation.unbind_row(); }
+     text_capture_allocations.clear();
++    if (pipeline_device) {
++        CUDA_CHECK(cudaSetDevice(pipeline_device->device));
++        for (PagedKVAllocation& allocation : pipeline_text_capture_allocations) {
++            allocation.unbind_row();
++        }
++        pipeline_text_capture_allocations.clear();
++        pipeline_device->synchronize();
++        CUDA_CHECK(cudaSetDevice(device.device));
++    }
+ }
+ 
+ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
+@@ -1910,7 +1963,20 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
+     try {
+         DecodeGraphExecutable* executable = nullptr;
+         ops::GqaExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
+-        if (use_cuda_graph) {
++        if (use_cuda_graph && pipeline_text_stage) {
++            const auto graph = std::find_if(
++                pipeline_text_stage->decode_graphs.begin(),
++                pipeline_text_stage->decode_graphs.end(),
++                [&](const schedule::TextPipelineStage::DecodeGraph& candidate) {
++                    return maximum_frontier >= candidate.min_execution_frontier &&
++                           maximum_frontier <= candidate.max_execution_frontier;
++                });
++            if (graph == pipeline_text_stage->decode_graphs.end()) {
++                throw std::logic_error("pipeline ordinary batch has no CUDA Graph profile");
++            }
++            envelope = {graph->min_execution_frontier + 1,
++                        graph->max_execution_frontier + 1};
++        } else if (use_cuda_graph) {
+             DecodeGraphProfile& profile =
+                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
+                                      maximum_frontier, "ordinary batch");
+diff --git a/src/targets/qwen3_6/impl/runtime/text_context.h b/src/targets/qwen3_6/impl/runtime/text_context.h
+index cba03a1..ac320bf 100644
+--- a/src/targets/qwen3_6/impl/runtime/text_context.h
++++ b/src/targets/qwen3_6/impl/runtime/text_context.h
+@@ -5,6 +5,7 @@
+ #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
+ 
+ #include "core/arena.h"
++#include "core/decode_graph.h"
+ #include "core/device.h"
+ #include "core/gdn_replay_records.h"
+ #include "core/tensor.h"
+@@ -150,6 +151,13 @@ struct DFlashFeatureSink {
+ class VisionPrefillSession;
+ 
+ struct TextPipelineStage {
++    struct DecodeGraph {
++        std::uint32_t min_execution_frontier = 0;
++        std::uint32_t max_execution_frontier = 0;
++        DecodeGraphDefinition definition;
++        DecodeGraphExecutable executable;
++    };
++
+     DeviceContext& device;
+     WorkspaceArena& work;
+     DeviceArena& transfer;
+@@ -159,6 +167,7 @@ struct TextPipelineStage {
+     const qwen3_6::PagedKVCache& text_cache;
+     PinnedHostBuffer& hidden_bridge;
+     PinnedHostBuffer& control_bridge;
++    std::vector<DecodeGraph> decode_graphs;
+ };
+ 
+ class TextContext {
+diff --git a/src/targets/qwen3_6/impl/runtime/text_context_impl.h b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+index 2150774..4990f18 100644
+--- a/src/targets/qwen3_6/impl/runtime/text_context_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+@@ -1066,33 +1066,64 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
+     // through pinned host memory.  The synchronous copies are the conservative
+     // correctness path; the transport can overlap/reuse these buffers later.
+     auto copy_between_devices = [&](void* destination, int destination_device,
+-                                    const void* source, int source_device,
++                                    cudaStream_t destination_stream, const void* source,
++                                    int source_device, cudaStream_t source_stream,
+                                     std::size_t bytes, PinnedHostBuffer& bridge) {
+         if (bytes > bridge.size()) {
+             throw std::runtime_error("pipeline bridge capacity is too small");
+         }
+         CUDA_CHECK(cudaSetDevice(source_device));
+-        CUDA_CHECK(cudaMemcpy(bridge.data(), source, bytes, cudaMemcpyDeviceToHost));
++        CUDA_CHECK(cudaMemcpyAsync(bridge.data(), source, bytes, cudaMemcpyDeviceToHost,
++                                   source_stream));
++        CUDA_CHECK(cudaStreamSynchronize(source_stream));
+         CUDA_CHECK(cudaSetDevice(destination_device));
+-        CUDA_CHECK(cudaMemcpy(destination, bridge.data(), bytes, cudaMemcpyHostToDevice));
++        CUDA_CHECK(cudaMemcpyAsync(destination, bridge.data(), bytes, cudaMemcpyHostToDevice,
++                                   destination_stream));
+     };
+-    copy_between_devices(remote_x.data, stage.device.device, x.data, ctx_.device, x.bytes(),
+-                         stage.hidden_bridge);
+-
+-    auto copy_control = [&](const Tensor* source) {
+-        if (source == nullptr) { return Tensor{}; }
+-        CUDA_CHECK(cudaSetDevice(stage.device.device));
+-        Tensor target = stage.transfer.alloc(
+-            source->dtype, {source->ne[0], source->ne[1], source->ne[2], source->ne[3]});
+-        copy_between_devices(target.data, stage.device.device, source->data, ctx_.device,
+-                             source->bytes(), stage.control_bridge);
+-        return target;
+-    };
+-    Tensor cache_positions = copy_control(active_cache_positions_);
+-    Tensor rope_positions  = copy_control(active_rope_positions_);
+-    Tensor kv_rows         = copy_control(active_kv_table_rows_);
+-    Tensor state_slots     = copy_control(active_linear_state_slots_);
+-    Tensor valid_columns   = copy_control(active_valid_columns_);
++    copy_between_devices(remote_x.data, stage.device.device, stage.device.stream, x.data,
++                         ctx_.device, ctx_.stream, x.bytes(), stage.hidden_bridge);
++
++    const std::array<const Tensor*, 5> control_sources{
++        active_cache_positions_, active_rope_positions_, active_kv_table_rows_,
++        active_linear_state_slots_, active_valid_columns_};
++    std::array<std::size_t, control_sources.size()> control_offsets{};
++    std::size_t packed_control_bytes = 0;
++    for (std::size_t i = 0; i < control_sources.size(); ++i) {
++        control_offsets[i] = packed_control_bytes;
++        if (control_sources[i] != nullptr) {
++            packed_control_bytes += control_sources[i]->bytes();
++        }
++    }
++    if (packed_control_bytes > stage.control_bridge.size()) {
++        throw std::runtime_error("pipeline control bridge capacity is too small");
++    }
++    const DeviceSpan packed_controls = stage.transfer.alloc_bytes(packed_control_bytes, 256);
++    CUDA_CHECK(cudaSetDevice(ctx_.device));
++    for (std::size_t i = 0; i < control_sources.size(); ++i) {
++        const Tensor* source = control_sources[i];
++        if (source == nullptr) { continue; }
++        CUDA_CHECK(cudaMemcpyAsync(
++            static_cast<std::byte*>(stage.control_bridge.data()) + control_offsets[i], source->data,
++            source->bytes(), cudaMemcpyDeviceToHost, ctx_.stream));
++    }
++    ctx_.synchronize();
++    CUDA_CHECK(cudaSetDevice(stage.device.device));
++    CUDA_CHECK(cudaMemcpyAsync(packed_controls.data, stage.control_bridge.data(),
++                               packed_control_bytes, cudaMemcpyHostToDevice,
++                               stage.device.stream));
++    std::array<Tensor, control_sources.size()> remote_controls{};
++    for (std::size_t i = 0; i < control_sources.size(); ++i) {
++        const Tensor* source = control_sources[i];
++        if (source == nullptr) { continue; }
++        remote_controls[i] = Tensor(
++            static_cast<std::byte*>(packed_controls.data) + control_offsets[i], source->dtype,
++            {source->ne[0], source->ne[1], source->ne[2], source->ne[3]});
++    }
++    Tensor& cache_positions = remote_controls[0];
++    Tensor& rope_positions  = remote_controls[1];
++    Tensor& kv_rows         = remote_controls[2];
++    Tensor& state_slots     = remote_controls[3];
++    Tensor& valid_columns   = remote_controls[4];
+ 
+     TextContext remote(stage.device, weights_, stage.work, {}, stage.linear_attention, stage.io,
+                        stage.prefill_hidden, prefill_chunk_, text_kv_base_, {}, &stage.text_cache,
+@@ -1108,11 +1139,32 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
+     remote.linear_state_current_slot_ = linear_state_current_slot_;
+     remote.linear_state_rewrite_checkpoint_slot_ = linear_state_rewrite_checkpoint_slot_;
+     NullTap remote_tap;
+-    remote.run_layers_range(remote_x, ph, remote_tap, split, kCfg.n_layers);
+-    stage.device.synchronize();
+-
+-    copy_between_devices(x.data, ctx_.device, remote_x.data, stage.device.device, x.bytes(),
+-                         stage.hidden_bridge);
++    TextPipelineStage::DecodeGraph* graph = nullptr;
++    if (ph != Phase::Prefill && active_gqa_envelope_ != nullptr) {
++        const std::uint32_t min_frontier = active_gqa_envelope_->min_visible_keys - 1;
++        const std::uint32_t max_frontier = active_gqa_envelope_->max_visible_keys - 1;
++        const auto found = std::find_if(
++            stage.decode_graphs.begin(), stage.decode_graphs.end(),
++            [&](const TextPipelineStage::DecodeGraph& candidate) {
++                return candidate.min_execution_frontier == min_frontier &&
++                       candidate.max_execution_frontier == max_frontier;
++            });
++        if (found != stage.decode_graphs.end()) { graph = &*found; }
++    }
++    if (graph == nullptr) {
++        remote.run_layers_range(remote_x, ph, remote_tap, split, kCfg.n_layers);
++    } else {
++        if (!graph->executable.ready()) {
++            graph->definition.capture(stage.device.stream, [&] {
++                remote.run_layers_range(remote_x, ph, remote_tap, split, kCfg.n_layers);
++            });
++            graph->executable.instantiate(graph->definition);
++            graph->executable.upload(stage.device.stream);
++        }
++        graph->executable.launch(stage.device.stream);
++    }
++    copy_between_devices(x.data, ctx_.device, ctx_.stream, remote_x.data, stage.device.device,
++                         stage.device.stream, x.bytes(), stage.hidden_bridge);
+     CUDA_CHECK(cudaSetDevice(ctx_.device));
+     stage.transfer.reset();
+ }

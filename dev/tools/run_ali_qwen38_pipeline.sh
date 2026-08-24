@@ -8,7 +8,8 @@ image="rgpu/ninfer-qwen38-pipeline:dev"
 shim_image="remote-gpu-client:0.2.1"
 port=8112
 context=1048576
-prefill_chunk=1024
+prefill_chunk=1536
+disable_cuda_graph=0
 
 while (($#)); do
   case "$1" in
@@ -40,8 +41,12 @@ while (($#)); do
       prefill_chunk=${2:?missing value for --prefill-chunk}
       shift 2
       ;;
+    --no-cuda-graph)
+      disable_cuda_graph=1
+      shift
+      ;;
     *)
-      echo "usage: $0 --ali PATH --host USER@HOST [--image NAME] [--shim-image NAME] [--port N]" >&2
+      echo "usage: $0 --ali PATH --host USER@HOST [--image NAME] [--shim-image NAME] [--port N] [--no-cuda-graph]" >&2
       exit 2
       ;;
   esac
@@ -52,6 +57,11 @@ model="$ali_tree/models/qwen3_8_27b_nvfp4.ninfer"
   echo "--ali must contain models/qwen3_8_27b_nvfp4.ninfer and --host is required" >&2
   exit 2
 }
+
+graph_args=()
+if ((disable_cuda_graph)); then
+  graph_args+=(--no-cuda-graph)
+fi
 
 exec env PYTHONPATH="$project_root/rgpu-client" python3 -m remote_gpu.cli run \
   --host "$host" \
@@ -73,7 +83,7 @@ exec env PYTHONPATH="$project_root/rgpu-client" python3 -m remote_gpu.cli run \
   --prefill-chunk "$prefill_chunk" \
   --kv-dtype int8 \
   --default-max-tokens 32768 \
-  --no-cuda-graph \
+  "${graph_args[@]}" \
   --no-prefix-reuse \
   --no-thinking \
   --greedy

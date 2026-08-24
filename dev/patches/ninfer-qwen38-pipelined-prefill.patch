@@ -1,0 +1,56 @@
+diff --git a/src/targets/qwen3_6/impl/runtime/text_context.h b/src/targets/qwen3_6/impl/runtime/text_context.h
+index ac320bf..7550005 100644
+--- a/src/targets/qwen3_6/impl/runtime/text_context.h
++++ b/src/targets/qwen3_6/impl/runtime/text_context.h
+@@ -266,7 +266,7 @@ private:
+     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
+     void run_layers(Tensor& x, Phase phase);
+     template <class Tap>
+-    void run_layers(Tensor& x, Phase phase, Tap& tap);
++    void run_layers(Tensor& x, Phase phase, Tap& tap, bool pipeline_output_required = true);
+     template <class Tap>
+     void run_layers_range(Tensor& x, Phase phase, Tap& tap, int begin, int end);
+     template <class Tap>
+diff --git a/src/targets/qwen3_6/impl/runtime/text_context_impl.h b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+index cff1f10..6b49771 100644
+--- a/src/targets/qwen3_6/impl/runtime/text_context_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+@@ -1040,7 +1040,7 @@ void TextContext::run_layers_range(Tensor& x, Phase ph, Tap& tap, int begin, int
+ }
+ 
+ template <class Tap>
+-void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
++void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap, bool pipeline_output_required) {
+     if (pipeline_ == nullptr) {
+         run_layers_range(x, ph, tap, 0, kCfg.n_layers);
+         return;
+@@ -1161,6 +1161,17 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
+         }
+         graph->executable.launch(stage.device.stream);
+     }
++    if (ph == Phase::Prefill && !pipeline_output_required) {
++        // The two stages have independent KV/GDN state. Once the remote work
++        // for a non-terminal prompt chunk is queued, the local stage can begin
++        // the next chunk while this stream finishes the previous one. Reusing
++        // the same remote workspace is safe because every upload and kernel is
++        // ordered on the stage stream. Only the terminal chunk needs its
++        // residual copied back for final norm and sampling.
++        CUDA_CHECK(cudaSetDevice(ctx_.device));
++        stage.transfer.reset();
++        return;
++    }
+     copy_between_devices(x.data, ctx_.device, ctx_.stream, remote_x.data, stage.device.device,
+                          stage.device.stream, x.bytes(), stage.hidden_bridge);
+     CUDA_CHECK(cudaSetDevice(ctx_.device));
+@@ -1310,7 +1321,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
+                 ops::scatter(embeddings, indices_device, x, s);
+             }
+             if constexpr (Tap::enabled) { tap.begin(x); }
+-            run_layers(x, Phase::Prefill, tap);
++            const bool pipeline_output_required =
++                is_last || prepare_mtp_prompt || Tap::enabled ||
++                (checkpoint_rel > 0 && t0 + len == checkpoint_rel);
++            run_layers(x, Phase::Prefill, tap, pipeline_output_required);
+             if constexpr (requires { tap.capture_positions(positions, s); }) {
+                 tap.capture_positions(positions, s);
+             }

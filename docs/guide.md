@@ -316,8 +316,14 @@ dev/tools/run_ali_qwen38_pipeline.sh \
 ```
 
 The launcher defaults to a balanced 32/32 layer split, 1,048,576-token cache,
-and the measured 1,024-token prefill chunk. Mixed two-device CUDA Graph capture
-is not yet implemented, so this path deliberately uses eager decode.
+the measured 1,536-token prefill chunk, pipelined prefill, and mixed-device CUDA
+Graph decode. During non-terminal prompt chunks, the local GPU begins the next
+chunk while the remote GPU completes the previous one; only the terminal
+residual crosses back for final normalization and sampling.
+The remote half of each decode profile is captured and uploaded during startup;
+the local half and the host-to-host device boundary remain eager. Small control
+tensors are packed into one asynchronous transfer. Pass `--no-cuda-graph` to
+retain the exact eager compatibility path.
 
 Compiled model-plus-optimizer execution is the strongest current performance
 path for modern training code: TorchTitan Qwen3 measures 4.606 ms remote versus
