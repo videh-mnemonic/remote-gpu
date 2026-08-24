@@ -90,6 +90,13 @@ extern "C" int lupine_cuda_current_route_id() {
   return -2;
 }
 
+extern "C" int lupine_cuda_deviceptr_route_id(CUdeviceptr ptr) {
+  lupine_route route = lupine_route_for_deviceptr(ptr);
+  if (route.kind == LUPINE_ROUTE_LOCAL) return -1;
+  if (route.kind == LUPINE_ROUTE_REMOTE) return lupine_conn_index(route.conn);
+  return -2;
+}
+
 extern "C" int lupine_cuda_device_route_id(int ordinal) {
   CUdevice device = static_cast<CUdevice>(ordinal);
   lupine_route route = lupine_route_for_device(&device);

@@ -24,6 +24,7 @@ from remote_gpu.cli import (
     run_checked,
     server_name,
     start_server,
+    reuse_persistent_server,
     stop_server,
 )
 
@@ -173,6 +174,35 @@ def test_ephemeral_server_lease_does_not_restart_after_reboot(monkeypatch):
     assert run[run.index("--restart") + 1] == "no"
     assert "io.rgpu.lease-mode=ephemeral" in run
     assert "io.rgpu.session=abc" in run
+
+
+def test_reuse_persistent_server_validates_managed_idle_lease(monkeypatch):
+    commands = []
+    labels = {
+        "io.rgpu.managed": "true",
+        "io.rgpu.lease-mode": "persistent",
+        "io.rgpu.endpoint": "10.0.0.1:14833",
+    }
+
+    def fake_ssh(_host, command, **_kwargs):
+        commands.append(list(command))
+        return subprocess.CompletedProcess(
+            command, 0, json.dumps(labels) + " true\n", ""
+        )
+
+    monkeypatch.setattr("remote_gpu.cli.ssh", fake_ssh)
+    monkeypatch.setattr("remote_gpu.cli.remote_compute_processes", lambda _host: "")
+    monkeypatch.setattr("remote_gpu.cli.wait_ready", lambda _host: None)
+    reuse_persistent_server(Host("u@remote", "10.0.0.1"), "rgpu-server-14833")
+    assert commands[0][:3] == ["docker", "inspect", "--format"]
+
+
+def test_reuse_persistent_server_refuses_active_gpu(monkeypatch):
+    monkeypatch.setattr(
+        "remote_gpu.cli.remote_compute_processes", lambda _host: "123, python, 1 GiB"
+    )
+    with pytest.raises(RgpuError, match="already in use"):
+        reuse_persistent_server(Host("u@remote", "10.0.0.1"), "rgpu-server-14833")
 
 
 def test_gc_reclaims_only_expired_disconnected_ephemeral_lease(monkeypatch):

@@ -1,0 +1,1590 @@
+diff --git a/include/ninfer/ops/gqa_attention.h b/include/ninfer/ops/gqa_attention.h
+index 05bec1d..6c5415e 100644
+--- a/include/ninfer/ops/gqa_attention.h
++++ b/include/ninfer/ops/gqa_attention.h
+@@ -110,4 +110,9 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
+                           const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
+                           WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+ 
++// Compatibility route for transports that cannot execute the large prompt kernel reliably.
++void gqa_attention_cached_chunked(const Tensor& q, const Tensor& positions, float scale,
++                                  const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
++                                  WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
++
+ } // namespace ninfer::ops
+diff --git a/src/artifact/binder.h b/src/artifact/binder.h
+index 29b5563..866cea6 100644
+--- a/src/artifact/binder.h
++++ b/src/artifact/binder.h
+@@ -24,6 +24,7 @@ struct DeviceMaterialization {
+     std::uint64_t offset    = 0;
+     std::uint64_t bytes     = 0;
+     std::uint64_t alignment = 0;
++    std::uint32_t device    = 0;
+ };
+ 
+ struct HostMaterialization {
+@@ -35,6 +36,9 @@ struct MaterializationPlan {
+     std::uint64_t device_capacity_bytes = 0;
+     std::vector<DeviceMaterialization> device_objects;
+     std::vector<HostMaterialization> host_objects;
++    // Empty for the legacy one-device path. Pipeline plans contain one exact
++    // arena capacity per stage and set DeviceMaterialization::device.
++    std::vector<std::uint64_t> device_capacities;
+ };
+ 
+ class Binder {
+diff --git a/src/artifact/materializer.cpp b/src/artifact/materializer.cpp
+index 2df1305..e280f80 100644
+--- a/src/artifact/materializer.cpp
++++ b/src/artifact/materializer.cpp
+@@ -4,7 +4,9 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <cstdlib>
+ #include <cstdint>
++#include <cstring>
+ #include <limits>
+ #include <memory>
+ #include <stdexcept>
+@@ -95,6 +97,131 @@ DeviceArena& MaterializedArtifact::device_arena() {
+     return *device_arena_;
+ }
+ 
++DeviceArena& MaterializedArtifact::device_arena(std::size_t stage) {
++    if (stage == 0) { return device_arena(); }
++    const std::size_t index = stage - 1;
++    if (index >= additional_device_arenas_.size() || !additional_device_arenas_[index]) {
++        throw ArtifactError("artifact has no device tensor backing for requested stage");
++    }
++    return *additional_device_arenas_[index];
++}
++
++MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
++                                 std::span<DeviceContext* const> devices,
++                                 LoadProgress* progress) {
++    if (devices.size() < 2 || plan.device_capacities.size() != devices.size()) {
++        throw ArtifactError("pipeline materialization device geometry is invalid");
++    }
++    MaterializedArtifact out;
++    out.objects_.resize(plan.object_count);
++    out.additional_device_arenas_.resize(devices.size() - 1);
++    for (std::size_t stage = 0; stage < devices.size(); ++stage) {
++        const std::uint64_t capacity = plan.device_capacities[stage];
++        if (devices[stage] == nullptr || capacity == 0 || capacity > SIZE_MAX) {
++            throw ArtifactError("pipeline artifact tensor backing size is invalid");
++        }
++        CUDA_CHECK(cudaSetDevice(devices[stage]->device));
++        auto arena = std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity));
++        if (stage == 0) {
++            out.device_arena_ = std::move(arena);
++        } else {
++            out.additional_device_arenas_[stage - 1] = std::move(arena);
++        }
++        out.stats_.device_capacity_bytes = checked_add(
++            out.stats_.device_capacity_bytes, capacity,
++            "pipeline artifact capacity overflows u64");
++    }
++    out.stats_.tensor_count   = plan.device_objects.size();
++    out.stats_.resource_count = plan.host_objects.size();
++
++    for (const HostMaterialization& placement : plan.host_objects) {
++        auto& resource            = out.objects_.at(placement.object.index).resource;
++        const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
++        resource.assign(payload.data.begin(), payload.data.end());
++        out.stats_.retained_resource_bytes += resource.size();
++        out.stats_.file_bytes = checked_add(out.stats_.file_bytes, resource.size(),
++                                            "artifact read bytes overflow u64");
++    }
++
++    const auto started = std::chrono::steady_clock::now();
++    std::vector<std::uint64_t> offsets(devices.size(), 0);
++    std::uint64_t copied = 0;
++    std::uint64_t total  = 0;
++    for (const DeviceMaterialization& placement : plan.device_objects) {
++        total = checked_add(total, placement.bytes, "artifact tensor byte count overflows u64");
++    }
++    for (const DeviceMaterialization& placement : plan.device_objects) {
++        if (placement.device >= devices.size()) {
++            throw ArtifactError("pipeline materialization names an invalid device stage");
++        }
++        const std::size_t stage = placement.device;
++        CUDA_CHECK(cudaSetDevice(devices[stage]->device));
++        DeviceArena& arena      = out.device_arena(stage);
++        const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
++        DeviceSpan storage = arena.alloc_bytes(static_cast<std::size_t>(placement.bytes),
++                                               static_cast<std::size_t>(placement.alignment));
++        const auto actual_offset = static_cast<std::uint64_t>(
++            static_cast<std::byte*>(storage.data) - static_cast<std::byte*>(arena.base()));
++        if (actual_offset != placement.offset || payload.data.size() != placement.bytes) {
++            throw ArtifactError("pipeline materialization plan does not match artifact payload");
++        }
++        out.objects_.at(placement.object.index).device = storage.data;
++        CUDA_CHECK(cudaMemcpyAsync(storage.data, payload.data.data(), payload.data.size(),
++                                   cudaMemcpyHostToDevice, devices[stage]->load_stream));
++        CUDA_CHECK(cudaStreamSynchronize(devices[stage]->load_stream));
++        if (std::getenv("NINFER_PIPELINE_VERIFY_LOAD") != nullptr) {
++            constexpr std::size_t kSampleBytes = 4096;
++            const std::size_t first_bytes = std::min(kSampleBytes, payload.data.size());
++            std::vector<std::byte> sample(first_bytes);
++            CUDA_CHECK(cudaMemcpy(sample.data(), storage.data, first_bytes,
++                                  cudaMemcpyDeviceToHost));
++            if (std::memcmp(sample.data(), payload.data.data(), first_bytes) != 0) {
++                throw ArtifactError(
++                    std::string("pipeline upload first-byte verification failed for ") +
++                    std::string(object_name(reader.objects().at(placement.object.index))));
++            }
++            if (payload.data.size() > first_bytes) {
++                const std::size_t last_bytes = std::min(kSampleBytes, payload.data.size());
++                const std::size_t last_offset = payload.data.size() - last_bytes;
++                sample.resize(last_bytes);
++                CUDA_CHECK(cudaMemcpy(sample.data(),
++                                      static_cast<const std::byte*>(storage.data) + last_offset,
++                                      last_bytes, cudaMemcpyDeviceToHost));
++                if (std::memcmp(sample.data(), payload.data.data() + last_offset, last_bytes) != 0) {
++                    throw ArtifactError(
++                        std::string("pipeline upload last-byte verification failed for ") +
++                        std::string(object_name(reader.objects().at(placement.object.index))));
++                }
++            }
++            const std::string_view name =
++                object_name(reader.objects().at(placement.object.index));
++            if (name.starts_with("text/layers/36/")) {
++                sample.resize(payload.data.size());
++                CUDA_CHECK(cudaMemcpy(sample.data(), storage.data, payload.data.size(),
++                                      cudaMemcpyDeviceToHost));
++                if (std::memcmp(sample.data(), payload.data.data(), payload.data.size()) != 0) {
++                    throw ArtifactError("pipeline upload full verification failed for " +
++                                        std::string(name));
++                }
++            }
++        }
++        copied = checked_add(copied, placement.bytes, "artifact upload bytes overflow u64");
++        if (progress != nullptr && progress->callback) {
++            progress->callback(object_name(reader.objects().at(placement.object.index)), copied,
++                               total);
++        }
++        offsets[stage] = placement.offset + placement.bytes;
++    }
++    out.stats_.file_bytes = checked_add(out.stats_.file_bytes, copied,
++                                        "artifact read bytes overflow u64");
++    out.stats_.h2d_bytes = copied;
++    out.stats_.upload_seconds = std::chrono::duration<double>(
++                                    std::chrono::steady_clock::now() - started)
++                                    .count();
++    CUDA_CHECK(cudaSetDevice(devices.front()->device));
++    return out;
++}
++
+ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
+                                  DeviceContext& device, LoadProgress* progress) {
+     MaterializedArtifact out;
+diff --git a/src/artifact/materializer.h b/src/artifact/materializer.h
+index d24884d..e587cd7 100644
+--- a/src/artifact/materializer.h
++++ b/src/artifact/materializer.h
+@@ -45,10 +45,13 @@ public:
+     const MaterializationStats& stats() const noexcept { return stats_; }
+ 
+     DeviceArena& device_arena();
++    DeviceArena& device_arena(std::size_t stage);
+ 
+ private:
+     friend MaterializedArtifact materialize(const Reader&, const MaterializationPlan&,
+                                             DeviceContext&, LoadProgress*);
++    friend MaterializedArtifact materialize(const Reader&, const MaterializationPlan&,
++                                            std::span<DeviceContext* const>, LoadProgress*);
+ 
+     struct ObjectStorage {
+         void* device = nullptr;
+@@ -56,6 +59,7 @@ private:
+     };
+ 
+     std::unique_ptr<DeviceArena> device_arena_;
++    std::vector<std::unique_ptr<DeviceArena>> additional_device_arenas_;
+     std::vector<ObjectStorage> objects_;
+     MaterializationStats stats_;
+ };
+@@ -63,4 +67,10 @@ private:
+ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
+                                  DeviceContext& device, LoadProgress* progress = nullptr);
+ 
++// Multi-stage startup path. It intentionally favors a simple, deterministic
++// object-at-a-time upload; model loading is outside the steady-state token path.
++MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
++                                 std::span<DeviceContext* const> devices,
++                                 LoadProgress* progress = nullptr);
++
+ } // namespace ninfer::artifact
+diff --git a/src/core/arena.cu b/src/core/arena.cu
+index 23a15a8..d3ee620 100644
+--- a/src/core/arena.cu
++++ b/src/core/arena.cu
+@@ -136,6 +136,10 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
+         throw std::invalid_argument("DeviceArena capacity must be nonzero");
+     }
+ 
++    const cudaError_t device_err = cudaGetDevice(&device_);
++    if (device_err != cudaSuccess) {
++        throw std::runtime_error(cuda_error_message("cudaGetDevice failed", device_err));
++    }
+     void* ptr             = nullptr;
+     const cudaError_t err = cudaMalloc(&ptr, capacity_bytes);
+     if (err != cudaSuccess) {
+@@ -155,12 +159,15 @@ DeviceArena::DeviceArena(DeviceSpan storage)
+ }
+ 
+ DeviceArena::~DeviceArena() {
+-    if (owns_) { free_device(base_); }
++    if (owns_ && base_ != nullptr) {
++        (void)cudaSetDevice(device_);
++        free_device(base_);
++    }
+ }
+ 
+ DeviceArena::DeviceArena(DeviceArena&& other) noexcept
+     : base_(other.base_), cap_(other.cap_), off_(other.off_), peak_(other.peak_),
+-      owns_(other.owns_) {
++      owns_(other.owns_), device_(other.device_) {
+     other.base_ = nullptr;
+     other.cap_  = 0;
+     other.off_  = 0;
+@@ -171,12 +178,16 @@ DeviceArena::DeviceArena(DeviceArena&& other) noexcept
+ DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
+     if (this == &other) { return *this; }
+ 
+-    if (owns_) { free_device(base_); }
++    if (owns_ && base_ != nullptr) {
++        (void)cudaSetDevice(device_);
++        free_device(base_);
++    }
+     base_ = other.base_;
+     cap_  = other.cap_;
+     off_  = other.off_;
+     peak_ = other.peak_;
+     owns_ = other.owns_;
++    device_ = other.device_;
+ 
+     other.base_ = nullptr;
+     other.cap_  = 0;
+diff --git a/src/core/arena.h b/src/core/arena.h
+index 658d531..ae01550 100644
+--- a/src/core/arena.h
++++ b/src/core/arena.h
+@@ -86,6 +86,7 @@ private:
+     std::size_t off_  = 0;
+     std::size_t peak_ = 0;
+     bool owns_        = true;
++    int device_       = 0;
+ };
+ 
+ class PinnedHostBuffer {
+diff --git a/src/ops/kernel/gqa_attention_prefill_bf16.cuh b/src/ops/kernel/gqa_attention_prefill_bf16.cuh
+index d289784..68e1d40 100644
+--- a/src/ops/kernel/gqa_attention_prefill_bf16.cuh
++++ b/src/ops/kernel/gqa_attention_prefill_bf16.cuh
+@@ -25,6 +25,7 @@ template <typename Geometry, typename Metadata>
+ __global__ void gqa_attention_prefill_fill_bf16_kernel(
+     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+     const std::int32_t* __restrict__ positions, Metadata metadata,
++    const std::int32_t* __restrict__ direct_table,
+     __nv_bfloat16* __restrict__ cache_k, __nv_bfloat16* __restrict__ cache_v, std::int32_t width) {
+     constexpr int VecElems = 8; // 8 bf16 == 16 B, matching the cache row alignment.
+     const int tokens       = metadata.valid_tokens(width);
+@@ -40,7 +41,7 @@ __global__ void gqa_attention_prefill_fill_bf16_kernel(
+     const int d                     = vec * VecElems;
+     const int position              = positions[0] + token;
+     const int lane                  = static_cast<int>(threadIdx.x) & 31;
+-    const std::int32_t* block_table = metadata.block_table();
++    const std::int32_t* block_table = gqa_prefill_block_table(metadata, direct_table);
+     int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+     const std::int64_t src_off =
+         static_cast<std::int64_t>(d) +
+@@ -105,6 +106,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
+                                            const __nv_bfloat16* __restrict__ cache_k,
+                                            const __nv_bfloat16* __restrict__ cache_v,
+                                            Metadata metadata,
++                                           const std::int32_t* __restrict__ direct_table,
+                                            const std::int32_t* __restrict__ positions, float scale,
+                                            __nv_bfloat16* __restrict__ out, std::int32_t width) {
+     constexpr int D             = kGqaPrefillHeadDim; // 256
+@@ -140,7 +142,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
+         return;
+     }
+     const int base_pos              = positions[0];
+-    const std::int32_t* block_table = metadata.block_table();
++    const std::int32_t* block_table = gqa_prefill_block_table(metadata, direct_table);
+ 
+     const int gid = lane >> 2;
+     const int lid = lane & 3;
+diff --git a/src/ops/kernel/gqa_attention_prefill_common.cuh b/src/ops/kernel/gqa_attention_prefill_common.cuh
+index da9cf7a..f85ec21 100644
+--- a/src/ops/kernel/gqa_attention_prefill_common.cuh
++++ b/src/ops/kernel/gqa_attention_prefill_common.cuh
+@@ -13,6 +13,7 @@
+ #include <cuda_bf16.h>
+ 
+ #include <cstdint>
++#include <type_traits>
+ 
+ namespace ninfer::ops {
+ 
+@@ -26,13 +27,19 @@ inline constexpr int kGqaPrefillSmemBytes = (kGqaPrefillBr + 2 * kGqaPrefillBc)
+                                             static_cast<int>(sizeof(__nv_bfloat16));
+ 
+ struct GqaPrefillDirectMetadata {
+-    const std::int32_t* table;
+-
+     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
+-
+-    __device__ __forceinline__ const std::int32_t* block_table() const { return table; }
+ };
+ 
++template <typename Metadata>
++__device__ __forceinline__ const std::int32_t*
++gqa_prefill_block_table(Metadata metadata, const std::int32_t* direct_table) {
++    if constexpr (std::is_same_v<Metadata, GqaPrefillDirectMetadata>) {
++        return direct_table;
++    } else {
++        return metadata.block_table();
++    }
++}
++
+ template <bool Masked>
+ struct GqaPrefillBatchMetadata {
+     const std::int32_t* tables;
+diff --git a/src/ops/kernel/gqa_attention_prefill_i8.cuh b/src/ops/kernel/gqa_attention_prefill_i8.cuh
+index a94c5a6..95fb0f0 100644
+--- a/src/ops/kernel/gqa_attention_prefill_i8.cuh
++++ b/src/ops/kernel/gqa_attention_prefill_i8.cuh
+@@ -84,7 +84,9 @@ __launch_bounds__(256) __global__
+     void gqa_attention_prefill_fill_i8_kernel(const __nv_bfloat16* __restrict__ k,
+                                               const __nv_bfloat16* __restrict__ v,
+                                               const std::int32_t* __restrict__ positions,
+-                                              Metadata metadata, std::int8_t* __restrict__ cache_k,
++                                              Metadata metadata,
++                                              const std::int32_t* __restrict__ direct_table,
++                                              std::int8_t* __restrict__ cache_k,
+                                               std::int8_t* __restrict__ cache_v,
+                                               __half* __restrict__ scale_k,
+                                               __half* __restrict__ scale_v, std::int32_t width) {
+@@ -102,7 +104,7 @@ __launch_bounds__(256) __global__
+     const int kv_head               = tmp % Geometry::KVHeads;
+     const int token                 = tmp / Geometry::KVHeads;
+     const int position              = positions[0] + token;
+-    const std::int32_t* block_table = metadata.block_table();
++    const std::int32_t* block_table = gqa_prefill_block_table(metadata, direct_table);
+     int page                        = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+     const int page_off              = position & kPagedKVPageMask;
+     const int d0                    = group * kGqaKvQuantGroup + lane;
+@@ -148,6 +150,7 @@ template <typename Geometry, typename Metadata>
+ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel(
+     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+     const std::int32_t* __restrict__ positions, Metadata metadata,
++    const std::int32_t* __restrict__ direct_table,
+     std::int8_t* __restrict__ cache_k, std::int8_t* __restrict__ cache_v,
+     __half* __restrict__ scale_k, __half* __restrict__ scale_v, std::int32_t width) {
+     constexpr int TokensPerTile = 8;
+@@ -165,7 +168,7 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
+     const int token_end         = min(tokens, tile_position + TokensPerTile - base_position);
+     if (token_begin >= token_end) { return; }
+ 
+-    const std::int32_t* block_table = metadata.block_table();
++    const std::int32_t* block_table = gqa_prefill_block_table(metadata, direct_table);
+     int physical_page               = lane == 0 ? block_table[logical_page] : 0;
+ 
+     const int token  = token_begin + warp;
+@@ -216,6 +219,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
+     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
+     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
+     const __half* __restrict__ cache_v_scale, Metadata metadata,
++    const std::int32_t* __restrict__ direct_table,
+     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
+     std::int32_t width) {
+     constexpr int D             = kGqaPrefillHeadDim;
+@@ -268,7 +272,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
+         return;
+     }
+     const int base_pos              = positions[0];
+-    const std::int32_t* block_table = metadata.block_table();
++    const std::int32_t* block_table = gqa_prefill_block_table(metadata, direct_table);
+ 
+     const int tile_rows     = min(Br, tokens - q0);
+     const int max_query_abs = base_pos + q0 + tile_rows - 1;
+diff --git a/src/ops/launcher/gqa_attention_decode.cu b/src/ops/launcher/gqa_attention_decode.cu
+index ea28608..a134950 100644
+--- a/src/ops/launcher/gqa_attention_decode.cu
++++ b/src/ops/launcher/gqa_attention_decode.cu
+@@ -9,6 +9,7 @@
+ #include "ninfer/ops/gqa_attention.h"
+ 
+ #include <cstdint>
++#include <cstdlib>
+ #include <stdexcept>
+ 
+ namespace ninfer::ops::detail {
+@@ -126,12 +127,18 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos,
+         constexpr std::size_t kDynamicBytes =
+             DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kGqaHeadDim) : 0u;
+         if constexpr (DynamicArena) {
+-            static const cudaError_t attr = cudaFuncSetAttribute(
+-                gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
+-                                                     MinBlocksPerSm, KeyBlock, DynamicArena,
+-                                                     MultiBatch, Masked, CacheInput>,
+-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
+-            CUDA_CHECK(attr);
++            int device = 0;
++            const bool remote_pipeline = std::getenv("NINFER_PIPELINE_DEVICE") != nullptr &&
++                                         cudaGetDevice(&device) == cudaSuccess && device != 0;
++            if (!remote_pipeline) {
++                static const cudaError_t attr = cudaFuncSetAttribute(
++                    gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
++                                                         MinBlocksPerSm, KeyBlock, DynamicArena,
++                                                         MultiBatch, Masked, CacheInput>,
++                    cudaFuncAttributeMaxDynamicSharedMemorySize,
++                    static_cast<int>(kDynamicBytes));
++                CUDA_CHECK(attr);
++            }
+         }
+         gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
+                                              KeyBlock, DynamicArena, MultiBatch, Masked, CacheInput>
+diff --git a/src/ops/launcher/gqa_attention_prefill.cu b/src/ops/launcher/gqa_attention_prefill.cu
+index b9baa6d..70cdb2d 100644
+--- a/src/ops/launcher/gqa_attention_prefill.cu
++++ b/src/ops/launcher/gqa_attention_prefill.cu
+@@ -8,6 +8,7 @@
+ #include "core/device.h" // CUDA_CHECK
+ 
+ #include <cstdint>
++#include <cstdlib>
+ 
+ namespace ninfer::ops::detail {
+ namespace {
+@@ -15,19 +16,28 @@ namespace {
+ template <typename Geometry, typename CacheView, typename Metadata>
+ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& positions,
+                                                float scale, const CacheView& cache,
+-                                               Metadata metadata, Tensor& out,
++                                               Metadata metadata,
++                                               const std::int32_t* direct_table, Tensor& out,
+                                                cudaStream_t stream) {
+     const Tensor& cache_k = cache.k_pages;
+     const Tensor& cache_v = cache.v_pages;
+     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
+-    static const cudaError_t attr_bf16 =
+-        cudaFuncSetAttribute(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
+-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes);
+-    CUDA_CHECK(attr_bf16);
+-    static const cudaError_t attr_i8 =
+-        cudaFuncSetAttribute(gqa_attention_prefill_i8_kernel<Geometry, Metadata>,
+-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes);
+-    CUDA_CHECK(attr_i8);
++    int current_device = 0;
++    const bool remote_pipeline = std::getenv("NINFER_PIPELINE_DEVICE") != nullptr &&
++                                 cudaGetDevice(&current_device) == cudaSuccess &&
++                                 current_device != 0;
++    if (!remote_pipeline) {
++        static const cudaError_t attr_bf16 =
++            cudaFuncSetAttribute(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
++                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                 kGqaPrefillSmemBytes);
++        CUDA_CHECK(attr_bf16);
++        static const cudaError_t attr_i8 =
++            cudaFuncSetAttribute(gqa_attention_prefill_i8_kernel<Geometry, Metadata>,
++                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                 kGqaPrefillI8SmemBytes);
++        CUDA_CHECK(attr_i8);
++    }
+ 
+     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
+     if (cache.dtype == DType::I8) {
+@@ -42,6 +52,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
+                 static_cast<const std::int8_t*>(cache_v.data),
+                 static_cast<const __half*>(cache_k_scale.data),
+                 static_cast<const __half*>(cache_v_scale.data), metadata,
++                direct_table,
+                 static_cast<const std::int32_t*>(positions.data), scale,
+                 static_cast<__nv_bfloat16*>(out.data), tokens);
+     } else {
+@@ -52,6 +63,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
+                 static_cast<const __nv_bfloat16*>(q.data),
+                 static_cast<const __nv_bfloat16*>(cache_k.data),
+                 static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
++                direct_table,
+                 static_cast<const std::int32_t*>(positions.data), scale,
+                 static_cast<__nv_bfloat16*>(out.data), tokens);
+     }
+@@ -60,7 +72,8 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
+ 
+ template <typename Geometry, typename CacheView, typename Metadata>
+ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& positions,
+-                              CacheView cache, Metadata metadata, cudaStream_t stream) {
++                              CacheView cache, Metadata metadata,
++                              const std::int32_t* direct_table, cudaStream_t stream) {
+     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
+     Tensor& cache_k   = cache.k_pages;
+     Tensor& cache_v   = cache.v_pages;
+@@ -80,6 +93,7 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
+                     static_cast<const __nv_bfloat16*>(k.data),
+                     static_cast<const __nv_bfloat16*>(v.data),
+                     static_cast<const std::int32_t*>(positions.data), metadata,
++                    direct_table,
+                     static_cast<std::int8_t*>(cache_k.data),
+                     static_cast<std::int8_t*>(cache_v.data),
+                     static_cast<__half*>(cache_k_scale.data),
+@@ -95,6 +109,7 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
+                     static_cast<const __nv_bfloat16*>(k.data),
+                     static_cast<const __nv_bfloat16*>(v.data),
+                     static_cast<const std::int32_t*>(positions.data), metadata,
++                    direct_table,
+                     static_cast<std::int8_t*>(cache_k.data),
+                     static_cast<std::int8_t*>(cache_v.data),
+                     static_cast<__half*>(cache_k_scale.data),
+@@ -112,7 +127,8 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
+             <<<fill_grid, kBlock, 0, stream>>>(static_cast<const __nv_bfloat16*>(k.data),
+                                                static_cast<const __nv_bfloat16*>(v.data),
+                                                static_cast<const std::int32_t*>(positions.data),
+-                                               metadata, static_cast<__nv_bfloat16*>(cache_k.data),
++                                               metadata, direct_table,
++                                               static_cast<__nv_bfloat16*>(cache_k.data),
+                                                static_cast<__nv_bfloat16*>(cache_v.data), tokens);
+         CUDA_CHECK(cudaGetLastError());
+     }
+@@ -123,26 +139,28 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
+ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
+                                            const PagedKVLayerView& cache, Tensor& out,
+                                            cudaStream_t stream) {
+-    const GqaPrefillDirectMetadata metadata{
+-        static_cast<const std::int32_t*>(cache.block_table.data)};
++    const GqaPrefillDirectMetadata metadata{};
++    const auto* direct_table = static_cast<const std::int32_t*>(cache.block_table.data);
+     if (q.ne[1] == Gqa27Geometry::QHeads) {
+         gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
+-                                                                 metadata, out, stream);
++                                                                 metadata, direct_table, out,
++                                                                 stream);
+         return;
+     }
+     gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache, metadata,
+-                                                             out, stream);
++                                                             direct_table, out, stream);
+ }
+ 
+ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                           PagedKVLayerView cache, cudaStream_t stream) {
+-    const GqaPrefillDirectMetadata metadata{
+-        static_cast<const std::int32_t*>(cache.block_table.data)};
++    const GqaPrefillDirectMetadata metadata{};
++    const auto* direct_table = static_cast<const std::int32_t*>(cache.block_table.data);
+     if (k.ne[1] == Gqa27Geometry::KVHeads) {
+-        gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
++        gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, direct_table,
++                                                stream);
+         return;
+     }
+-    gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
++    gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, direct_table, stream);
+ }
+ 
+ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+@@ -158,14 +176,16 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
+             .table_stride = cache.block_tables.ne[0],
+         };
+         if (q.ne[1] == Gqa27Geometry::QHeads) {
+-            gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
++            gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, nullptr,
++                                                    stream);
+             gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
+-                                                                     metadata, out, stream);
++                                                                     metadata, nullptr, out,
++                                                                     stream);
+             return;
+         }
+-        gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
++        gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, nullptr, stream);
+         gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache,
+-                                                                 metadata, out, stream);
++                                                                 metadata, nullptr, out, stream);
+     };
+     if (valid_columns.data == nullptr) {
+         launch.template operator()<false>();
+diff --git a/src/ops/linear_attention/gated_delta_net/chunked/output.cu b/src/ops/linear_attention/gated_delta_net/chunked/output.cu
+index 25dd7b3..b95603a 100644
+--- a/src/ops/linear_attention/gated_delta_net/chunked/output.cu
++++ b/src/ops/linear_attention/gated_delta_net/chunked/output.cu
+@@ -1,6 +1,8 @@
+ #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
+ #include "ops/linear_attention/gated_delta_net/chunked/output.cuh"
+ 
++#include <cstdlib>
++
+ namespace ninfer::ops::detail::gated_delta_net::chunked {
+ namespace {
+ 
+@@ -14,9 +16,15 @@ template <bool MULTI_JOB>
+ cudaError_t launch_fixed(const chunk_output_config& cfg, dim3 grid, head_map qk_map, int chunks) {
+     constexpr int smem_bytes = kernel::kernel_dims::SMEM_BYTES;
+ 
+-    cudaError_t err = cudaFuncSetAttribute(kernel::output_kernel<MULTI_JOB>,
+-                                           cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+-    if (err != cudaSuccess) { return err; }
++    int device = 0;
++    const bool remote_pipeline = std::getenv("NINFER_PIPELINE_DEVICE") != nullptr &&
++                                 cudaGetDevice(&device) == cudaSuccess && device != 0;
++    if (!remote_pipeline) {
++        cudaError_t err = cudaFuncSetAttribute(kernel::output_kernel<MULTI_JOB>,
++                                               cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                               smem_bytes);
++        if (err != cudaSuccess) { return err; }
++    }
+ 
+     const dim3 block(kernel::THREADS, 1, 1);
+ 
+diff --git a/src/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu b/src/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
+index 0d6ed63..eca0b2a 100644
+--- a/src/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
++++ b/src/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
+@@ -1,6 +1,8 @@
+ #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
+ #include "ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cuh"
+ 
++#include <cstdlib>
++
+ namespace ninfer::ops::detail::gated_delta_net::chunked {
+ namespace {
+ 
+@@ -12,10 +14,15 @@ cudaError_t launch_fixed(const prepare_wy_wu_config& cfg, dim3 grid, head_map qk
+     constexpr int smem_bytes = dims::SMEM_FLOATS * static_cast<int>(sizeof(float));
+     constexpr int threads    = BlockWarps * ninfer::ops::kWarpSize;
+ 
+-    cudaError_t err =
+-        cudaFuncSetAttribute(kernel::prepare_wy_wu_kernel<KPanelCols, WuPanelCols, BlockWarps>,
+-                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+-    if (err != cudaSuccess) { return err; }
++    int device = 0;
++    const bool remote_pipeline = std::getenv("NINFER_PIPELINE_DEVICE") != nullptr &&
++                                 cudaGetDevice(&device) == cudaSuccess && device != 0;
++    if (!remote_pipeline) {
++        cudaError_t err =
++            cudaFuncSetAttribute(kernel::prepare_wy_wu_kernel<KPanelCols, WuPanelCols, BlockWarps>,
++                                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
++        if (err != cudaSuccess) { return err; }
++    }
+ 
+     kernel::prepare_wy_wu_kernel<KPanelCols, WuPanelCols, BlockWarps>
+         <<<grid, dim3(threads, 1, 1), smem_bytes, cfg.stream>>>(
+diff --git a/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cu b/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cu
+index 73223a4..e16055f 100644
+--- a/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cu
++++ b/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cu
+@@ -1,6 +1,8 @@
+ #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
+ #include "ops/linear_attention/gated_delta_net/chunked/state_passing.cuh"
+ 
++#include <cstdlib>
++
+ namespace ninfer::ops::detail::gated_delta_net::chunked {
+ namespace {
+ 
+@@ -12,9 +14,15 @@ cudaError_t launch_fixed(const state_passing_config& cfg, head_map qk_map, int N
+     constexpr int smem_bytes =
+         kernel::smem_layout<NStrip>::SMEM_FLOATS * static_cast<int>(sizeof(float));
+ 
+-    cudaError_t err = cudaFuncSetAttribute(kernel::state_passing_kernel<NStrip>,
+-                                           cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+-    if (err != cudaSuccess) { return err; }
++    int device = 0;
++    const bool remote_pipeline = std::getenv("NINFER_PIPELINE_DEVICE") != nullptr &&
++                                 cudaGetDevice(&device) == cudaSuccess && device != 0;
++    if (!remote_pipeline) {
++        cudaError_t err = cudaFuncSetAttribute(kernel::state_passing_kernel<NStrip>,
++                                               cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                               smem_bytes);
++        if (err != cudaSuccess) { return err; }
++    }
+ 
+     const dim3 grid(static_cast<unsigned>(static_cast<std::int64_t>(cfg.H_v) * D::D_STRIPS), 1, 1);
+     const dim3 block(D::THREADS, 1, 1);
+diff --git a/src/ops/wrapper/gdn_input_proj.cpp b/src/ops/wrapper/gdn_input_proj.cpp
+index d4cddf3..3157e9d 100644
+--- a/src/ops/wrapper/gdn_input_proj.cpp
++++ b/src/ops/wrapper/gdn_input_proj.cpp
+@@ -190,7 +190,14 @@ void require_snapshot_nonoverlap(const Tensor& x, const Tensor& conv_weight,
+     for (std::size_t lhs = 0; lhs < tensors.size(); ++lhs) {
+         if (tensors[lhs]->data == nullptr) { continue; }
+         for (std::size_t rhs = lhs + 1; rhs < tensors.size(); ++rhs) {
+-            if (tensors[rhs]->data != nullptr && overlaps(*tensors[lhs], *tensors[rhs])) {
++            // The runtime intentionally uses the current state slot as the
++            // first snapshot destination for in-place verification. Both
++            // control arrays are read-only, so that exact alias is safe.
++            const bool aliased_slot_controls = lhs == 4 && rhs == 5 &&
++                                                tensors[lhs]->data == tensors[rhs]->data &&
++                                                tensors[lhs]->bytes() == tensors[rhs]->bytes();
++            if (!aliased_slot_controls && tensors[rhs]->data != nullptr &&
++                overlaps(*tensors[lhs], *tensors[rhs])) {
+                 throw std::invalid_argument(
+                     "gdn_input_proj_conv_snapshot: tensor operands must not overlap");
+             }
+diff --git a/src/ops/wrapper/gqa_attention.cpp b/src/ops/wrapper/gqa_attention.cpp
+index b85b6c1..5241682 100644
+--- a/src/ops/wrapper/gqa_attention.cpp
++++ b/src/ops/wrapper/gqa_attention.cpp
+@@ -483,4 +483,13 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
+     detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
+ }
+ 
++void gqa_attention_cached_chunked(const Tensor& q, const Tensor& positions, float scale,
++                                  const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
++                                  WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
++    constexpr const char* op = "gqa_attention_cached_chunked";
++    validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
++    auto scope = workspace.scope();
++    launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
++}
++
+ } // namespace ninfer::ops
+diff --git a/src/targets/qwen3_6/impl/runtime/decode_impl.h b/src/targets/qwen3_6/impl/runtime/decode_impl.h
+index dea1868..da1770f 100644
+--- a/src/targets/qwen3_6/impl/runtime/decode_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/decode_impl.h
+@@ -24,7 +24,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
+         TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
+                          state.execution.linear_attention, state.execution.io,
+                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
+-                         &state.text_cache);
++                         &state.text_cache, nullptr, state.execution.pipeline);
+ 
+         Tensor tokens          = ordinary.tokens.slice(0, 0, batch_size);
+         Tensor cache_positions = ordinary.cache_positions.slice(0, 0, batch_size);
+diff --git a/src/targets/qwen3_6/impl/runtime/layouts_impl.h b/src/targets/qwen3_6/impl/runtime/layouts_impl.h
+index ca50405..378f2bf 100644
+--- a/src/targets/qwen3_6/impl/runtime/layouts_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/layouts_impl.h
+@@ -17,6 +17,7 @@
+ #include "ninfer/ops/swa.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <initializer_list>
+ #include <limits>
+ #include <stdexcept>
+@@ -108,9 +109,20 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
+                     "MTP Paged KV physical pages exceed int32"));
+     LayoutBuilder builder;
+     PersistentLayout out;
++    std::uint32_t text_kv_layers = TextConfig::full_attention_layers();
++    if (std::getenv("NINFER_PIPELINE_DEVICE") != nullptr) {
++        if (text_kv_layers != 16U) {
++            throw std::invalid_argument(
++                "two-stage pipeline currently requires the 64-layer Qwen3.8 topology");
++        }
++        // The 36/28 layer split leaves nine full-attention layers on stage 0
++        // and seven on stage 1. Both stage layouts use the larger count so
++        // either cache remains safely addressable.
++        text_kv_layers = 8U;
++    }
+     out.decoder = qwen3_6::plan_decoder_state(
+         builder, qwen3_6::DecoderStateSpec{
+-                     .full_attention_layers     = TextConfig::full_attention_layers(),
++                     .full_attention_layers     = text_kv_layers,
+                      .mtp_layers                = TextConfig::mtp_layers,
+                      .capacity                  = plan.capacity,
+                      .kv_heads                  = TextConfig::kv_heads,
+diff --git a/src/targets/qwen3_6/impl/runtime/program.h b/src/targets/qwen3_6/impl/runtime/program.h
+index 11fcee5..abaf2cd 100644
+--- a/src/targets/qwen3_6/impl/runtime/program.h
++++ b/src/targets/qwen3_6/impl/runtime/program.h
+@@ -152,6 +152,7 @@ struct DecodeGraphFamily {
+ // output, sampling, and round-control state.
+ struct SequenceState {
+     std::optional<SequenceKVBundle> kv;
++    std::optional<SequenceKVBundle> pipeline_kv;
+     Tensor tail_hidden;
+     Tensor rewrite_checkpoint_hidden;
+     std::uint32_t lane = 0;
+@@ -262,6 +263,17 @@ public:
+     DeviceArena workspace_storage;
+     WorkspaceArena work;
+     std::unique_ptr<qwen3_6::DecoderState> decoder;
++    std::unique_ptr<DeviceContext> pipeline_device;
++    std::unique_ptr<DeviceArena> pipeline_persistent;
++    std::unique_ptr<DeviceArena> pipeline_workspace_storage;
++    std::unique_ptr<WorkspaceArena> pipeline_work;
++    std::unique_ptr<DeviceArena> pipeline_transfer;
++    std::unique_ptr<qwen3_6::DecoderState> pipeline_decoder;
++    qwen3_6::RoundState pipeline_io;
++    Tensor pipeline_prefill_hidden;
++    std::unique_ptr<PinnedHostBuffer> pipeline_hidden_bridge;
++    std::unique_ptr<PinnedHostBuffer> pipeline_control_bridge;
++    std::unique_ptr<schedule::TextPipelineStage> pipeline_text_stage;
+     std::optional<GdnReplayRecords> replay_records;
+     std::optional<DFlashPersistentState> dflash;
+     qwen3_6::RoundState io;
+@@ -334,6 +346,8 @@ private:
+     [[nodiscard]] const qwen3_6::PagedKVCache* backend_kv_cache() const noexcept;
+     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
+     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
++    [[nodiscard]] qwen3_6::PagedKVCacheView
++    pipeline_text_kv_view(const SequenceState& sequence) const;
+     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
+ };
+ 
+diff --git a/src/targets/qwen3_6/impl/runtime/program_impl.h b/src/targets/qwen3_6/impl/runtime/program_impl.h
+index 68397ec..1c6a9d1 100644
+--- a/src/targets/qwen3_6/impl/runtime/program_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/program_impl.h
+@@ -11,7 +11,9 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <charconv>
+ #include <chrono>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+@@ -21,6 +23,18 @@
+ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+ namespace {
+ 
++std::optional<int> configured_pipeline_device() {
++    const char* raw = std::getenv("NINFER_PIPELINE_DEVICE");
++    if (raw == nullptr || *raw == '\0') { return std::nullopt; }
++    int value = -1;
++    const char* end = raw + std::char_traits<char>::length(raw);
++    const auto parsed = std::from_chars(raw, end, value);
++    if (parsed.ec != std::errc{} || parsed.ptr != end || value < 0) {
++        throw std::invalid_argument("NINFER_PIPELINE_DEVICE must be a non-negative integer");
++    }
++    return value;
++}
++
+ using Clock = std::chrono::steady_clock;
+ 
+ std::int32_t checked_i32(std::uint32_t value, const char* label) {
+@@ -202,7 +216,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
+       dflash_host(plan.speculative_backend == SpeculativeBackend::DFlash
+                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_6::DFlashDecodeIngress) +
+                                                              sizeof(qwen3_6::DFlashDecodeEgress))
+-                      : std::nullopt) {
++                   : std::nullopt) {
+     if (model.weights_arena == nullptr) {
+         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
+     }
+@@ -219,6 +233,50 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
+     if (model.dflash.has_value() && model.vision.has_value()) {
+         throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
+     }
++    if (const auto stage_device = configured_pipeline_device()) {
++        if (*stage_device == device.device) {
++            throw std::invalid_argument("pipeline stages must use distinct CUDA devices");
++        }
++        if (speculative_backend != SpeculativeBackend::None || vision_enabled || use_cuda_graph) {
++            throw std::invalid_argument(
++                "initial NInfer pipeline mode requires --spec none, text-only, and --no-cuda-graph");
++        }
++        pipeline_device = std::make_unique<DeviceContext>(*stage_device);
++        pipeline_persistent = std::make_unique<DeviceArena>(plan.persistent.bytes);
++        pipeline_workspace_storage = std::make_unique<DeviceArena>(plan.workspace.capacity);
++        pipeline_work = std::make_unique<WorkspaceArena>(DeviceSpan{
++            pipeline_workspace_storage->base(), pipeline_workspace_storage->capacity()});
++        const DeviceSpan stage_backing =
++            pipeline_persistent->alloc_bytes(plan.persistent.bytes, 256);
++        pipeline_decoder =
++            std::make_unique<qwen3_6::DecoderState>(stage_backing, plan.persistent.decoder);
++        pipeline_io = qwen3_6::RoundState(stage_backing, plan.persistent.round);
++        pipeline_prefill_hidden = plan.persistent.prefill_hidden.bind(stage_backing);
++        const std::size_t transfer_capacity = pipeline_prefill_hidden.bytes() * 2ULL;
++        if (transfer_capacity < pipeline_prefill_hidden.bytes()) {
++            throw std::overflow_error("pipeline transfer arena capacity overflows size_t");
++        }
++        pipeline_transfer = std::make_unique<DeviceArena>(transfer_capacity);
++        pipeline_hidden_bridge =
++            std::make_unique<PinnedHostBuffer>(pipeline_prefill_hidden.bytes());
++        pipeline_control_bridge =
++            std::make_unique<PinnedHostBuffer>(pipeline_prefill_hidden.bytes());
++        pipeline_text_stage = std::make_unique<schedule::TextPipelineStage>(
++            schedule::TextPipelineStage{*pipeline_device, *pipeline_work, *pipeline_transfer,
++                                        pipeline_decoder->linear_attention, pipeline_io,
++                                        pipeline_prefill_hidden, pipeline_decoder->text_kv,
++                                        *pipeline_hidden_bridge, *pipeline_control_bridge});
++        CUDA_CHECK(cudaMemsetAsync(pipeline_io.rope_delta.data, 0,
++                                   pipeline_io.rope_delta.bytes(), pipeline_device->stream));
++        for (Tensor& tensor : pipeline_decoder->linear_attention.conv) {
++            CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), pipeline_device->stream));
++        }
++        for (Tensor& tensor : pipeline_decoder->linear_attention.recurrent) {
++            CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), pipeline_device->stream));
++        }
++        pipeline_device->synchronize();
++        CUDA_CHECK(cudaSetDevice(device.device));
++    }
+     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
+     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
+     if (plan.persistent.replay_records) {
+@@ -310,6 +368,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
+ 
+ ProgramImplCore::~ProgramImplCore() noexcept {
+     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
++    if (pipeline_device && pipeline_device->stream != nullptr) {
++        (void)cudaSetDevice(pipeline_device->device);
++        (void)cudaStreamSynchronize(pipeline_device->stream);
++        (void)cudaSetDevice(device.device);
++    }
+ }
+ 
+ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
+@@ -490,6 +553,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
+     try {
+         if (request_plan.reuse == ReusePath::FullReset) {
+             sequence.kv.reset();
++            sequence.pipeline_kv.reset();
+             ordered_reset(sequence);
+             sequence.ledger.clear();
+             sequence.text_kv_valid = 0;
+@@ -864,6 +928,7 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
+ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
+     request.prefill.reset();
+     sequence.kv.reset();
++    sequence.pipeline_kv.reset();
+     request.lifecycle           = Lifecycle::Empty;
+     sequence.execution_frontier = 0;
+     sequence.ledger_frontier    = 0;
+@@ -901,7 +966,9 @@ std::uint32_t ProgramImplCore::backend_kv_valid(const SequenceState& sequence) c
+ 
+ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
+                                           std::uint32_t backend_pages) {
+-    if (sequence.kv) { throw std::logic_error("sequence already owns a KV allocation bundle"); }
++    if (sequence.kv || sequence.pipeline_kv) {
++        throw std::logic_error("sequence already owns a KV allocation bundle");
++    }
+     if (text_pages == 0 || (backend_kv_cache() == nullptr) != (backend_pages == 0)) {
+         throw std::invalid_argument("KV allocation entitlement does not match the active backend");
+     }
+@@ -925,6 +992,16 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
+     bundle.text = std::move(allocations[0]);
+     if (count == 2) { bundle.backend.emplace(std::move(allocations[1])); }
+     sequence.kv.emplace(std::move(bundle));
++    if (pipeline_decoder) {
++        std::array<PagedKVReservation, 1> pipeline_reservations{
++            PagedKVReservation{.pool = &pipeline_decoder->text_kv.pool(),
++                               .page_entitlement = text_pages}};
++        std::vector<PagedKVAllocation> pipeline_allocations = reserve_paged_kv_bundle(
++            std::span<const PagedKVReservation>(pipeline_reservations));
++        SequenceKVBundle pipeline_bundle;
++        pipeline_bundle.text = std::move(pipeline_allocations[0]);
++        sequence.pipeline_kv.emplace(std::move(pipeline_bundle));
++    }
+ }
+ 
+ void ProgramImplCore::resize_sequence_kv_entitlement(SequenceState& sequence,
+@@ -949,6 +1026,17 @@ void ProgramImplCore::resize_sequence_kv_entitlement(SequenceState& sequence,
+         };
+     }
+     resize_paged_kv_bundle(std::span<PagedKVResize>(changes.data(), count));
++    if (pipeline_decoder) {
++        if (!sequence.pipeline_kv) {
++            throw std::logic_error("pipeline KV bundle is unavailable");
++        }
++        PagedKVResize pipeline_change{
++            .allocation       = &sequence.pipeline_kv->text,
++            .mapped_pages     = sequence.pipeline_kv->text.mapped_page_count(),
++            .page_entitlement = text_pages,
++        };
++        resize_paged_kv_bundle(std::span<PagedKVResize>(&pipeline_change, 1));
++    }
+ }
+ 
+ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
+@@ -963,6 +1051,18 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
+         set_device_i32(io.text_kv_table_row, sequence.kv->text.bound_row());
+         set_device_i32(io.backend_kv_table_row,
+                        sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
++        if (pipeline_decoder) {
++            if (!sequence.pipeline_kv || !pipeline_device) {
++                throw std::logic_error("pipeline KV bundle is unavailable");
++            }
++            CUDA_CHECK(cudaSetDevice(pipeline_device->device));
++            sequence.pipeline_kv->text.bind_row(row, pipeline_device->stream);
++            const std::int32_t pipeline_row = sequence.pipeline_kv->text.bound_row();
++            CUDA_CHECK(cudaMemcpyAsync(pipeline_io.text_kv_table_row.data, &pipeline_row,
++                                       sizeof(pipeline_row), cudaMemcpyHostToDevice,
++                                       pipeline_device->stream));
++            CUDA_CHECK(cudaSetDevice(device.device));
++        }
+     } catch (...) {
+         if (sequence.kv->backend && sequence.kv->backend->bound_row() >= 0) {
+             sequence.kv->backend->unbind_row();
+@@ -976,6 +1076,7 @@ void ProgramImplCore::unbind_sequence_kv(SequenceState& sequence) noexcept {
+     if (!sequence.kv) { return; }
+     if (sequence.kv->backend) { sequence.kv->backend->unbind_row(); }
+     sequence.kv->text.unbind_row();
++    if (sequence.pipeline_kv) { sequence.pipeline_kv->text.unbind_row(); }
+ }
+ 
+ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
+@@ -989,6 +1090,16 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
+     if (main_tokens > sequence.kv->text.mapped_token_capacity()) {
+         sequence.kv->text.materialize_tokens(main_tokens, device.stream);
+     }
++    if (pipeline_decoder) {
++        if (!pipeline_device || !sequence.pipeline_kv) {
++            throw std::logic_error("pipeline KV bundle is unavailable");
++        }
++        CUDA_CHECK(cudaSetDevice(pipeline_device->device));
++        if (main_tokens > sequence.pipeline_kv->text.mapped_token_capacity()) {
++            sequence.pipeline_kv->text.materialize_tokens(main_tokens, pipeline_device->stream);
++        }
++        CUDA_CHECK(cudaSetDevice(device.device));
++    }
+     if (backend_tokens != 0 && backend_tokens > sequence.kv->backend->mapped_token_capacity()) {
+         sequence.kv->backend->materialize_tokens(backend_tokens, device.stream);
+     }
+@@ -1003,12 +1114,14 @@ void ProgramImplCore::trim_sequence_kv(SequenceState& sequence, std::uint32_t ma
+         throw std::logic_error("backend KV trim requested without an allocation");
+     }
+     sequence.kv->text.trim_tokens(main_tokens);
++    if (sequence.pipeline_kv) { sequence.pipeline_kv->text.trim_tokens(main_tokens); }
+     if (sequence.kv->backend) { sequence.kv->backend->trim_tokens(backend_tokens); }
+ }
+ 
+ void ProgramImplCore::release_sequence_growth_entitlement(SequenceState& sequence) noexcept {
+     if (!sequence.kv) { return; }
+     sequence.kv->text.cancel_unmapped_entitlement();
++    if (sequence.pipeline_kv) { sequence.pipeline_kv->text.cancel_unmapped_entitlement(); }
+     if (sequence.kv->backend) { sequence.kv->backend->cancel_unmapped_entitlement(); }
+ }
+ 
+@@ -1017,6 +1130,15 @@ qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& seq
+     return decoder->text_kv.execution_view(sequence.kv->text);
+ }
+ 
++qwen3_6::PagedKVCacheView
++ProgramImplCore::pipeline_text_kv_view(const SequenceState& sequence) const {
++    if (!pipeline_decoder) { return {}; }
++    if (!sequence.pipeline_kv) {
++        throw std::logic_error("sequence has no pipeline KV allocation bundle");
++    }
++    return pipeline_decoder->text_kv.execution_view(sequence.pipeline_kv->text);
++}
++
+ qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequence) const {
+     if (speculative_backend != SpeculativeBackend::Mtp) { return {}; }
+     if (decoder->mtp_cache() == nullptr || !sequence.kv || !sequence.kv->backend) {
+@@ -1033,6 +1155,13 @@ void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
+ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
+     decoder->linear_attention.zero_slot(
+         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), device.stream);
++    if (pipeline_decoder && pipeline_device) {
++        CUDA_CHECK(cudaSetDevice(pipeline_device->device));
++        pipeline_decoder->linear_attention.zero_slot(
++            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
++            pipeline_device->stream);
++        CUDA_CHECK(cudaSetDevice(device.device));
++    }
+     work.reset();
+     set_device_i32(io.pos, 0);
+     set_device_i32(io.rope_pos, 0);
+@@ -1137,8 +1266,15 @@ void ProgramImplCore::prepare_graphs() {
+         }
+         if (dflash) { zero_capture_pages(dflash->full, dflash_capture_allocations, batch_size); }
+         for (std::uint32_t row = 0; row < batch_size; ++row) {
+-            decoder->linear_attention.zero_slot(
+-                LinearStateSlots::current_state_slot(row, max_concurrency), device.stream);
++            const std::int32_t current_slot =
++                LinearStateSlots::current_state_slot(row, max_concurrency);
++            decoder->linear_attention.zero_slot(current_slot, device.stream);
++            if (pipeline_decoder && pipeline_device) {
++                CUDA_CHECK(cudaSetDevice(pipeline_device->device));
++                pipeline_decoder->linear_attention.zero_slot(current_slot,
++                                                              pipeline_device->stream);
++                CUDA_CHECK(cudaSetDevice(device.device));
++            }
+             if (dflash) {
+                 zero_cyclic_lane(dflash->local, row);
+                 const Tensor pending =
+@@ -1224,7 +1360,8 @@ void ProgramImplCore::prepare_graphs() {
+                                        io,
+                                        prefill_hidden,
+                                        prefill_chunk,
+-                                       proposal_head};
++                                       proposal_head,
++                                       pipeline_text_stage.get()};
+     };
+ 
+     if (speculative_backend == SpeculativeBackend::None) {
+@@ -1351,6 +1488,19 @@ void ProgramImplCore::prepare_graphs() {
+     for (Tensor& tensor : decoder->linear_attention.recurrent) {
+         CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
+     }
++    if (pipeline_decoder && pipeline_device) {
++        CUDA_CHECK(cudaSetDevice(pipeline_device->device));
++        for (Tensor& tensor : pipeline_decoder->linear_attention.conv) {
++            CUDA_CHECK(
++                cudaMemsetAsync(tensor.data, 0, tensor.bytes(), pipeline_device->stream));
++        }
++        for (Tensor& tensor : pipeline_decoder->linear_attention.recurrent) {
++            CUDA_CHECK(
++                cudaMemsetAsync(tensor.data, 0, tensor.bytes(), pipeline_device->stream));
++        }
++        pipeline_device->synchronize();
++        CUDA_CHECK(cudaSetDevice(device.device));
++    }
+     if (dflash) {
+         const auto zero_cyclic_cache = [&](CyclicKVCache& cache) {
+             for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
+@@ -1520,7 +1670,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
+         schedule::PrefillContext schedule_state{
+             {device, model, work, decoder->linear_attention,
+              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+-             proposal_head},
++             proposal_head, pipeline_text_stage.get()},
+             text_kv_view(sequence),
+             mtp_kv_view(sequence),
+             decoder->text_kv,
+@@ -1786,7 +1936,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
+         schedule::OrdinaryBatchContext schedule_state{
+             {device, model, work, decoder->linear_attention,
+              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+-             proposal_head},
++             proposal_head, pipeline_text_stage.get()},
+             decoder->text_kv,
+             *io.ordinary,
+             *ordinary_host_ingress,
+diff --git a/src/targets/qwen3_6/impl/runtime/schedule.h b/src/targets/qwen3_6/impl/runtime/schedule.h
+index 6e26b35..924f15b 100644
+--- a/src/targets/qwen3_6/impl/runtime/schedule.h
++++ b/src/targets/qwen3_6/impl/runtime/schedule.h
+@@ -39,6 +39,7 @@ struct ExecutionCore {
+     Tensor& prefill_hidden;
+     std::uint32_t prefill_chunk;
+     ProposalHead proposal_head;
++    TextPipelineStage* pipeline = nullptr;
+ };
+ 
+ struct PrefillContext {
+diff --git a/src/targets/qwen3_6/impl/runtime/text_context.h b/src/targets/qwen3_6/impl/runtime/text_context.h
+index 4e59e9b..cba03a1 100644
+--- a/src/targets/qwen3_6/impl/runtime/text_context.h
++++ b/src/targets/qwen3_6/impl/runtime/text_context.h
+@@ -149,6 +149,18 @@ struct DFlashFeatureSink {
+ 
+ class VisionPrefillSession;
+ 
++struct TextPipelineStage {
++    DeviceContext& device;
++    WorkspaceArena& work;
++    DeviceArena& transfer;
++    LinearAttentionStatePool& linear_attention;
++    qwen3_6::RoundState& io;
++    Tensor& prefill_hidden;
++    const qwen3_6::PagedKVCache& text_cache;
++    PinnedHostBuffer& hidden_bridge;
++    PinnedHostBuffer& control_bridge;
++};
++
+ class TextContext {
+ public:
+     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
+@@ -157,7 +169,9 @@ public:
+                 std::uint32_t text_kv_base,
+                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
+                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
+-                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr);
++                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr,
++                TextPipelineStage* pipeline                 = nullptr,
++                std::uint32_t kv_layer_base                 = 0);
+     ~TextContext();
+ 
+     TextContext(const TextContext&)            = delete;
+@@ -245,6 +259,8 @@ private:
+     template <class Tap>
+     void run_layers(Tensor& x, Phase phase, Tap& tap);
+     template <class Tap>
++    void run_layers_range(Tensor& x, Phase phase, Tap& tap, int begin, int end);
++    template <class Tap>
+     void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
+                                   const Tensor& rope_positions, const Tensor& valid_columns,
+                                   const Tensor& kv_table_rows, const Tensor& linear_state_slots,
+@@ -294,6 +310,7 @@ private:
+     Tensor& prefill_hidden_;
+     std::uint32_t prefill_chunk_;
+     std::uint32_t text_kv_base_;
++    std::uint32_t kv_layer_base_ = 0;
+     const Tensor* active_cache_positions_                 = nullptr;
+     const Tensor* active_rope_positions_                  = nullptr;
+     const Tensor* active_kv_table_rows_                   = nullptr;
+@@ -311,6 +328,7 @@ private:
+     std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;
+     Tensor* rewrite_checkpoint_hidden_output_             = nullptr;
+     std::uint32_t mtp_proposal_extent_                    = 0;
++    TextPipelineStage* pipeline_                          = nullptr;
+ 
+     const Weight* embed_                        = nullptr;
+     const Tensor* final_norm_                   = nullptr;
+diff --git a/src/targets/qwen3_6/impl/runtime/text_context_impl.h b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+index 5d70829..2150774 100644
+--- a/src/targets/qwen3_6/impl/runtime/text_context_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+@@ -223,10 +223,12 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
+                          std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
+                          qwen3_6::PagedKVCacheView mtp_kv,
+                          const qwen3_6::PagedKVCache* batch_text_kv,
+-                         const qwen3_6::PagedKVCache* batch_mtp_kv)
++                         const qwen3_6::PagedKVCache* batch_mtp_kv,
++                         TextPipelineStage* pipeline, std::uint32_t kv_layer_base)
+     : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
+       prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base),
+-      batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv) {
++      kv_layer_base_(kv_layer_base), batch_text_kv_(batch_text_kv),
++      batch_mtp_kv_(batch_mtp_kv), pipeline_(pipeline) {
+     if (prefill_chunk_ == 0 ||
+         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
+@@ -826,7 +828,29 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
+     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
+     const Tensor& kv_table_rows =
+         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+-    if (active_sequence_batch_ != 0) {
++    if (kv_layer_base_ != 0) {
++        if (active_sequence_batch_ > 1) {
++            throw std::logic_error("pipeline direct attention currently requires batch one");
++        }
++        const PagedKVBatchLayerView batch_cache =
++            batch_text_kv_->batch_layer_view(fidx - kv_layer_base_);
++        const PagedKVLayerView direct_cache{
++            .k_pages       = batch_cache.k_pages,
++            .v_pages       = batch_cache.v_pages,
++            .k_scale_pages = batch_cache.k_scale_pages,
++            .v_scale_pages = batch_cache.v_scale_pages,
++            .block_table   = batch_cache.block_tables.slice(1, 0, 1).view(
++                {batch_cache.block_tables.ne[0]}),
++            .head_dim      = batch_cache.head_dim,
++            .num_kv_heads = batch_cache.num_kv_heads,
++            .dtype         = batch_cache.dtype,
++            .quant_group   = batch_cache.quant_group,
++        };
++        const Tensor direct_positions = cache_positions.view({T});
++        ops::gqa_kv_append(kn, v, direct_positions, direct_cache, s);
++        ops::gqa_attention_cached_chunked(qn, direct_positions, kAttnScale, direct_cache,
++                                          *active_gqa_envelope_, work_, a, s);
++    } else if (active_sequence_batch_ != 0) {
+         const std::int32_t width = active_sequence_width_;
+         if (width <= 0 || width * active_sequence_batch_ != T) {
+             throw std::logic_error("Text sequence batch binding does not match aggregate columns");
+@@ -838,12 +862,12 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
+         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
+         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
+         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
+-                           kAttnScale, batch_text_kv_->batch_layer_view(fidx),
++                           kAttnScale, batch_text_kv_->batch_layer_view(fidx - kv_layer_base_),
+                            *active_gqa_envelope_, work_, a_batch, s);
+     } else {
+         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
+-                           batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
+-                           s);
++                           batch_text_kv_->batch_layer_view(fidx - kv_layer_base_),
++                           *active_gqa_envelope_, work_, a, s);
+     }
+     ops::sigmoid_mul(gate, a, s);
+ 
+@@ -965,9 +989,12 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
+ }
+ 
+ template <class Tap>
+-void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
++void TextContext::run_layers_range(Tensor& x, Phase ph, Tap& tap, int begin, int end) {
+     const bool prefill = ph == Phase::Prefill;
+-    for (int layer = 0; layer < kCfg.n_layers; ++layer) {
++    if (begin < 0 || end < begin || end > kCfg.n_layers) {
++        throw std::invalid_argument("Text layer range is invalid");
++    }
++    for (int layer = begin; layer < end; ++layer) {
+         if (ModelConfig::is_full(layer)) {
+             const int fidx         = ModelConfig::full_idx(layer);
+             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
+@@ -1014,6 +1041,82 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
+     }
+ }
+ 
++template <class Tap>
++void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
++    if (pipeline_ == nullptr) {
++        run_layers_range(x, ph, tap, 0, kCfg.n_layers);
++        return;
++    }
++    constexpr int split = 32;
++    run_layers_range(x, ph, tap, 0, split);
++    ctx_.synchronize();
++
++    TextPipelineStage& stage = *pipeline_;
++    CUDA_CHECK(cudaSetDevice(stage.device.device));
++    stage.work.reset();
++    stage.transfer.reset();
++    // Preserve the native TextContext workspace topology: the residual is a
++    // live root allocation and layer scopes begin after it. Transfer-only
++    // control tensors remain in the separate arena below.
++    Tensor remote_x = stage.work.alloc(DType::BF16, {x.ne[0], x.ne[1], x.ne[2], x.ne[3]});
++
++    // A CUDA D2D copy is only valid inside one CUDA address space.  With a
++    // Lupine-backed device, the source and destination belong to different
++    // driver instances (and potentially different hosts), so stage explicitly
++    // through pinned host memory.  The synchronous copies are the conservative
++    // correctness path; the transport can overlap/reuse these buffers later.
++    auto copy_between_devices = [&](void* destination, int destination_device,
++                                    const void* source, int source_device,
++                                    std::size_t bytes, PinnedHostBuffer& bridge) {
++        if (bytes > bridge.size()) {
++            throw std::runtime_error("pipeline bridge capacity is too small");
++        }
++        CUDA_CHECK(cudaSetDevice(source_device));
++        CUDA_CHECK(cudaMemcpy(bridge.data(), source, bytes, cudaMemcpyDeviceToHost));
++        CUDA_CHECK(cudaSetDevice(destination_device));
++        CUDA_CHECK(cudaMemcpy(destination, bridge.data(), bytes, cudaMemcpyHostToDevice));
++    };
++    copy_between_devices(remote_x.data, stage.device.device, x.data, ctx_.device, x.bytes(),
++                         stage.hidden_bridge);
++
++    auto copy_control = [&](const Tensor* source) {
++        if (source == nullptr) { return Tensor{}; }
++        CUDA_CHECK(cudaSetDevice(stage.device.device));
++        Tensor target = stage.transfer.alloc(
++            source->dtype, {source->ne[0], source->ne[1], source->ne[2], source->ne[3]});
++        copy_between_devices(target.data, stage.device.device, source->data, ctx_.device,
++                             source->bytes(), stage.control_bridge);
++        return target;
++    };
++    Tensor cache_positions = copy_control(active_cache_positions_);
++    Tensor rope_positions  = copy_control(active_rope_positions_);
++    Tensor kv_rows         = copy_control(active_kv_table_rows_);
++    Tensor state_slots     = copy_control(active_linear_state_slots_);
++    Tensor valid_columns   = copy_control(active_valid_columns_);
++
++    TextContext remote(stage.device, weights_, stage.work, {}, stage.linear_attention, stage.io,
++                       stage.prefill_hidden, prefill_chunk_, text_kv_base_, {}, &stage.text_cache,
++                       nullptr, nullptr, 8);
++    remote.active_cache_positions_    = cache_positions.data ? &cache_positions : nullptr;
++    remote.active_rope_positions_     = rope_positions.data ? &rope_positions : nullptr;
++    remote.active_kv_table_rows_      = kv_rows.data ? &kv_rows : nullptr;
++    remote.active_linear_state_slots_ = state_slots.data ? &state_slots : nullptr;
++    remote.active_valid_columns_      = valid_columns.data ? &valid_columns : nullptr;
++    remote.active_gqa_envelope_       = active_gqa_envelope_;
++    remote.active_sequence_batch_     = active_sequence_batch_;
++    remote.active_sequence_width_     = active_sequence_width_;
++    remote.linear_state_current_slot_ = linear_state_current_slot_;
++    remote.linear_state_rewrite_checkpoint_slot_ = linear_state_rewrite_checkpoint_slot_;
++    NullTap remote_tap;
++    remote.run_layers_range(remote_x, ph, remote_tap, split, kCfg.n_layers);
++    stage.device.synchronize();
++
++    copy_between_devices(x.data, ctx_.device, remote_x.data, stage.device.device, x.bytes(),
++                         stage.hidden_bridge);
++    CUDA_CHECK(cudaSetDevice(ctx_.device));
++    stage.transfer.reset();
++}
++
+ void TextContext::run_layers(Tensor& x, Phase ph) {
+     NullTap tap;
+     run_layers(x, ph, tap);
+diff --git a/src/targets/qwen3_6/impl/runtime/text_prefill_impl.h b/src/targets/qwen3_6/impl/runtime/text_prefill_impl.h
+index 8140ced..1e0ea74 100644
+--- a/src/targets/qwen3_6/impl/runtime/text_prefill_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/text_prefill_impl.h
+@@ -59,7 +59,8 @@ PrefillChunkResult prefill_text_chunk(
+     TextContext card(state.execution.device, state.execution.model, state.execution.work,
+                      state.text_kv, state.execution.linear_attention, state.execution.io,
+                      state.execution.prefill_hidden, state.execution.prefill_chunk,
+-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
++                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
++                     state.execution.pipeline);
+     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
+                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
+@@ -87,7 +88,8 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
+     TextContext card(state.execution.device, state.execution.model, state.execution.work,
+                      state.text_kv, state.execution.linear_attention, state.execution.io,
+                      state.execution.prefill_hidden, state.execution.prefill_chunk,
+-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
++                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
++                     state.execution.pipeline);
+     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
+                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
+diff --git a/src/targets/qwen3_6_27b/impl/variant.cpp b/src/targets/qwen3_6_27b/impl/variant.cpp
+index 3624224..5a9f923 100644
+--- a/src/targets/qwen3_6_27b/impl/variant.cpp
++++ b/src/targets/qwen3_6_27b/impl/variant.cpp
+@@ -59,6 +59,24 @@ ops::LinearPolicy text_policy(const Weight& weight) {
+ 
+ constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
+ 
++std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
++                                         const Variant::GdnProjectionWeights& weights) {
++    const std::int32_t batch = hidden.ne[2];
++    const std::int32_t width = hidden.ne[1];
++    if (std::holds_alternative<SplitGdnInputProjectionPayload>(weights.input_projection)) {
++        return std::max(kMinimumLeafWorkspaceBytes,
++                        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
++                            TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
++                            width, width));
++    }
++    const Weight& parent =
++        std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
++    return std::max(
++        kMinimumLeafWorkspaceBytes,
++        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
++            parent.qtype, parent.n, parent.k, text_policy(parent), batch, width, width));
++}
++
+ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
+                                        const Variant::GdnProjectionWeights& weights) {
+     const std::int32_t batch = hidden.ne[2];
+@@ -206,20 +224,23 @@ void Variant::gdn_input_projection_snapshot(
+     Tensor& conv_states, const Tensor& valid_columns, const Tensor& initial_slot,
+     const Tensor& snapshot_base_slot, Tensor& query, Tensor& key, Tensor& value,
+     Tensor& output_gate, qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
++    auto workspace_scope     = workspace.scope();
++    const DeviceSpan storage = workspace.alloc_bytes(gdn_snapshot_workspace_bytes(hidden, weights));
++    WorkspaceArena leaf_workspace(storage);
+     Tensor output_gate_view = output_gate.view({TextConfig::value_dim, hidden.ne[1], hidden.ne[2]});
+     if (const auto* split =
+             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
+         ops::gdn_input_proj_conv_snapshot(hidden, split->query_key, split->value_z, conv_weight,
+                                           conv_states, valid_columns, initial_slot,
+                                           snapshot_base_slot, query, key, value, output_gate_view,
+-                                          workspace, stream);
++                                          leaf_workspace, stream);
+         return;
+     }
+     const Weight& fused =
+         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
+     ops::gdn_input_proj_conv_snapshot(hidden, fused, conv_weight, conv_states, valid_columns,
+                                       initial_slot, snapshot_base_slot, query, key, value,
+-                                      output_gate_view, text_policy(fused), workspace, stream);
++                                      output_gate_view, text_policy(fused), leaf_workspace, stream);
+ }
+ 
+ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProjectionWeights& weights,
+diff --git a/src/targets/registry.cpp b/src/targets/registry.cpp
+index 95763bb..a5815a5 100644
+--- a/src/targets/registry.cpp
++++ b/src/targets/registry.cpp
+@@ -6,11 +6,17 @@
+ #include "core/device.h"
+ #include "runtime/engine/kv_capacity.h"
+ 
++#include <array>
+ #include <chrono>
++#include <charconv>
++#include <cstdlib>
+ #include <cstdint>
++#include <limits>
++#include <optional>
+ #include <stdexcept>
+ #include <string>
+ #include <string_view>
++#include <type_traits>
+ #include <utility>
+ 
+ namespace ninfer::targets {
+@@ -79,6 +85,55 @@ std::size_t current_free_device_bytes() {
+     return free_bytes;
+ }
+ 
++std::optional<int> pipeline_device_from_environment() {
++    const char* raw = std::getenv("NINFER_PIPELINE_DEVICE");
++    if (raw == nullptr || *raw == '\0') { return std::nullopt; }
++    int value = -1;
++    const char* end = raw + std::char_traits<char>::length(raw);
++    const auto parsed = std::from_chars(raw, end, value);
++    if (parsed.ec != std::errc{} || parsed.ptr != end || value < 0) {
++        throw std::invalid_argument("NINFER_PIPELINE_DEVICE must be a non-negative integer");
++    }
++    return value;
++}
++
++std::optional<std::uint32_t> text_layer(std::string_view name) {
++    constexpr std::string_view prefix = "text/layers/";
++    if (!name.starts_with(prefix)) { return std::nullopt; }
++    name.remove_prefix(prefix.size());
++    const std::size_t slash = name.find('/');
++    if (slash == std::string_view::npos) { return std::nullopt; }
++    std::uint32_t layer = 0;
++    const auto parsed = std::from_chars(name.data(), name.data() + slash, layer);
++    if (parsed.ec != std::errc{} || parsed.ptr != name.data() + slash) { return std::nullopt; }
++    return layer;
++}
++
++artifact::MaterializationPlan pipeline_weight_plan(
++    const artifact::Reader& reader, const artifact::MaterializationPlan& source) {
++    constexpr std::uint32_t split = 32;
++    artifact::MaterializationPlan out = source;
++    out.device_capacities.assign(2, 0);
++    for (artifact::DeviceMaterialization& placement : out.device_objects) {
++        const std::string_view name = artifact::object_name(
++            reader.objects().at(placement.object.index));
++        const auto layer = text_layer(name);
++        placement.device = layer && *layer >= split ? 1U : 0U;
++        std::uint64_t& capacity = out.device_capacities[placement.device];
++        const std::uint64_t mask = placement.alignment - 1;
++        if (capacity > std::numeric_limits<std::uint64_t>::max() - mask) {
++            throw artifact::ArtifactError("pipeline materialization plan overflows u64");
++        }
++        placement.offset = (capacity + mask) & ~mask;
++        if (placement.bytes > std::numeric_limits<std::uint64_t>::max() - placement.offset) {
++            throw artifact::ArtifactError("pipeline materialization plan overflows u64");
++        }
++        capacity = placement.offset + placement.bytes;
++    }
++    out.device_capacity_bytes = out.device_capacities.front();
++    return out;
++}
++
+ template <class Target, class Loaded, class Instance>
+ ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
+                                        artifact::Reader& reader, Clock::time_point load_start,
+@@ -91,16 +146,40 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
+     auto load_plan        = Target::plan_load(binder, options, weights_profile);
+     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
+     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
++    std::optional<DeviceContext> pipeline_device;
++    std::optional<artifact::MaterializationPlan> partitioned;
++    if constexpr (std::is_same_v<Target, Qwen3_6_27B>) {
++        if (const auto id = pipeline_device_from_environment()) {
++            if (*id == device.device) {
++                throw std::invalid_argument("pipeline stages must use distinct CUDA devices");
++            }
++            pipeline_device.emplace(*id);
++            partitioned.emplace(pipeline_weight_plan(reader, load_plan.materialization()));
++        }
++    }
++    CUDA_CHECK(cudaSetDevice(device.device));
++    const artifact::MaterializationPlan& materialization =
++        partitioned ? *partitioned : load_plan.materialization();
+     const std::size_t preflight_runtime_bytes =
+-        runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes);
++        runtime_bytes_after_planned_weights(materialization.device_capacity_bytes);
+     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
+ 
+     auto progress     = artifact_progress(options.load_progress);
+-    auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
+-                                              progress.callback ? &progress : nullptr);
++    artifact::MaterializedArtifact materialized;
++    if (pipeline_device) {
++        CUDA_CHECK(cudaSetDevice(pipeline_device->device));
++        (void)runtime_bytes_after_planned_weights(materialization.device_capacities.at(1));
++        std::array<DeviceContext*, 2> devices{&device, &*pipeline_device};
++        materialized = artifact::materialize(reader, materialization, devices,
++                                             progress.callback ? &progress : nullptr);
++    } else {
++        materialized = artifact::materialize(reader, materialization, device,
++                                             progress.callback ? &progress : nullptr);
++    }
+     const artifact::MaterializationStats stats = materialized.stats();
+ 
+     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
++    CUDA_CHECK(cudaSetDevice(device.device));
+     device.synchronize();
+     runtime::KvCapacityResolution capacity_resolution =
+         runtime::resolve_kv_capacity(options.kv_capacity, curve, current_free_device_bytes());

@@ -536,6 +536,43 @@ def start_server(
         raise RgpuError(f"remote server container {name} exited during startup")
 
 
+def reuse_persistent_server(host: Host, name: str) -> None:
+    """Validate and reuse an explicitly selected rgpu-owned persistent lease."""
+    active = remote_compute_processes(host)
+    if active:
+        raise RgpuError(
+            f"remote GPU {host.ssh_target} is already in use; refusing to interfere:\n{active}"
+        )
+    inspected = ssh(
+        host,
+        [
+            "docker",
+            "inspect",
+            "--format",
+            "{{json .Config.Labels}} {{.State.Running}}",
+            name,
+        ],
+    )
+    value = require_success(inspected, f"inspect persistent lease on {host.ssh_target}")
+    try:
+        raw_labels, running = value.rsplit(" ", 1)
+        labels = json.loads(raw_labels)
+    except (AttributeError, ValueError, json.JSONDecodeError) as exc:
+        raise RgpuError(f"invalid persistent lease metadata on {host.ssh_target}") from exc
+    if not isinstance(labels, dict) or labels.get("io.rgpu.managed") != "true":
+        raise RgpuError(f"refusing unmanaged container {name} on {host.ssh_target}")
+    if labels.get("io.rgpu.lease-mode") != "persistent":
+        raise RgpuError(f"container {name} is not a persistent rgpu attachment lease")
+    if labels.get("io.rgpu.endpoint") != host.endpoint:
+        raise RgpuError(
+            f"persistent lease endpoint does not match {host.endpoint}: "
+            f"{labels.get('io.rgpu.endpoint')!r}"
+        )
+    if running != "true":
+        raise RgpuError(f"persistent lease {name} is not running on {host.ssh_target}")
+    wait_ready(host)
+
+
 def stop_server(host: Host, name: str) -> None:
     # Keep cleanup inside common orchestrator SIGTERM→SIGKILL grace periods.
     # The server owns only this launcher's leased CUDA contexts and does not
@@ -995,14 +1032,17 @@ def command_run(args: argparse.Namespace) -> int:
         for host in hosts:
             require_matching_server_image(host, args.server_image)
             name = server_name(host)
-            start_server(
-                host,
-                name,
-                args.server_image,
-                lease_mode="ephemeral",
-                session=session,
-            )
-            started.append((host, name))
+            if getattr(args, "reuse_attached", False):
+                reuse_persistent_server(host, name)
+            else:
+                start_server(
+                    host,
+                    name,
+                    args.server_image,
+                    lease_mode="ephemeral",
+                    session=session,
+                )
+                started.append((host, name))
         child = subprocess.Popen(
             client_command(
                 args,
@@ -1250,6 +1290,12 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--server-image", default=DEFAULT_SERVER_IMAGE)
     run.add_argument("--shim-image", default=DEFAULT_SHIM_IMAGE)
     run.add_argument("--deploy", action="store_true")
+    run.add_argument(
+        "--reuse-attached",
+        action="store_true",
+        help=("reuse a validated, idle persistent server created by rgpu attach; "
+              "the run will not stop that server"),
+    )
     run.add_argument("--workspace", default=os.getcwd())
     run.add_argument("--workspace-write", action="store_true")
     run.add_argument(

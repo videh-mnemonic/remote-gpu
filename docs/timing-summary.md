@@ -1,6 +1,6 @@
 # Native and remote GPU timing summary
 
-Last updated: 2026-08-22
+Last updated: 2026-08-24
 
 “Native” is direct execution on the RTX 5090 in `ws-5090-1`. “Remote” is
 execution from `ws-5090-2` on that same GPU through the current optimized
@@ -34,6 +34,29 @@ digest natively and remotely.
 | Same | Time to first token | 1.868 s | 1.882 s | 1.008× | Pass |
 | Same | Request wall time | 1.934 s | 1.960 s | 1.013× | Pass |
 | Prior no-graph model initialization | Model loaded | 3.614 s | 21.679 s | 5.999× | Pass; retained for comparison |
+
+### Local plus remote GPU, 1M context
+
+This profile partitions the unmodified `ali` Qwen3.8 27B artifact at layer 32:
+eight full-attention KV-cache layers reside on each RTX 5090. The server reserves
+an INT8 KV cache for 1,048,576 tokens and uses a 1,024-token prefill chunk. Mixed
+two-device mode currently requires `--no-cuda-graph`; the remote half uses a
+chunked attention compatibility route because its large fused prompt kernel is
+not reliable through the RPC launch marshaller.
+
+| Profile | Metric | Native, one GPU | Local + remote | Pipeline/native | Result |
+|---|---|---:|---:|---:|---|
+| 7,012-token prompt, one-token generation | Prefill throughput | 9,171.0 tok/s | 7,637.2 tok/s | 0.833× | Pass; identical request completes at full 1M reservation |
+| 35-token prompt, 128-token generation | Decode throughput | 74.3 tok/s | 63.1 tok/s | 0.849× | Pass; identical 128-token output |
+| Full 1M startup | Local GPU memory | — | 28,202 MiB | — | Pass |
+| Full 1M startup | Remote GPU memory | — | 26,766 MiB | — | Pass |
+| Full 1M startup | Reported local slack | — | 3.66 GiB | — | Pass; 2K and 7K prompts complete |
+
+The earlier 36/28-layer split allocated nine local cache layers and left only
+about 0.8 GiB of local slack. Rebalancing to 32/32 layers and eight cache layers
+per GPU made the full reservation usable by nontrivial prompts. Increasing the
+prefill chunk from 128 to 1,024 raised the 7K pipeline result from about 4,154 to
+7,637 tok/s; 2,048 was rejected because warmup was not stable.
 
 ## Current performance-focused results
 

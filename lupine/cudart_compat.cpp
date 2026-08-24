@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <vector>
 
@@ -13,6 +14,162 @@ extern "C" int lupine_restore_default_context_hint();
 extern "C" int lupine_repair_current_context_device(int device);
 
 static thread_local int lupine_runtime_device = -1;
+
+enum lupine_cuda_memcpy_kind {
+  LUPINE_CUDA_MEMCPY_HOST_TO_HOST = 0,
+  LUPINE_CUDA_MEMCPY_HOST_TO_DEVICE = 1,
+  LUPINE_CUDA_MEMCPY_DEVICE_TO_HOST = 2,
+  LUPINE_CUDA_MEMCPY_DEVICE_TO_DEVICE = 3,
+  LUPINE_CUDA_MEMCPY_DEFAULT = 4,
+};
+
+static int lupine_runtime_error(CUresult result) {
+  switch (result) {
+    case CUDA_SUCCESS:
+      return 0;  // cudaSuccess
+    case CUDA_ERROR_INVALID_VALUE:
+      return 1;  // cudaErrorInvalidValue
+    case CUDA_ERROR_INVALID_DEVICE:
+      return 10; // cudaErrorInvalidDevice
+    case CUDA_ERROR_OUT_OF_MEMORY:
+      return 2;  // cudaErrorMemoryAllocation
+    case CUDA_ERROR_DEVICE_UNAVAILABLE:
+      return 46; // cudaErrorDevicesUnavailable
+    default:
+      return 999; // cudaErrorUnknown
+  }
+}
+
+static int lupine_cudaMemcpy2D_common(
+    void *dst, size_t dpitch, const void *src, size_t spitch, size_t width,
+    size_t height, int kind, void *stream, bool async) {
+  if (width == 0 || height == 0) return 0;
+  if (dst == nullptr || src == nullptr || width > dpitch || width > spitch) {
+    return 1;
+  }
+  if (kind == LUPINE_CUDA_MEMCPY_HOST_TO_HOST) {
+    for (size_t row = 0; row < height; ++row) {
+      std::memcpy(static_cast<unsigned char *>(dst) + row * dpitch,
+                  static_cast<const unsigned char *>(src) + row * spitch,
+                  width);
+    }
+    return 0;
+  }
+  if (kind == LUPINE_CUDA_MEMCPY_DEFAULT) {
+    auto is_device = [](const void *pointer) {
+      unsigned int memory_type = CU_MEMORYTYPE_HOST;
+      CUresult result = cuPointerGetAttribute(
+          &memory_type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+          reinterpret_cast<CUdeviceptr>(pointer));
+      return result == CUDA_SUCCESS &&
+             (memory_type == CU_MEMORYTYPE_DEVICE ||
+              memory_type == CU_MEMORYTYPE_UNIFIED);
+    };
+    const bool source_device = is_device(src);
+    const bool destination_device = is_device(dst);
+    if (source_device && destination_device) {
+      kind = LUPINE_CUDA_MEMCPY_DEVICE_TO_DEVICE;
+    } else if (source_device) {
+      kind = LUPINE_CUDA_MEMCPY_DEVICE_TO_HOST;
+    } else if (destination_device) {
+      kind = LUPINE_CUDA_MEMCPY_HOST_TO_DEVICE;
+    } else {
+      for (size_t row = 0; row < height; ++row) {
+        std::memcpy(static_cast<unsigned char *>(dst) + row * dpitch,
+                    static_cast<const unsigned char *>(src) + row * spitch,
+                    width);
+      }
+      return 0;
+    }
+  }
+
+  using pointer_route_fn_t = int (*)(CUdeviceptr);
+  static pointer_route_fn_t pointer_route =
+      reinterpret_cast<pointer_route_fn_t>(
+          dlsym(RTLD_DEFAULT, "lupine_cuda_deviceptr_route_id"));
+  const void *routing_pointer =
+      kind == LUPINE_CUDA_MEMCPY_DEVICE_TO_HOST ? src : dst;
+  const int route = pointer_route == nullptr
+                        ? -2
+                        : pointer_route(reinterpret_cast<CUdeviceptr>(routing_pointer));
+  if (route < 0) {
+    if (async) {
+      using real_async_fn_t = int (*)(void *, size_t, const void *, size_t,
+                                     size_t, size_t, int, void *);
+      static real_async_fn_t real_async = reinterpret_cast<real_async_fn_t>(
+          dlsym(RTLD_NEXT, "cudaMemcpy2DAsync"));
+      return real_async == nullptr
+                 ? 999
+                 : real_async(dst, dpitch, src, spitch, width, height, kind,
+                              stream);
+    }
+    using real_sync_fn_t = int (*)(void *, size_t, const void *, size_t,
+                                  size_t, size_t, int);
+    static real_sync_fn_t real_sync = reinterpret_cast<real_sync_fn_t>(
+        dlsym(RTLD_NEXT, "cudaMemcpy2D"));
+    return real_sync == nullptr
+               ? 999
+               : real_sync(dst, dpitch, src, spitch, width, height, kind);
+  }
+
+  CUDA_MEMCPY2D copy{};
+  copy.WidthInBytes = width;
+  copy.Height = height;
+  copy.srcPitch = spitch;
+  copy.dstPitch = dpitch;
+  switch (kind) {
+    case LUPINE_CUDA_MEMCPY_HOST_TO_DEVICE:
+      copy.srcMemoryType = CU_MEMORYTYPE_HOST;
+      copy.srcHost = src;
+      copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+      copy.dstDevice = reinterpret_cast<CUdeviceptr>(dst);
+      break;
+    case LUPINE_CUDA_MEMCPY_DEVICE_TO_HOST:
+      copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+      copy.srcDevice = reinterpret_cast<CUdeviceptr>(src);
+      copy.dstMemoryType = CU_MEMORYTYPE_HOST;
+      copy.dstHost = dst;
+      break;
+    case LUPINE_CUDA_MEMCPY_DEVICE_TO_DEVICE:
+      copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+      copy.srcDevice = reinterpret_cast<CUdeviceptr>(src);
+      copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+      copy.dstDevice = reinterpret_cast<CUdeviceptr>(dst);
+      break;
+    default:
+      return 21;
+  }
+  const CUresult result = async
+                              ? cuMemcpy2DAsync_v2(
+                                    &copy, reinterpret_cast<CUstream>(stream))
+                              : cuMemcpy2D_v2(&copy);
+  return lupine_runtime_error(result);
+}
+
+// libcudart validates Runtime pointer ownership before reaching the interposed
+// Driver API.  That rejects a perfectly valid remote-only 2D copy in a mixed
+// local/remote process.  Translate explicit Runtime directions directly to the
+// routed Driver operation, just as the 1D Runtime path already does internally.
+extern "C" int cudaMemcpy2DAsync(
+    void *dst, size_t dpitch, const void *src, size_t spitch, size_t width,
+    size_t height, int kind, void *stream) {
+  return lupine_cudaMemcpy2D_common(dst, dpitch, src, spitch, width, height,
+                                    kind, stream, true);
+}
+
+extern "C" int cudaMemcpy2DAsync_ptsz(
+    void *dst, size_t dpitch, const void *src, size_t spitch, size_t width,
+    size_t height, int kind, void *stream) {
+  return cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, kind,
+                           stream);
+}
+
+extern "C" int cudaMemcpy2D(
+    void *dst, size_t dpitch, const void *src, size_t spitch, size_t width,
+    size_t height, int kind) {
+  return lupine_cudaMemcpy2D_common(dst, dpitch, src, spitch, width, height,
+                                    kind, nullptr, false);
+}
 
 struct lupine_registered_runtime_function {
   void **fatbin = nullptr;

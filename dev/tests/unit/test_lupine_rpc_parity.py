@@ -74,8 +74,22 @@ def test_device_only_async_2d_copy_is_fire_and_forget_on_both_sides() -> None:
     condition = "async && src_host_size == 0 && dst_host_size == 0"
     assert condition in client
     assert "return rpc_write_end_deferred(conn)" in client
+    assert 'lupine_real_cuda_fn<real_fn_t>("cuMemcpy2DAsync_v2")' in client
     assert "if (src_host_size == 0 && dst_host_size == 0)" in handler
     assert "result = cuMemcpy2DAsync_v2(&copy, stream)" in handler
+
+
+def test_mixed_runtime_2d_copy_bypasses_cudart_pointer_ownership() -> None:
+    compat = (LUPINE_ROOT / "cudart_compat.cpp").read_text()
+
+    assert 'extern "C" int cudaMemcpy2DAsync(' in compat
+    assert 'extern "C" int cudaMemcpy2DAsync_ptsz(' in compat
+    assert 'extern "C" int cudaMemcpy2D(' in compat
+    assert "cuMemcpy2DAsync_v2(" in compat
+    assert "cuMemcpy2D_v2(&copy)" in compat
+    assert 'dlsym(RTLD_DEFAULT, "lupine_cuda_deviceptr_route_id")' in compat
+    routing = (LUPINE_ROOT / "routing.cpp").read_text()
+    assert 'extern "C" int lupine_cuda_deviceptr_route_id(' in routing
 
 
 def test_runtime_memory_queries_preload_one_symbol_per_fatbin() -> None:

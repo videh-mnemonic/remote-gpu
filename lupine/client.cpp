@@ -5642,6 +5642,25 @@ static CUresult lupine_cuMemcpy2D_common(const CUDA_MEMCPY2D *pCopy,
   }
 
   CUDA_MEMCPY2D copy = *pCopy;
+  lupine_route route =
+      copy.srcMemoryType == CU_MEMORYTYPE_DEVICE && copy.srcDevice != 0
+          ? lupine_route_for_deviceptr(copy.srcDevice)
+          : (copy.dstMemoryType == CU_MEMORYTYPE_DEVICE && copy.dstDevice != 0
+                 ? lupine_route_for_deviceptr(copy.dstDevice)
+                 : (stream != nullptr ? lupine_route_for_stream(stream)
+                                      : lupine_route_for_current_context()));
+  if (lupine_route_is_local(route)) {
+    if (async) {
+      using real_fn_t = CUresult (*)(const CUDA_MEMCPY2D *, CUstream);
+      auto real = lupine_real_cuda_fn<real_fn_t>("cuMemcpy2DAsync_v2");
+      return real == nullptr ? CUDA_ERROR_DEVICE_UNAVAILABLE
+                             : real(&copy, stream);
+    }
+    using real_fn_t = CUresult (*)(const CUDA_MEMCPY2D *);
+    const char *symbol = unaligned ? "cuMemcpy2DUnaligned_v2" : "cuMemcpy2D_v2";
+    auto real = lupine_real_cuda_fn<real_fn_t>(symbol);
+    return real == nullptr ? CUDA_ERROR_DEVICE_UNAVAILABLE : real(&copy);
+  }
   size_t src_host_size = copy.srcMemoryType == CU_MEMORYTYPE_HOST
                              ? lupine_memcpy2d_host_span(copy, true)
                              : 0;
@@ -5655,17 +5674,7 @@ static CUresult lupine_cuMemcpy2D_common(const CUDA_MEMCPY2D *pCopy,
     return CUDA_ERROR_INVALID_VALUE;
   }
 
-  conn_t *conn = nullptr;
-  if (copy.srcMemoryType == CU_MEMORYTYPE_DEVICE && copy.srcDevice != 0) {
-    conn = lupine_rpc_conn_for_deviceptr(copy.srcDevice);
-  } else if (copy.dstMemoryType == CU_MEMORYTYPE_DEVICE &&
-             copy.dstDevice != 0) {
-    conn = lupine_rpc_conn_for_deviceptr(copy.dstDevice);
-  } else if (stream != nullptr) {
-    conn = lupine_rpc_conn_for_stream(stream);
-  } else {
-    conn = lupine_rpc_conn_for_current_context();
-  }
+  conn_t *conn = lupine_route_remote_conn(route);
   CUresult return_value;
   size_t returned_dst_size = 0;
   if (conn == nullptr ||

@@ -1,0 +1,38 @@
+diff --git a/include/ninfer/ops/gqa_attention.h b/include/ninfer/ops/gqa_attention.h
+--- a/include/ninfer/ops/gqa_attention.h
++++ b/include/ninfer/ops/gqa_attention.h
+@@ -11,3 +11,3 @@ namespace ninfer::ops {
+ 
+-inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 262144;
++inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 1048576;
+ 
+diff --git a/src/ops/kernel/gqa_attention_decode_bf16.cuh b/src/ops/kernel/gqa_attention_decode_bf16.cuh
+--- a/src/ops/kernel/gqa_attention_decode_bf16.cuh
++++ b/src/ops/kernel/gqa_attention_decode_bf16.cuh
+@@ -37,4 +37,5 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_k
+     constexpr int PVKs    = Bc / 16;
+-    // The GQA Op's 262144-key maximum envelope spans at most 49 pages in one 27B split.
+-    constexpr int PageIds       = 64;
++    // A 1M-key envelope spans at most 193 pages with the capped 27B split count.
++    // 256 entries cost only 1 KiB of shared memory and retain a power-of-two bound.
++    constexpr int PageIds       = 256;
+     constexpr float Log2E       = 1.4426950408889634074f;
+diff --git a/src/ops/kernel/gqa_attention_decode_i8.cuh b/src/ops/kernel/gqa_attention_decode_i8.cuh
+--- a/src/ops/kernel/gqa_attention_decode_i8.cuh
++++ b/src/ops/kernel/gqa_attention_decode_i8.cuh
+@@ -81,4 +81,5 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
+     constexpr int PVKs                 = Bc / 16;
+-    // The GQA Op's 262144-key maximum envelope spans at most 49 pages in one 27B split.
+-    constexpr int PageIds         = 64;
++    // A 1M-key envelope spans at most 193 pages with the capped 27B split count.
++    // 256 entries cost only 1 KiB of shared memory and retain a power-of-two bound.
++    constexpr int PageIds         = 256;
+     constexpr int ProducerThreads = RowTiles * 32;
+diff --git a/src/targets/qwen3_6_27b/impl/config.h b/src/targets/qwen3_6_27b/impl/config.h
+--- a/src/targets/qwen3_6_27b/impl/config.h
++++ b/src/targets/qwen3_6_27b/impl/config.h
+@@ -90,3 +90,3 @@ inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
+ inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
+-inline constexpr std::uint32_t kNativeContext            = 262144;
++inline constexpr std::uint32_t kNativeContext            = 1048576;
+ 

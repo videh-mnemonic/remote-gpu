@@ -2157,6 +2157,28 @@ CUresult lupine_get_kernel_param_layout(CUfunction f,
   return CUDA_SUCCESS;
 }
 
+static CUresult lupine_ensure_dynamic_shared_attribute(CUfunction function,
+                                                       unsigned int bytes) {
+  constexpr unsigned int kDefaultDynamicSharedBytes = 48U * 1024U;
+  if (bytes <= kDefaultDynamicSharedBytes) {
+    return CUDA_SUCCESS;
+  }
+  static std::mutex mutex;
+  static std::unordered_map<CUfunction, unsigned int> configured;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto found = configured.find(function);
+  if (found != configured.end() && found->second >= bytes) {
+    return CUDA_SUCCESS;
+  }
+  CUresult result = cuFuncSetAttribute(
+      function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+      static_cast<int>(bytes));
+  if (result == CUDA_SUCCESS) {
+    configured[function] = bytes;
+  }
+  return result;
+}
+
 int handle_manual_cuLaunchKernel(conn_t *conn) {
   CUfunction f = nullptr;
   CUcontext ctx = nullptr;
@@ -2227,6 +2249,9 @@ int handle_manual_cuLaunchKernel(conn_t *conn) {
   }
 
   if (result == CUDA_SUCCESS) {
+    result = lupine_ensure_dynamic_shared_attribute(f, sharedMemBytes);
+  }
+  if (result == CUDA_SUCCESS) {
     result =
         cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY,
                        blockDimZ, sharedMemBytes, hStream,
@@ -2281,6 +2306,10 @@ int handle_manual_cuLaunchKernelEx(conn_t *conn) {
       }
     } else {
       result = CUDA_SUCCESS;
+    }
+    if (result == CUDA_SUCCESS) {
+      result = lupine_ensure_dynamic_shared_attribute(
+          f, static_cast<unsigned int>(config.sharedMemBytes));
     }
     if (result == CUDA_SUCCESS) {
       void *extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, packed.data(),
@@ -2350,6 +2379,10 @@ int handle_manual_cuLaunchKernelEx(conn_t *conn) {
   }
 
 #if CUDA_VERSION >= 11080
+  if (result == CUDA_SUCCESS) {
+    result = lupine_ensure_dynamic_shared_attribute(
+        f, static_cast<unsigned int>(config.sharedMemBytes));
+  }
   if (result == CUDA_SUCCESS) {
     result = cuLaunchKernelEx(
         &config, f, param_count == 0 ? nullptr : params.data(), nullptr);

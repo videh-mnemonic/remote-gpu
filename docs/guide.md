@@ -303,6 +303,22 @@ remote versus 204.26 tok/s native, with identical deterministic streamed
 output. Model initialization remains transfer-bound because 19.73 GiB of
 weights cross the 10 GbE link.
 
+The experimental local-plus-remote Qwen3.8 path can instead reserve a full 1M
+INT8 KV context across two 32 GiB RTX 5090s. Build a disposable patched NInfer
+image and launch it without modifying `ali`:
+
+```bash
+dev/tools/build_ninfer_qwen38_pipeline.sh \
+  --source /home/USER/Documents/ali/ninfer
+dev/tools/run_ali_qwen38_pipeline.sh \
+  --ali /home/USER/Documents/ali \
+  --host USER@GPU_HOST
+```
+
+The launcher defaults to a balanced 32/32 layer split, 1,048,576-token cache,
+and the measured 1,024-token prefill chunk. Mixed two-device CUDA Graph capture
+is not yet implemented, so this path deliberately uses eager decode.
+
 Compiled model-plus-optimizer execution is the strongest current performance
 path for modern training code: TorchTitan Qwen3 measures 4.606 ms remote versus
 4.622 ms native GPU time, and LitGPT measures 2.179 ms versus 2.211 ms. Eager
