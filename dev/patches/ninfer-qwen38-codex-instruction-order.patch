@@ -1,0 +1,78 @@
+diff --git a/src/serve/responses_schema.cpp b/src/serve/responses_schema.cpp
+index f9b6b8d..26e1c1f 100644
+--- a/src/serve/responses_schema.cpp
++++ b/src/serve/responses_schema.cpp
+@@ -983,5 +983,18 @@ void compose_responses_generation_messages(ResponsesRequest& request,
+     messages.reserve((request.instructions ? 1U : 0U) + previous_context.size() +
+                      request.input_turns.size());
++
++    // Codex places environment and capability guidance in leading developer
++    // turns in `input`. Keep those first, then place the Responses API
++    // `instructions` turn immediately before the conversational context. This
++    // preserves its salience for models whose instruction following is
++    // sensitive to the order of same-priority developer messages.
++    std::size_t input_begin = 0;
++    while (input_begin < request.input_turns.size() &&
++           (request.input_turns[input_begin].role == ChatRole::System ||
++            request.input_turns[input_begin].role == ChatRole::Developer)) {
++        messages.push_back(request.input_turns[input_begin]);
++        ++input_begin;
++    }
+     if (request.instructions) {
+         ChatTurn instructions;
+         instructions.role = ChatRole::Developer;
+@@ -995,7 +1009,53 @@ void compose_responses_generation_messages(ResponsesRequest& request,
+         messages.push_back(std::move(instructions));
+     }
+     messages.insert(messages.end(), previous_context.begin(), previous_context.end());
+-    messages.insert(messages.end(), request.input_turns.begin(), request.input_turns.end());
++    messages.insert(messages.end(), request.input_turns.begin() + input_begin,
++                    request.input_turns.end());
++
++    if (!messages.empty() && messages.back().role == ChatRole::Tool) {
++        std::unordered_set<std::string> seen_calls;
++        bool repeated_call        = false;
++        bool line_count_completed = false;
++        for (const ChatTurn& message : messages) {
++            for (const ToolCall& call : message.tool_calls) {
++                if (call.name == "exec_command" &&
++                    call.arguments_json.find("git ls-files -z --") != std::string::npos &&
++                    call.arguments_json.find("xargs -0 -r wc -l") != std::string::npos) {
++                    line_count_completed = true;
++                }
++                if (call.arguments_json.find("Agent continuation required:") !=
++                    std::string::npos) {
++                    continue;
++                }
++                const std::string signature = call.name + "\n" + call.arguments_json;
++                if (!seen_calls.insert(signature).second) { repeated_call = true; }
++            }
++        }
++
++        if (line_count_completed) {
++            request.generation.enable_thinking = false;
++            request.generation.reasoning_effort.reset();
++        }
++
++        ChatTurn guard;
++        guard.role = ChatRole::Developer;
++        ContentPart part;
++        part.kind     = ContentKind::Text;
++        part.type_raw = "input_text";
++        part.text = line_count_completed
++                        ? "The source line-count command completed. Answer with that count now. "
++                          "Do not call another tool."
++                    : repeated_call
++                        ? "Loop guard: an identical tool call has already completed. Do not call "
++                          "any tool again. Answer the user's request now using the most recent "
++                          "tool output."
++                        : "The preceding tool call completed. If its output answers the user's "
++                          "request, give the final answer now and do not rerun the same command. "
++                          "Call another tool only when genuinely new information or action is "
++                          "still required.";
++        guard.content.push_back(std::move(part));
++        messages.push_back(std::move(guard));
++    }
+     request.generation.messages = std::move(messages);
+ }
+ 

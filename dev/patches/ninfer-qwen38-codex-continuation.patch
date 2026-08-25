@@ -1,0 +1,153 @@
+--- a/src/serve/tool_call_parser.cpp
++++ b/src/serve/tool_call_parser.cpp
+@@ -119,6 +119,15 @@
+            allowed_tool_names.end();
+ }
+ 
++bool is_shell_alias(std::string_view name) {
++    std::string lower(name);
++    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
++        return static_cast<char>(std::tolower(c));
++    });
++    return lower == "bash" || lower == "shell" || lower == "shell_command" ||
++           lower == "terminal";
++}
++
+ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length,
+                          const std::vector<std::string>& allowed_tool_names, ToolCall& out) {
+     constexpr std::string_view kFunctionOpen  = "<function=";
+@@ -155,6 +164,10 @@
+     pos = name_end + (block[name_end] == '>' ? 1 : 0);
+ 
+     if (name == "execution" || name == "command") { name = "exec_command"; }
++    if (!contains_tool_name(allowed_tool_names, name) &&
++        contains_tool_name(allowed_tool_names, "exec_command") && is_shell_alias(name)) {
++        name = "exec_command";
++    }
+ 
+     const std::size_t function_end = block.find(kFunctionClose, pos);
+     if (function_end == std::string_view::npos) { return false; }
+@@ -213,7 +226,44 @@
+     return true;
+ }
+ 
+-ParsedToolCallOutput fallback(const std::string& text) {
++bool looks_like_progress_only(std::string_view text) {
++    std::string lower = trim_ascii(text);
++    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
++        return static_cast<char>(std::tolower(c));
++    });
++    constexpr std::array<std::string_view, 18> prefixes = {
++        "let me ",       "i'll check",      "i'll inspect",    "i'll explore",
++        "i'll count",    "i'll continue",   "i'll examine",    "i'll look",
++        "i'll find",     "i'll get",        "i will check",    "i will inspect",
++        "i will explore","i will count",    "now i'll ",       "now i will ",
++        "next i'll ",    "next i will ",
++    };
++    return std::any_of(prefixes.begin(), prefixes.end(),
++                       [&](std::string_view prefix) { return lower.starts_with(prefix); });
++}
++
++ParsedToolCallOutput fallback(const std::string& text,
++                              const std::vector<std::string>& allowed_tool_names) {
++    const bool malformed_tool_markup = text.find("<tool_call>") != std::string::npos;
++    if (contains_tool_name(allowed_tool_names, "exec_command") &&
++        (malformed_tool_markup || looks_like_progress_only(text))) {
++        ParsedToolCallOutput out;
++        out.is_tool_call_response = true;
++        if (const std::size_t marker = text.find("<tool_call>"); marker != std::string::npos) {
++            out.content = rtrim_ascii(std::string_view(text).substr(0, marker));
++        }
++        ToolCall call;
++        call.id   = new_tool_call_id();
++        call.name = "exec_command";
++        Json args = Json::object();
++        args["cmd"] =
++            "printf '%s\\n' 'Agent continuation required: the previous response announced "
++            "unfinished work or contained malformed tool syntax. Continue with a valid tool call, "
++            "or give the completed answer now.'";
++        call.arguments_json = args.dump();
++        out.tool_calls.push_back(std::move(call));
++        return out;
++    }
+     ParsedToolCallOutput out;
+     out.content = text;
+     return out;
+@@ -228,7 +278,7 @@
+     constexpr std::string_view kToolClose = "</tool_call>";
+ 
+     const std::size_t first = text.find(kToolOpen);
+-    if (first == std::string::npos) { return fallback(text); }
++    if (first == std::string::npos) { return fallback(text, allowed_tool_names); }
+ 
+     ParsedToolCallOutput out;
+     out.content = rtrim_ascii(std::string_view(text).substr(0, first));
+@@ -237,20 +287,22 @@
+     while (pos < text.size()) {
+         skip_ws(text, pos);
+         if (pos >= text.size()) { break; }
+-        if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
++        if (!starts_with_at(text, pos, kToolOpen)) {
++            return fallback(text, allowed_tool_names);
++        }
+         const std::size_t inner_begin = pos + kToolOpen.size();
+         const std::size_t close       = text.find(kToolClose, inner_begin);
+-        if (close == std::string::npos) { return fallback(text); }
++        if (close == std::string::npos) { return fallback(text, allowed_tool_names); }
+         ToolCall call;
+         if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
+                                  max_tool_name_length, allowed_tool_names, call)) {
+-            return fallback(text);
++            return fallback(text, allowed_tool_names);
+         }
+         out.tool_calls.push_back(std::move(call));
+         pos = close + kToolClose.size();
+     }
+ 
+-    if (out.tool_calls.empty()) { return fallback(text); }
++    if (out.tool_calls.empty()) { return fallback(text, allowed_tool_names); }
+     out.is_tool_call_response = true;
+     return out;
+ }
+--- a/tests/test_tool_call_parser.cpp
++++ b/tests/test_tool_call_parser.cpp
+@@ -186,6 +186,31 @@
+     return failures;
+ }
+ 
++int test_codex_shell_alias_and_progress_retry() {
++    const auto alias = ninfer::serve::parse_qwen_tool_call_output(
++        "<tool_call>\n<function=Bash>\n"
++        "<parameter=command>\npwd\n</parameter>\n</function>\n</tool_call>",
++        64, {"exec_command"});
++    const auto progress = ninfer::serve::parse_qwen_tool_call_output(
++        "Let me explore the project structure to understand what's tracked.", 64,
++        {"exec_command"});
++    const auto malformed = ninfer::serve::parse_qwen_tool_call_output(
++        "<tool_call>\n", 64, {"exec_command"});
++
++    int failures = 0;
++    failures += check(alias.is_tool_call_response, "Bash alias parsed");
++    failures += check(alias.tool_calls[0].name == "exec_command", "Bash alias normalized");
++    failures += check(Json::parse(alias.tool_calls[0].arguments_json).at("cmd") == "pwd",
++                      "Bash command preserved");
++    for (const auto* parsed : {&progress, &malformed}) {
++        failures += check(parsed->is_tool_call_response, "incomplete response becomes retry");
++        failures += check(parsed->tool_calls.size() == 1, "one continuation feedback call");
++        failures += check(parsed->tool_calls[0].name == "exec_command",
++                          "continuation uses available command tool");
++    }
++    return failures;
++}
++
+ int test_malformed_falls_back_to_text() {
+     const std::string text = "<tool_call>\n<function=get_weather>\n";
+     const ninfer::serve::ParsedToolCallOutput parsed =
+@@ -282,6 +307,7 @@
+     failures += test_codex_shell_command_as_function_name();
+     failures += test_codex_args_and_inline_command_forms();
+     failures += test_codex_missing_command_returns_retry_feedback();
++    failures += test_codex_shell_alias_and_progress_retry();
+     failures += test_malformed_falls_back_to_text();
+     failures += test_suffix_after_tool_falls_back_to_text();
+     failures += test_configured_name_limit();

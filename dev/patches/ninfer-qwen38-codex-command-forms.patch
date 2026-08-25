@@ -1,0 +1,114 @@
+--- a/src/serve/tool_call_parser.cpp
++++ b/src/serve/tool_call_parser.cpp
+@@ -140,6 +140,18 @@
+     const std::size_t name_end = block.find_first_of(">\r\n", name_begin);
+     if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
+     std::string name = trim_ascii(block.substr(name_begin, name_end - name_begin));
++    Json args        = Json::object();
++    if (starts_with_at(name, 0, "exec_command ")) {
++        constexpr std::string_view kInlineCmd = "cmd=\"";
++        const std::size_t cmd_begin = name.find(kInlineCmd);
++        const std::size_t cmd_end   = name.rfind('"');
++        if (cmd_begin == std::string::npos || cmd_end <= cmd_begin + kInlineCmd.size()) {
++            return false;
++        }
++        args["cmd"] =
++            name.substr(cmd_begin + kInlineCmd.size(), cmd_end - cmd_begin - kInlineCmd.size());
++        name = "exec_command";
++    }
+     pos = name_end + (block[name_end] == '>' ? 1 : 0);
+ 
+     if (name == "execution" || name == "command") { name = "exec_command"; }
+@@ -150,7 +162,6 @@
+     const bool direct_shell_command =
+         !contains_tool_name(allowed_tool_names, name) &&
+         contains_tool_name(allowed_tool_names, "exec_command") && trim_ascii(params).empty();
+-    Json args = Json::object();
+     if (direct_shell_command) {
+         if (name.empty()) { return false; }
+         args["cmd"] = name;
+@@ -170,11 +181,21 @@
+     }
+ 
+     if (name == "exec_command" && !direct_shell_command) {
++        if (args.contains("args") && !args.contains("cmd") && args["args"].is_array() &&
++            args["args"].size() == 2 && args["args"][0] == "-c" &&
++            args["args"][1].is_string()) {
++            args["cmd"] = std::move(args["args"][1]);
++            args.erase("args");
++        }
+         if (args.contains("command") && !args.contains("cmd")) {
+             args["cmd"] = std::move(args["command"]);
+             args.erase("command");
+         }
+-        if (!args.contains("cmd") && !parse_codex_command_fallback(params, args)) { return false; }
++        if (!args.contains("cmd") && !parse_codex_command_fallback(params, args)) {
++            args["cmd"] =
++                "printf '%s\\n' 'Tool-call syntax error: exec_command requires a cmd parameter; "
++                "retry the intended command using the exact tool schema.' >&2; exit 2";
++        }
+         // Once a complete command has been recovered, ignore only the malformed
+         // suffix inside this already-delimited tool block. Codex still applies
+         // its normal tool schema, sandbox, and approval checks.
+--- a/tests/test_tool_call_parser.cpp
++++ b/tests/test_tool_call_parser.cpp
+@@ -142,6 +142,50 @@
+     return failures;
+ }
+ 
++int test_codex_args_and_inline_command_forms() {
++    const auto args = ninfer::serve::parse_qwen_tool_call_output(
++        "<tool_call>\n<function=exec_command>\n"
++        "<parameter=args>\n[\"-c\",\"pwd && ls -la\"]\n</parameter>\n"
++        "<parameter=description>\nList files\n</parameter>\n"
++        "</function>\n</tool_call>",
++        64, {"exec_command"});
++    const auto inline_command = ninfer::serve::parse_qwen_tool_call_output(
++        "<tool_call>\n<exec_command cmd=\"pwd; ls -la\" \n"
++        "</parameter>\n</function>\n</tool_call>",
++        64, {"exec_command"});
++
++    int failures = 0;
++    for (const auto* parsed : {&args, &inline_command}) {
++        failures += check(parsed->is_tool_call_response, "alternate command arguments parsed");
++        failures += check(parsed->tool_calls.size() == 1, "one alternate command parsed");
++        failures += check(parsed->tool_calls[0].name == "exec_command",
++                          "alternate command normalized");
++    }
++    failures += check(Json::parse(args.tool_calls[0].arguments_json).at("cmd") ==
++                          "pwd && ls -la",
++                      "args array command recovered");
++    failures += check(Json::parse(inline_command.tool_calls[0].arguments_json).at("cmd") ==
++                          "pwd; ls -la",
++                      "inline command recovered");
++    return failures;
++}
++
++int test_codex_missing_command_returns_retry_feedback() {
++    const auto parsed = ninfer::serve::parse_qwen_tool_call_output(
++        "<tool_call>\n<function=exec_command>\ncmd\n</parameter>\n"
++        "</function>\n</tool_call>",
++        64, {"exec_command"});
++
++    int failures = 0;
++    failures += check(parsed.is_tool_call_response, "missing command becomes tool response");
++    failures += check(parsed.tool_calls.size() == 1, "one retry feedback call");
++    const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
++    failures += check(args.at("cmd").get<std::string>().find("Tool-call syntax error") !=
++                          std::string::npos,
++                      "retry feedback explains malformed call");
++    return failures;
++}
++
+ int test_malformed_falls_back_to_text() {
+     const std::string text = "<tool_call>\n<function=get_weather>\n";
+     const ninfer::serve::ParsedToolCallOutput parsed =
+@@ -236,6 +280,8 @@
+     failures += test_codex_alternate_function_open();
+     failures += test_codex_malformed_variants();
+     failures += test_codex_shell_command_as_function_name();
++    failures += test_codex_args_and_inline_command_forms();
++    failures += test_codex_missing_command_returns_retry_feedback();
+     failures += test_malformed_falls_back_to_text();
+     failures += test_suffix_after_tool_falls_back_to_text();
+     failures += test_configured_name_limit();

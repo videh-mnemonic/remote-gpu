@@ -1,0 +1,50 @@
+diff --git a/src/serve/tool_call_parser.cpp b/src/serve/tool_call_parser.cpp
+index b1cbc00..d8e97e3 100644
+--- a/src/serve/tool_call_parser.cpp
++++ b/src/serve/tool_call_parser.cpp
+@@ -276,15 +276,19 @@ bool looks_like_progress_only(std::string_view text) {
+     std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+         return static_cast<char>(std::tolower(c));
+     });
+-    constexpr std::array<std::string_view, 18> prefixes = {
++    constexpr std::array<std::string_view, 27> prefixes = {
+         "let me ",       "i'll check",      "i'll inspect",    "i'll explore",
+         "i'll count",    "i'll continue",   "i'll examine",    "i'll look",
+         "i'll find",     "i'll get",        "i will check",    "i will inspect",
+         "i will explore","i will count",    "now i'll ",       "now i will ",
+-        "next i'll ",    "next i will ",
++        "next i'll ",    "next i will ",    "let me check",    "let me inspect",
++        "let me explore","let me count",    "let me continue", "let me identify",
++        "let me understand", "let me investigate", "i need to ",
+     };
+     return std::any_of(prefixes.begin(), prefixes.end(),
+-                       [&](std::string_view prefix) { return lower.starts_with(prefix); });
++                       [&](std::string_view prefix) {
++                           return lower.starts_with(prefix) || lower.find(prefix) != std::string::npos;
++                       });
+ }
+ 
+ ParsedToolCallOutput fallback(const std::string& text,
+diff --git a/tests/test_tool_call_parser.cpp b/tests/test_tool_call_parser.cpp
+index 09ed16b..511a158 100644
+--- a/tests/test_tool_call_parser.cpp
++++ b/tests/test_tool_call_parser.cpp
+@@ -210,6 +210,9 @@ int test_codex_shell_alias_and_progress_retry() {
+     const auto progress = ninfer::serve::parse_qwen_tool_call_output(
+         "Let me explore the project structure to understand what's tracked.", 64,
+         {"exec_command"});
++    const auto trailing_progress = ninfer::serve::parse_qwen_tool_call_output(
++        "The largest files look generated. Let me identify them before counting.", 64,
++        {"exec_command"});
+     const auto malformed = ninfer::serve::parse_qwen_tool_call_output(
+         "<tool_call>\n", 64, {"exec_command"});
+ 
+@@ -218,7 +221,7 @@ int test_codex_shell_alias_and_progress_retry() {
+     failures += check(alias.tool_calls[0].name == "exec_command", "Bash alias normalized");
+     failures += check(Json::parse(alias.tool_calls[0].arguments_json).at("cmd") == "pwd",
+                       "Bash command preserved");
+-    for (const auto* parsed : {&progress, &malformed}) {
++    for (const auto* parsed : {&progress, &trailing_progress, &malformed}) {
+         failures += check(parsed->is_tool_call_response, "incomplete response becomes retry");
+         failures += check(parsed->tool_calls.size() == 1, "one continuation feedback call");
+         failures += check(parsed->tool_calls[0].name == "exec_command",

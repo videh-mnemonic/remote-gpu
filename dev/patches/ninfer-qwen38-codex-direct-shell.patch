@@ -1,0 +1,156 @@
+--- a/src/serve/tool_call_parser.h
++++ b/src/serve/tool_call_parser.h
+@@ -16,7 +16,9 @@
+ };
+ 
+ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
+-                                                 std::size_t max_tool_name_length);
++                                                 std::size_t max_tool_name_length,
++                                                 const std::vector<std::string>& allowed_tool_names =
++                                                     {});
+ 
+ // Incrementally publishes text that is provably outside a possible Qwen
+ // <tool_call> suffix. At terminal time, a valid tool response discards the
+--- a/src/serve/generation_service.h
++++ b/src/serve/generation_service.h
+@@ -73,6 +73,7 @@
+     bool include_usage                     = false;
+     bool tool_capable                      = false;
+     std::size_t tool_name_max_length       = 64;
++    std::vector<std::string> tool_names;
+     bool enable_thinking                   = true;
+     bool preserve_thinking                 = false;
+     bool preserve_thinking_semantic_change = false;
+--- a/src/serve/generation_service.cpp
++++ b/src/serve/generation_service.cpp
+@@ -329,6 +329,10 @@
+     prepared.include_usage                 = request.include_usage;
+     prepared.tool_capable                  = request.uses_tools() || request.has_tool_history();
+     prepared.tool_name_max_length          = request.tool_name_max_length;
++    prepared.tool_names.reserve(request.tools.size());
++    for (const ToolDefinition& tool : request.tools) {
++        prepared.tool_names.push_back(tool.name);
++    }
+     const ResolvedPromptSemantics semantics =
+         resolve_prompt_semantics(request, options_, prompt_capabilities_);
+     prepared.enable_thinking                   = semantics.enable_thinking;
+@@ -456,7 +460,8 @@
+     bool is_tool_call_response = false;
+     if (prepared.tool_capable) {
+         ParsedToolCallOutput parsed =
+-            parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length);
++            parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length,
++                                        prepared.tool_names);
+         outcome.text          = std::move(parsed.content);
+         is_tool_call_response = parsed.is_tool_call_response;
+         if (is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
+--- a/src/serve/tool_call_parser.cpp
++++ b/src/serve/tool_call_parser.cpp
+@@ -113,7 +113,14 @@
+     return true;
+ }
+ 
+-bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, ToolCall& out) {
++bool contains_tool_name(const std::vector<std::string>& allowed_tool_names,
++                        std::string_view name) {
++    return std::find(allowed_tool_names.begin(), allowed_tool_names.end(), name) !=
++           allowed_tool_names.end();
++}
++
++bool parse_one_tool_call(std::string_view block, std::size_t max_name_length,
++                         const std::vector<std::string>& allowed_tool_names, ToolCall& out) {
+     constexpr std::string_view kFunctionOpen  = "<function=";
+     constexpr std::string_view kFunctionClose = "</function>";
+     std::size_t pos                           = 0;
+@@ -132,8 +139,7 @@
+     }
+     const std::size_t name_end = block.find_first_of(">\r\n", name_begin);
+     if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
+-    std::string name = std::string(block.substr(name_begin, name_end - name_begin));
+-    if (!valid_function_name(name, max_name_length)) { return false; }
++    std::string name = trim_ascii(block.substr(name_begin, name_end - name_begin));
+     pos = name_end + (block[name_end] == '>' ? 1 : 0);
+ 
+     if (name == "execution" || name == "command") { name = "exec_command"; }
+@@ -141,7 +147,17 @@
+     const std::size_t function_end = block.find(kFunctionClose, pos);
+     if (function_end == std::string_view::npos) { return false; }
+     const std::string_view params = block.substr(pos, function_end - pos);
+-    Json args                     = Json::object();
++    const bool direct_shell_command =
++        !contains_tool_name(allowed_tool_names, name) &&
++        contains_tool_name(allowed_tool_names, "exec_command") && trim_ascii(params).empty();
++    Json args = Json::object();
++    if (direct_shell_command) {
++        if (name.empty()) { return false; }
++        args["cmd"] = name;
++        name        = "exec_command";
++    }
++    if (!valid_function_name(name, max_name_length)) { return false; }
++
+     std::size_t param_pos         = 0;
+     bool malformed_suffix         = false;
+     for (;;) {
+@@ -153,7 +169,7 @@
+         }
+     }
+ 
+-    if (name == "exec_command") {
++    if (name == "exec_command" && !direct_shell_command) {
+         if (args.contains("command") && !args.contains("cmd")) {
+             args["cmd"] = std::move(args["command"]);
+             args.erase("command");
+@@ -185,7 +201,8 @@
+ } // namespace
+ 
+ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
+-                                                 std::size_t max_tool_name_length) {
++                                                 std::size_t max_tool_name_length,
++                                                 const std::vector<std::string>& allowed_tool_names) {
+     constexpr std::string_view kToolOpen  = "<tool_call>";
+     constexpr std::string_view kToolClose = "</tool_call>";
+ 
+@@ -205,7 +222,7 @@
+         if (close == std::string::npos) { return fallback(text); }
+         ToolCall call;
+         if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
+-                                 max_tool_name_length, call)) {
++                                 max_tool_name_length, allowed_tool_names, call)) {
+             return fallback(text);
+         }
+         out.tool_calls.push_back(std::move(call));
+--- a/tests/test_tool_call_parser.cpp
++++ b/tests/test_tool_call_parser.cpp
+@@ -124,6 +124,24 @@
+     return failures;
+ }
+ 
++int test_codex_shell_command_as_function_name() {
++    const auto parsed = ninfer::serve::parse_qwen_tool_call_output(
++        "<tool_call>\n<function=pwd>\n</function>\n</tool_call>\n"
++        "<tool_call>\n<function=ls -la\n</function>\n</tool_call>",
++        64, {"exec_command", "list_mcp_resources"});
++
++    int failures = 0;
++    failures += check(parsed.is_tool_call_response, "direct shell commands parsed");
++    failures += check(parsed.tool_calls.size() == 2, "two direct shell commands parsed");
++    failures += check(parsed.tool_calls[0].name == "exec_command", "pwd normalized");
++    failures += check(parsed.tool_calls[1].name == "exec_command", "ls normalized");
++    failures += check(Json::parse(parsed.tool_calls[0].arguments_json).at("cmd") == "pwd",
++                      "pwd command recovered");
++    failures += check(Json::parse(parsed.tool_calls[1].arguments_json).at("cmd") == "ls -la",
++                      "ls command recovered");
++    return failures;
++}
++
+ int test_malformed_falls_back_to_text() {
+     const std::string text = "<tool_call>\n<function=get_weather>\n";
+     const ninfer::serve::ParsedToolCallOutput parsed =
+@@ -217,6 +235,7 @@
+     failures += test_multiple_calls_and_json_values();
+     failures += test_codex_alternate_function_open();
+     failures += test_codex_malformed_variants();
++    failures += test_codex_shell_command_as_function_name();
+     failures += test_malformed_falls_back_to_text();
+     failures += test_suffix_after_tool_falls_back_to_text();
+     failures += test_configured_name_limit();

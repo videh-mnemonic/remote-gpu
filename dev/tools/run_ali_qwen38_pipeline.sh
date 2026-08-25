@@ -10,6 +10,8 @@ port=8112
 context=1048576
 prefill_chunk=1536
 disable_cuda_graph=0
+codex_mode=0
+codex_greedy=0
 
 while (($#)); do
   case "$1" in
@@ -45,8 +47,17 @@ while (($#)); do
       disable_cuda_graph=1
       shift
       ;;
+    --codex)
+      codex_mode=1
+      shift
+      ;;
+    --codex-greedy)
+      codex_mode=1
+      codex_greedy=1
+      shift
+      ;;
     *)
-      echo "usage: $0 --ali PATH --host USER@HOST [--image NAME] [--shim-image NAME] [--port N] [--no-cuda-graph]" >&2
+      echo "usage: $0 --ali PATH --host USER@HOST [--image NAME] [--shim-image NAME] [--port N] [--no-cuda-graph] [--codex|--codex-greedy]" >&2
       exit 2
       ;;
   esac
@@ -61,6 +72,19 @@ model="$ali_tree/models/qwen3_8_27b_nvfp4.ninfer"
 graph_args=()
 if ((disable_cuda_graph)); then
   graph_args+=(--no-cuda-graph)
+fi
+
+generation_args=(--no-thinking --greedy)
+default_max_tokens=32768
+if ((codex_mode)); then
+  # Keep thinking enabled while balancing strict tool syntax against repetitive
+  # decoding. Very low temperatures repeated malformed calls; the registered
+  # temperature-1 preset occasionally wandered or produced very long turns.
+  generation_args=(--temperature 0.6 --top-p 0.95 --top-k 20)
+  default_max_tokens=4096
+fi
+if ((codex_greedy)); then
+  generation_args=(--greedy)
 fi
 
 exec env PYTHONPATH="$project_root/rgpu-client" python3 -m remote_gpu.cli run \
@@ -82,8 +106,7 @@ exec env PYTHONPATH="$project_root/rgpu-client" python3 -m remote_gpu.cli run \
   --max-concurrency 1 \
   --prefill-chunk "$prefill_chunk" \
   --kv-dtype int8 \
-  --default-max-tokens 32768 \
+  --default-max-tokens "$default_max_tokens" \
   "${graph_args[@]}" \
   --no-prefix-reuse \
-  --no-thinking \
-  --greedy
+  "${generation_args[@]}"

@@ -1,0 +1,178 @@
+diff --git a/src/serve/tool_call_parser.cpp b/src/serve/tool_call_parser.cpp
+index a7bd3ca..86afa36 100644
+--- a/src/serve/tool_call_parser.cpp
++++ b/src/serve/tool_call_parser.cpp
+@@ -82,29 +82,89 @@ bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args) {
+     return true;
+ }
+ 
++bool parse_codex_command_fallback(std::string_view params, Json& args) {
++    constexpr std::string_view kCommandOpen  = "<command>";
++    constexpr std::string_view kCommandClose = "</command>";
++    const std::size_t first_open  = params.find(kCommandOpen);
++    const std::size_t first_close = params.find(kCommandClose);
++    if (first_close != std::string_view::npos &&
++        (first_open == std::string_view::npos || first_close < first_open)) {
++        args["cmd"] = trim_ascii(params.substr(0, first_close));
++        return true;
++    }
++    if (const std::size_t open = first_open; open != std::string_view::npos) {
++        const std::size_t begin = open + kCommandOpen.size();
++        const std::size_t end   = params.find(kCommandClose, begin);
++        if (end != std::string_view::npos) {
++            args["cmd"] = trim_ascii(params.substr(begin, end - begin));
++            return true;
++        }
++    }
++    constexpr std::string_view kCmdAssign = "cmd=\"";
++    const std::size_t assign = params.find(kCmdAssign);
++    if (assign == std::string_view::npos) { return false; }
++    const std::size_t begin = assign + kCmdAssign.size();
++    const std::size_t parameter_end = params.find("</parameter>", begin);
++    const std::size_t search_end =
++        parameter_end == std::string_view::npos ? params.size() : parameter_end;
++    const std::size_t end = params.rfind('"', search_end);
++    if (end == std::string_view::npos || end < begin) { return false; }
++    args["cmd"] = std::string(params.substr(begin, end - begin));
++    return true;
++}
++
+ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, ToolCall& out) {
+     constexpr std::string_view kFunctionOpen  = "<function=";
+     constexpr std::string_view kFunctionClose = "</function>";
+     std::size_t pos                           = 0;
+     skip_ws(block, pos);
+-    if (!starts_with_at(block, pos, kFunctionOpen)) { return false; }
+-    const std::size_t name_begin = pos + kFunctionOpen.size();
+-    const std::size_t name_end   = block.find('>', name_begin);
++    std::size_t name_begin = 0;
++    if (starts_with_at(block, pos, kFunctionOpen)) {
++        name_begin = pos + kFunctionOpen.size();
++    } else if (starts_with_at(block, pos, "<")) {
++        // Codex-oriented prompts can occasionally make Qwen spell the opening
++        // tag as <tool_name> while retaining NInfer's </function> terminator.
++        // Accept that narrow variant; valid_function_name still rejects XML
++        // syntax, parameter tags, and names beyond the request's API limit.
++        name_begin = pos + 1;
++    } else {
++        return false;
++    }
++    const std::size_t name_end = block.find_first_of(">\r\n", name_begin);
+     if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
+-    const std::string name = std::string(block.substr(name_begin, name_end - name_begin));
++    std::string name = std::string(block.substr(name_begin, name_end - name_begin));
+     if (!valid_function_name(name, max_name_length)) { return false; }
+-    pos = name_end + 1;
++    pos = name_end + (block[name_end] == '>' ? 1 : 0);
++
++    if (name == "execution" || name == "command") { name = "exec_command"; }
+ 
+     const std::size_t function_end = block.find(kFunctionClose, pos);
+     if (function_end == std::string_view::npos) { return false; }
+     const std::string_view params = block.substr(pos, function_end - pos);
+     Json args                     = Json::object();
+     std::size_t param_pos         = 0;
++    bool malformed_suffix         = false;
+     for (;;) {
+         skip_ws(params, param_pos);
+         if (param_pos >= params.size()) { break; }
+-        if (!parse_parameter(params, param_pos, args)) { return false; }
++        if (!parse_parameter(params, param_pos, args)) {
++            malformed_suffix = true;
++            break;
++        }
++    }
++
++    if (name == "exec_command") {
++        if (args.contains("command") && !args.contains("cmd")) {
++            args["cmd"] = std::move(args["command"]);
++            args.erase("command");
++        }
++        if (!args.contains("cmd") && !parse_codex_command_fallback(params, args)) { return false; }
++        // Once a complete command has been recovered, ignore only the malformed
++        // suffix inside this already-delimited tool block. Codex still applies
++        // its normal tool schema, sandbox, and approval checks.
++        malformed_suffix = false;
+     }
++    if (malformed_suffix) { return false; }
+ 
+     pos = function_end + kFunctionClose.size();
+     skip_ws(block, pos);
+diff --git a/tests/test_tool_call_parser.cpp b/tests/test_tool_call_parser.cpp
+index 8c96b73..e54c409 100644
+--- a/tests/test_tool_call_parser.cpp
++++ b/tests/test_tool_call_parser.cpp
+@@ -66,6 +66,64 @@ int test_multiple_calls_and_json_values() {
+     return failures;
+ }
+ 
++int test_codex_alternate_function_open() {
++    const ninfer::serve::ParsedToolCallOutput parsed =
++        ninfer::serve::parse_qwen_tool_call_output("I'll inspect it.\n"
++                                                   "<tool_call>\n"
++                                                   "<exec_command>\n"
++                                                   "<parameter=cmd>\npwd\n</parameter>\n"
++                                                   "</function>\n"
++                                                   "</tool_call>",
++                                                   64);
++
++    int failures = 0;
++    failures += check(parsed.is_tool_call_response, "Codex alternate call parsed as tool response");
++    failures += check(parsed.content == "I'll inspect it.", "Codex content prefix trimmed");
++    failures += check(parsed.tool_calls.size() == 1, "one Codex call parsed");
++    failures += check(parsed.tool_calls[0].name == "exec_command", "Codex function name parsed");
++    const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
++    failures += check(args.at("cmd") == "pwd", "Codex command parameter parsed");
++    return failures;
++}
++
++int test_codex_malformed_variants() {
++    const auto missing_delimiter = ninfer::serve::parse_qwen_tool_call_output(
++        "<tool_call>\n<function=exec_command\n<parameter=cmd>\npwd\n</parameter>\n"
++        "</function>\n</tool_call>",
++        64);
++    const auto alias = ninfer::serve::parse_qwen_tool_call_output(
++        "<tool_call>\n<execution>\n<parameter=command>\npwd\n</parameter>\n"
++        "</function>\n</tool_call>",
++        64);
++    const auto command_block = ninfer::serve::parse_qwen_tool_call_output(
++        "<tool_call>\n<command>\npwd\n</command>\n<tool_call>\n<command>\nignored\n"
++        "</command>\n</function>\n</tool_call>",
++        64);
++    const auto assignment = ninfer::serve::parse_qwen_tool_call_output(
++        "<tool_call>\n<function=exec_command>\ncmd=\"echo \\\"hello\\\"\n\"\n"
++        "</parameter>\n<name>junk</name>\n</function>\n</tool_call>",
++        64);
++
++    int failures = 0;
++    for (const auto* parsed : {&missing_delimiter, &alias, &command_block, &assignment}) {
++        failures += check(parsed->is_tool_call_response, "malformed Codex variant recovered");
++        failures += check(parsed->tool_calls.size() == 1, "one recovered Codex call");
++        failures += check(parsed->tool_calls[0].name == "exec_command",
++                          "recovered Codex call normalized");
++    }
++    failures += check(Json::parse(missing_delimiter.tool_calls[0].arguments_json).at("cmd") ==
++                          "pwd",
++                      "missing delimiter command recovered");
++    failures += check(Json::parse(alias.tool_calls[0].arguments_json).at("cmd") == "pwd",
++                      "execution alias and argument recovered");
++    failures += check(Json::parse(command_block.tool_calls[0].arguments_json).at("cmd") == "pwd",
++                      "command block recovered");
++    failures += check(Json::parse(assignment.tool_calls[0].arguments_json).at("cmd") ==
++                          "echo \\\"hello\\\"\n",
++                      "assignment command recovered");
++    return failures;
++}
++
+ int test_malformed_falls_back_to_text() {
+     const std::string text = "<tool_call>\n<function=get_weather>\n";
+     const ninfer::serve::ParsedToolCallOutput parsed =
+@@ -157,6 +215,8 @@ int main() {
+     int failures = 0;
+     failures += test_single_call();
+     failures += test_multiple_calls_and_json_values();
++    failures += test_codex_alternate_function_open();
++    failures += test_codex_malformed_variants();
+     failures += test_malformed_falls_back_to_text();
+     failures += test_suffix_after_tool_falls_back_to_text();
+     failures += test_configured_name_limit();

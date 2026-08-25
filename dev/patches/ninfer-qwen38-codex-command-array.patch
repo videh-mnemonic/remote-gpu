@@ -1,0 +1,97 @@
+diff --git a/src/serve/tool_call_parser.cpp b/src/serve/tool_call_parser.cpp
+index f49b066..b1cbc00 100644
+--- a/src/serve/tool_call_parser.cpp
++++ b/src/serve/tool_call_parser.cpp
+@@ -119,6 +119,48 @@ bool contains_tool_name(const std::vector<std::string>& allowed_tool_names,
+            allowed_tool_names.end();
+ }
+ 
++std::string shell_quote(std::string_view value) {
++    if (value.empty()) { return "''"; }
++    const bool safe = std::all_of(value.begin(), value.end(), [](unsigned char c) {
++        return std::isalnum(c) != 0 || c == '_' || c == '-' || c == '.' || c == '/' || c == ':';
++    });
++    if (safe) { return std::string(value); }
++    std::string quoted{"'"};
++    for (const char c : value) {
++        if (c == '\'') {
++            quoted += "'\\''";
++        } else {
++            quoted += c;
++        }
++    }
++    quoted += '\'';
++    return quoted;
++}
++
++bool normalize_command_array(Json& value) {
++    if (!value.is_array() || value.empty()) { return false; }
++    std::vector<std::string> parts;
++    parts.reserve(value.size());
++    for (const Json& part : value) {
++        if (!part.is_string()) { return false; }
++        parts.push_back(part.get<std::string>());
++    }
++    if (parts.size() >= 3 &&
++        (parts[0] == "bash" || parts[0] == "/bin/bash" || parts[0] == "sh" ||
++         parts[0] == "/bin/sh") &&
++        (parts[1] == "-c" || parts[1] == "-lc")) {
++        value = parts[2];
++        return true;
++    }
++    std::string command;
++    for (const std::string& part : parts) {
++        if (!command.empty()) { command += ' '; }
++        command += shell_quote(part);
++    }
++    value = std::move(command);
++    return true;
++}
++
+ bool is_shell_alias(std::string_view name) {
+     std::string lower(name);
+     std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+@@ -194,6 +236,9 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length,
+     }
+ 
+     if (name == "exec_command" && !direct_shell_command) {
++        if (args.contains("cmd") && args["cmd"].is_array()) {
++            normalize_command_array(args["cmd"]);
++        }
+         if (args.contains("args") && !args.contains("cmd") && args["args"].is_array() &&
+             args["args"].size() == 2 && args["args"][0] == "-c" &&
+             args["args"][1].is_string()) {
+diff --git a/tests/test_tool_call_parser.cpp b/tests/test_tool_call_parser.cpp
+index 142d789..09ed16b 100644
+--- a/tests/test_tool_call_parser.cpp
++++ b/tests/test_tool_call_parser.cpp
+@@ -153,6 +153,16 @@ int test_codex_args_and_inline_command_forms() {
+         "<tool_call>\n<exec_command cmd=\"pwd; ls -la\" \n"
+         "</parameter>\n</function>\n</tool_call>",
+         64, {"exec_command"});
++    const auto command_array = ninfer::serve::parse_qwen_tool_call_output(
++        "<tool_call>\n<function=exec_command>\n"
++        "<parameter=cmd>\n[\"git\",\"ls-files\"]\n</parameter>\n"
++        "</function>\n</tool_call>",
++        64, {"exec_command"});
++    const auto shell_array = ninfer::serve::parse_qwen_tool_call_output(
++        "<tool_call>\n<function=exec_command>\n"
++        "<parameter=cmd>\n[\"/bin/bash\",\"-lc\",\"pwd && ls -la\"]\n</parameter>\n"
++        "</function>\n</tool_call>",
++        64, {"exec_command"});
+ 
+     int failures = 0;
+     for (const auto* parsed : {&args, &inline_command}) {
+@@ -167,6 +177,12 @@ int test_codex_args_and_inline_command_forms() {
+     failures += check(Json::parse(inline_command.tool_calls[0].arguments_json).at("cmd") ==
+                           "pwd; ls -la",
+                       "inline command recovered");
++    failures += check(Json::parse(command_array.tool_calls[0].arguments_json).at("cmd") ==
++                          "git ls-files",
++                      "command array normalized");
++    failures += check(Json::parse(shell_array.tool_calls[0].arguments_json).at("cmd") ==
++                          "pwd && ls -la",
++                      "shell command array unwrapped");
+     return failures;
+ }
+ 
