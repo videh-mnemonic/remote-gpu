@@ -53,6 +53,80 @@ rgpu run --host USER@GPU_HOST --include-local --cublas-rpc -- \
   python3 -c 'import torch; print(torch.cuda.device_count()); print([torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])'
 ```
 
+## Bidirectional two-host setup
+
+For two workstations that should each be able to use the other's GPU, put the
+direct 10 GbE interfaces on the same private point-to-point subnet. Use local
+values for the placeholders below:
+
+```text
+HOST_A           first workstation
+HOST_B           second workstation
+USER_A           SSH user on HOST_A
+USER_B           SSH user on HOST_B
+DIRECT_IF        10 GbE interface, for example eno2
+HOST_A_DIRECT_IP static direct-link address for HOST_A
+HOST_B_DIRECT_IP static direct-link address for HOST_B
+```
+
+Temporary network setup until reboot:
+
+```bash
+# On HOST_A
+sudo ip link set DIRECT_IF up
+sudo ip addr replace HOST_A_DIRECT_IP/24 dev DIRECT_IF
+sudo ip link set DIRECT_IF mtu 9000
+
+# On HOST_B
+sudo ip link set DIRECT_IF up
+sudo ip addr replace HOST_B_DIRECT_IP/24 dev DIRECT_IF
+sudo ip link set DIRECT_IF mtu 9000
+```
+
+Persistent NetworkManager setup:
+
+```bash
+# On HOST_A
+sudo nmcli con add type ethernet ifname DIRECT_IF con-name rgpu-direct \
+  ipv4.method manual ipv4.addresses HOST_A_DIRECT_IP/24 \
+  ipv6.method ignore 802-3-ethernet.mtu 9000 autoconnect yes
+sudo nmcli con up rgpu-direct
+
+# On HOST_B
+sudo nmcli con add type ethernet ifname DIRECT_IF con-name rgpu-direct \
+  ipv4.method manual ipv4.addresses HOST_B_DIRECT_IP/24 \
+  ipv6.method ignore 802-3-ethernet.mtu 9000 autoconnect yes
+sudo nmcli con up rgpu-direct
+```
+
+Verify that each direction routes directly over the 10 GbE interface and not
+through a gateway:
+
+```bash
+# On HOST_A
+ip route get HOST_B_DIRECT_IP
+ssh USER_B@HOST_B_DIRECT_IP 'hostname; nvidia-smi -L'
+
+# On HOST_B
+ip route get HOST_A_DIRECT_IP
+ssh USER_A@HOST_A_DIRECT_IP 'hostname; nvidia-smi -L'
+```
+
+In contained mode, each side can append the other GPU after its local GPU:
+
+```bash
+# On HOST_A: local GPU is cuda:0, HOST_B's GPU is cuda:1.
+rgpu run --host USER_B@HOST_B_DIRECT_IP --include-local --cublas-rpc -- \
+  python3 -c 'import torch; print(torch.cuda.device_count()); print([torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])'
+
+# On HOST_B: local GPU is cuda:0, HOST_A's GPU is cuda:1.
+rgpu run --host USER_A@HOST_A_DIRECT_IP --include-local --cublas-rpc -- \
+  python3 -c 'import torch; print(torch.cuda.device_count()); print([torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])'
+```
+
+Validate one direction at a time first. `rgpu` uses exclusive remote GPU
+leases and refuses to interfere with active compute work.
+
 ## Host-wide attachment
 
 This changes only rgpu-owned loader configuration and libraries; it does not
@@ -67,6 +141,25 @@ nvidia-smi
 python3 -c 'import torch; print(torch.cuda.device_count()); print([torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])'
 sudo "$(command -v rgpu)" detach
 ```
+
+To make ordinary `nvidia-smi` on each workstation show both GPUs, attach each
+machine to the other machine's direct-link SSH target:
+
+```bash
+# On HOST_A
+sudo "$(command -v rgpu)" attach --host USER_B@HOST_B_DIRECT_IP
+nvidia-smi
+
+# On HOST_B
+sudo "$(command -v rgpu)" attach --host USER_A@HOST_A_DIRECT_IP
+nvidia-smi
+```
+
+Each host-wide view is local-first: the physical GPU in that workstation is
+listed before the attached remote GPU. Validate one side first, then the other.
+If the second side refuses because a GPU is already leased or busy, detach the
+first side and use contained `rgpu run --include-local` for bidirectional
+testing until the lease policy is relaxed.
 
 `nvidia-smi` is immediately transparent. PyTorch must be launched from a new
 login shell so it inherits rgpu's narrowly scoped CUDA-library path; attach

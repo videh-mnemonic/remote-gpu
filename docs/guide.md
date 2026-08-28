@@ -134,6 +134,72 @@ ID before opening a session. The client and server also negotiate an explicit
 wire-protocol revision and reject mismatches before dispatching a CUDA call.
 Use `--deploy` after rebuilding an image.
 
+## Direct-link network setup
+
+For a symmetric two-workstation setup, each host needs a static address on the
+same trusted point-to-point subnet. Keep machine-specific names, users, and
+addresses in local notes or `dev/config/hosts.json`; public examples use
+placeholders:
+
+```text
+HOST_A, USER_A, HOST_A_DIRECT_IP
+HOST_B, USER_B, HOST_B_DIRECT_IP
+DIRECT_IF  # 10 GbE interface, for example eno2
+```
+
+Temporary setup until reboot:
+
+```bash
+# On HOST_A
+sudo ip link set DIRECT_IF up
+sudo ip addr replace HOST_A_DIRECT_IP/24 dev DIRECT_IF
+sudo ip link set DIRECT_IF mtu 9000
+
+# On HOST_B
+sudo ip link set DIRECT_IF up
+sudo ip addr replace HOST_B_DIRECT_IP/24 dev DIRECT_IF
+sudo ip link set DIRECT_IF mtu 9000
+```
+
+Persistent NetworkManager setup:
+
+```bash
+# On HOST_A
+sudo nmcli con add type ethernet ifname DIRECT_IF con-name rgpu-direct \
+  ipv4.method manual ipv4.addresses HOST_A_DIRECT_IP/24 \
+  ipv6.method ignore 802-3-ethernet.mtu 9000 autoconnect yes
+sudo nmcli con up rgpu-direct
+
+# On HOST_B
+sudo nmcli con add type ethernet ifname DIRECT_IF con-name rgpu-direct \
+  ipv4.method manual ipv4.addresses HOST_B_DIRECT_IP/24 \
+  ipv6.method ignore 802-3-ethernet.mtu 9000 autoconnect yes
+sudo nmcli con up rgpu-direct
+```
+
+Verify both directions. The route should name `DIRECT_IF` directly and should
+not contain a `via` gateway:
+
+```bash
+# On HOST_A
+ip route get HOST_B_DIRECT_IP
+ssh USER_B@HOST_B_DIRECT_IP 'hostname; nvidia-smi -L'
+
+# On HOST_B
+ip route get HOST_A_DIRECT_IP
+ssh USER_A@HOST_A_DIRECT_IP 'hostname; nvidia-smi -L'
+```
+
+Then deploy in whichever direction will consume the remote GPU:
+
+```bash
+# HOST_A consuming HOST_B's GPU.
+./rgpu-client/install.sh --host USER_B@HOST_B_DIRECT_IP
+
+# HOST_B consuming HOST_A's GPU.
+./rgpu-client/install.sh --host USER_A@HOST_A_DIRECT_IP
+```
+
 To install a wheel produced by the release builder while reusing already
 loaded images:
 
@@ -155,6 +221,25 @@ loader cache, but an existing shell cannot retroactively inherit the profile
 environment. rgpu deliberately does not write `/etc/ld.so.preload`: that would
 inject its libraries into every host process and create an unnecessary safety
 boundary.
+
+For the host-wide demonstration where ordinary `nvidia-smi` on both
+workstations shows two GPUs, attach each machine to the other direct-link SSH
+target:
+
+```bash
+# On HOST_A
+sudo "$(command -v rgpu)" attach --host USER_B@HOST_B_DIRECT_IP
+nvidia-smi
+
+# On HOST_B
+sudo "$(command -v rgpu)" attach --host USER_A@HOST_A_DIRECT_IP
+nvidia-smi
+```
+
+The expected ordering on each machine is local physical GPU first, then the
+attached remote GPU. Validate one side first. If the second attachment refuses
+because a GPU is already leased or busy, detach the first side and use
+contained `rgpu run --include-local` for bidirectional testing.
 
 Installation also provides `rgpu-rescue`, a local-only recovery path for an
 interrupted host-wide transaction. It does not contact remote hosts and refuses
