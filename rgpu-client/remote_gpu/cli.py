@@ -276,6 +276,49 @@ def local_source_address(host: Host) -> str | None:
         return None
 
 
+def route_summary(host: Host) -> dict[str, object]:
+    result = run_checked(["ip", "-o", "route", "get", host.address], timeout=5)
+    fields = (result.stdout or "").split()
+    summary: dict[str, object] = {
+        "exit_code": result.returncode,
+        "stdout": (result.stdout or "").strip(),
+        "stderr": (result.stderr or "").strip(),
+    }
+    for key in ("dev", "src", "via"):
+        try:
+            summary[key] = fields[fields.index(key) + 1]
+        except (ValueError, IndexError):
+            pass
+    if result.returncode == 0 and "via" in summary:
+        summary["warning"] = (
+            "route uses a gateway; a point-to-point GPU link usually routes "
+            "directly with `dev` and no `via` hop"
+        )
+    return summary
+
+
+def docker_runtime_summary() -> dict[str, object]:
+    result = run_checked(["docker", "info", "--format", "{{json .Runtimes}}"], timeout=15)
+    summary: dict[str, object] = {
+        "exit_code": result.returncode,
+        "runtimes": [],
+        "has_nvidia_runtime": False,
+    }
+    if result.returncode != 0:
+        summary["error"] = (result.stderr or result.stdout or "").strip()
+        return summary
+    try:
+        runtimes = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        summary["error"] = "could not parse docker runtime metadata"
+        return summary
+    if isinstance(runtimes, dict):
+        names = sorted(str(name) for name in runtimes)
+        summary["runtimes"] = names
+        summary["has_nvidia_runtime"] = "nvidia" in names
+    return summary
+
+
 def configured_host_candidates(values: Sequence[str]) -> list[str]:
     candidates: list[str] = []
     for value in values:
@@ -291,17 +334,12 @@ def probe_discovery_candidate(value: str) -> dict[str, object]:
         host = parse_host(value)
     except argparse.ArgumentTypeError as error:
         return {"candidate": value, "valid": False, "error": str(error)}
-    route = run_checked(["ip", "-o", "route", "get", host.address], timeout=5)
     record: dict[str, object] = {
         "candidate": value,
         "ssh_target": host.ssh_target,
         "endpoint": host.endpoint,
         "local_machine": host_points_to_local(host),
-        "route": {
-            "exit_code": route.returncode,
-            "stdout": (route.stdout or "").strip(),
-            "stderr": (route.stderr or "").strip(),
-        },
+        "route": route_summary(host),
     }
     if record["local_machine"]:
         record["usable_remote_gpu_host"] = False
@@ -335,7 +373,6 @@ def probe_discovery_candidate(value: str) -> dict[str, object]:
 
 def command_discover(args: argparse.Namespace) -> int:
     gpu = run_checked(["nvidia-smi", "-L"], timeout=15)
-    docker = run_checked(["docker", "info", "--format", "{{json .Runtimes}}"], timeout=15)
     candidates = configured_host_candidates(args.candidate)
     payload = {
         "local": {
@@ -345,8 +382,7 @@ def command_discover(args: argparse.Namespace) -> int:
             "addresses": local_address_records(),
             "gpus": (gpu.stdout or "").strip().splitlines(),
             "gpu_error": (gpu.stderr or "").strip() if gpu.returncode else "",
-            "docker_runtimes": (docker.stdout or "").strip(),
-            "docker_error": (docker.stderr or "").strip() if docker.returncode else "",
+            "docker": docker_runtime_summary(),
         },
         "candidates": [probe_discovery_candidate(value) for value in candidates],
     }

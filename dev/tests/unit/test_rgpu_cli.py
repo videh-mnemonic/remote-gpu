@@ -23,6 +23,7 @@ from remote_gpu.cli import (
     parse_host,
     remote_client_interface,
     require_matching_server_image,
+    route_summary,
     run_checked,
     server_name,
     start_server,
@@ -129,6 +130,20 @@ def test_local_server_interface_uses_ip_route(monkeypatch):
     )
     monkeypatch.setattr("remote_gpu.cli.run_checked", lambda *_args, **_kwargs: result)
     assert local_server_interface(Host("u@remote", "192.0.2.10")) == "eth0"
+
+
+def test_route_summary_warns_when_candidate_uses_gateway(monkeypatch):
+    result = subprocess.CompletedProcess(
+        [],
+        0,
+        "10.0.0.20 via 10.0.0.1 dev wlan0 src 10.0.0.5 uid 1000\n",
+        "",
+    )
+    monkeypatch.setattr("remote_gpu.cli.run_checked", lambda *_args, **_kwargs: result)
+    summary = route_summary(Host("u@remote", "10.0.0.20"))
+    assert summary["dev"] == "wlan0"
+    assert summary["via"] == "10.0.0.1"
+    assert "gateway" in summary["warning"]
 
 
 def test_server_lease_survives_remote_reboot(monkeypatch):
