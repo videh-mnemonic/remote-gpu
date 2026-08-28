@@ -24,7 +24,7 @@ LUPINE lets you spin up a container with a virtual GPU, like connecting a Mac to
 % uname -mors 
 Darwin 25.5.0 arm64
 % uv run https://raw.githubusercontent.com/lupinemachines/lupine/main/python/examples/tensor.py
-LUPINE server host: 100.106.167.98  <-- the ip of a machine with the LUPINE server running
+LUPINE server host: 192.0.2.10  <-- the ip of a machine with the LUPINE server running
 LUPINE server port [14833]: 
 cuda available: True
 device: lupine:0

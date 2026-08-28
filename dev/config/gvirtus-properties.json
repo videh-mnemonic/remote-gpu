@@ -4,7 +4,7 @@
       "endpoint": {
         "suite": "tcp/ip",
         "protocol": "tcp",
-        "server_address": "10.77.77.1",
+        "server_address": "192.0.2.10",
         "port": "9999"
       },
       "plugins": ["cudart", "cublas", "curand", "cudnn"]

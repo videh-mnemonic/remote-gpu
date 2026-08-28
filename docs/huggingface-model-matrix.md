@@ -10,8 +10,8 @@ It downloads no weights or datasets: every test uses 0 MB of data downloads.
 - Transformers commit: `94f09cfec149050b5355bab7f207ac69e21f1a02`
 - Diffusers commit: `4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db`
 - PyTorch: `2.12.0+cu130`
-- Native: direct execution on the RTX 5090 in `ws-5090-1`
-- Remote: execution from `ws-5090-2` through optimized LUPINE on that GPU
+- Native: direct execution on the RTX 5090 in `gpu-host`
+- Remote: execution from `client-host` through optimized LUPINE on that GPU
 - Short sweep: two warmups and 30 measured steps, CUDA-event median
 - Stable rerank: 10–20 warmups and 100–200 measured steps, three fresh
   processes per side; used to choose optimization targets

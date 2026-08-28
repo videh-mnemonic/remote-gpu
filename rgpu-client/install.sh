@@ -56,26 +56,15 @@ if [[ -n "$release_wheel" ]]; then
   install_source=$(realpath "$release_wheel")
 fi
 
-if command -v pipx >/dev/null; then
-  # Keep the application isolated from distro-managed Python (PEP 668) while
-  # exposing only the rgpu entry point in the user's normal local bin path.
-  pipx install --force "$install_source"
-  rgpu_bin=$(command -v rgpu || true)
-  if [[ -z "$rgpu_bin" ]]; then
-    bin_root=${PIPX_BIN_DIR:-${XDG_BIN_HOME:-"$HOME/.local/bin"}}
-    rgpu_bin="$bin_root/rgpu"
-  fi
-else
-  data_root=${XDG_DATA_HOME:-"$HOME/.local/share"}
-  bin_root=${XDG_BIN_HOME:-"$HOME/.local/bin"}
-  app_venv="$data_root/remote-gpu/venv"
-  python3 -m venv "$app_venv"
-  "$app_venv/bin/python" -m pip install --upgrade --force-reinstall \
-    "$install_source"
-  install -d "$bin_root"
-  ln -sfn "$app_venv/bin/rgpu" "$bin_root/rgpu"
-  rgpu_bin="$app_venv/bin/rgpu"
-fi
+bin_root=${XDG_BIN_HOME:-"$HOME/.local/bin"}
+app_venv="$project_root/.venv/remote-gpu-client"
+python3 -m venv "$app_venv"
+"$app_venv/bin/python" -m pip install --upgrade --force-reinstall \
+  "$install_source"
+install -d "$bin_root"
+ln -sfn "$app_venv/bin/rgpu" "$bin_root/rgpu"
+ln -sfn "$app_venv/bin/rgpu-rescue" "$bin_root/rgpu-rescue"
+rgpu_bin="$app_venv/bin/rgpu"
 
 [[ -x "$rgpu_bin" ]] || {
   echo "rgpu was installed but its executable was not found: $rgpu_bin" >&2

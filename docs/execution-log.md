@@ -70,7 +70,7 @@
 ## 2026-08-21 — Qwen3.8 27B NInfer serving optimization
 
 - Ran the unmodified private `ali` Qwen3.8 27B NVFP4 serving image natively on
-  `ws-5090-2` and through strict rgpu execution on `ws-5090-1`. The benchmark
+  `client-host` and through strict rgpu execution on `gpu-host`. The benchmark
   client uses bounded OpenAI-compatible streaming requests and records startup,
   time to first token, wall time, prefill throughput, and decode throughput.
 - The first remote run exposed one compatibility issue: NInfer's CUDA Graph
@@ -555,8 +555,8 @@ generic CUDA remoting path remains the single-device compatibility fallback.
   admission, invoking-user SSH identity, post-attach UUID verification, and
   automatic rollback. The user validated that ordinary host `nvidia-smi`
   enumerates local `cuda:0` plus remote `cuda:1` without an rgpu shell.
-- A controlled native workload on `ws-5090-1` made the remote row in bare
-  `nvidia-smi` on `ws-5090-2` jump from idle to 100% utilization and roughly
+- A controlled native workload on `gpu-host` made the remote row in bare
+  `nvidia-smi` on `client-host` jump from idle to 100% utilization and roughly
   1 GiB allocated, while direct telemetry on the server changed in lockstep.
 - Fixed local-route `cuMemcpyDtoHAsync_v2` and local-to-local
   `cuMemcpyAsync`. Independent PyTorch compute and device-to-host copies now
@@ -779,7 +779,7 @@ generic CUDA remoting path remains the single-device compatibility fallback.
 - Preserved exact upstream commits and disabled public pushes in every clone
   and initialized submodule.
 - Confirmed native PyTorch 2.12.0+cu130 passes all eight smoke checks on
-  `ws-5090-1`.
+  `gpu-host`.
 - Found a regression in current LUPINE main: even basic PyTorch tensor and
   matmul probes terminate the server child in the library-snapshot path.
 - Built LUPINE v1.0.0 and passed all eight smoke checks, the bounded 124M
@@ -797,7 +797,7 @@ generic CUDA remoting path remains the single-device compatibility fallback.
   does not see a device through it.
 - Left both remote test servers stopped after each candidate run.
 
-The local nanoGPT control remains pending. `ws-5090-2` continuously had an
+The local nanoGPT control remains pending. `client-host` continuously had an
 unrelated `ninfer-serve` process using about 25.7 GiB, so no benchmark was
 started on that GPU.
 
@@ -805,7 +805,7 @@ started on that GPU.
 
 Completed without GPU load:
 
-- Confirmed ws-5090-2 has an RTX 5090 PCIe device, NVIDIA kernel modules, an
+- Confirmed client-host has an RTX 5090 PCIe device, NVIDIA kernel modules, an
   active 10 GbE `eno2` link, and MTU 9,000 through read-only host interfaces.
 - Added ignored local-clone storage and a manifest for LUPINE, Cricket,
   GVirtuS, modded-nanogpt, PyTorch, and TorchBench.

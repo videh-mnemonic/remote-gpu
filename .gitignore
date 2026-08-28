@@ -3,8 +3,7 @@
 
 # Prepared datasets, container caches, and bulky/raw benchmark artifacts.
 /data/
-/dev/results/raw/
-/dev/results/tmp/
+/dev/results/
 /dev/results/inductor-*/
 /dev/generated/
 /dev/releases/
@@ -12,6 +11,10 @@
 
 # Local configuration and credentials.
 /dev/config/hosts.json
+.memo-sandbox
+.vscode/
+/.vscode/
+/lupine/.vscode/
 .env
 .env.*
 !.env.example
@@ -22,5 +25,8 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 .venv/
+venv/
+/rgpu-client/.venv/
+/lupine/python/.venv/
 /build/
 /rgpu-client/build/

@@ -33,7 +33,7 @@ def shim_bundle(tmp_path: Path) -> Path:
 
 def test_live_root_is_locked():
     with pytest.raises(HostwideError, match="live-root attachment is locked"):
-        install(Path("/"), Path("/missing"), ["10.77.77.1:14833"])
+        install(Path("/"), Path("/missing"), ["192.0.2.10:14833"])
 
 
 def test_sandbox_install_and_detach_are_reversible(tmp_path: Path):
@@ -46,13 +46,13 @@ def test_sandbox_install_and_detach_are_reversible(tmp_path: Path):
     state = install(
         root,
         shim_bundle(tmp_path),
-        ["10.77.77.1:14833", "10.77.77.2:14834"],
+        ["192.0.2.10:14833", "192.0.2.20:14834"],
         refresh_loader=False,
     )
     assert state["live_root"] is False
     assert state["phase"] == "attached"
     assert original.read_text(encoding="utf-8") == (
-        "10.77.77.1:14833,10.77.77.2:14834\n"
+        "192.0.2.10:14833,192.0.2.20:14834\n"
     )
     assert (root / "usr/local/lib/rgpu/libcuda.so").readlink() == Path(
         "libcuda.so.1"
@@ -77,7 +77,7 @@ def test_detach_refuses_modified_managed_file(tmp_path: Path):
     install(
         root,
         shim_bundle(tmp_path),
-        ["10.77.77.1:14833"],
+        ["192.0.2.10:14833"],
         refresh_loader=False,
     )
     (root / "etc/rgpu/endpoints").write_text("tampered\n", encoding="utf-8")
@@ -102,7 +102,7 @@ def test_installing_journal_recovers_partial_replacements(tmp_path: Path):
     install(
         root,
         shim_bundle(tmp_path),
-        ["10.77.77.1:14833"],
+        ["192.0.2.10:14833"],
         refresh_loader=False,
     )
 
@@ -131,7 +131,7 @@ def test_detach_retries_after_loader_refresh_failure(
     install(
         root,
         shim_bundle(tmp_path),
-        ["10.77.77.1:14833"],
+        ["192.0.2.10:14833"],
         refresh_loader=False,
     )
 
@@ -164,7 +164,7 @@ def test_out_of_band_rescue_restores_without_gpu_libraries(tmp_path: Path):
     install(
         root,
         shim_bundle(tmp_path),
-        ["10.77.77.1:14833"],
+        ["192.0.2.10:14833"],
         refresh_loader=False,
         metadata={"leases": [{"name": "test-lease"}]},
     )
@@ -247,7 +247,7 @@ def test_install_recovers_after_each_managed_replacement_boundary(
         install(
             root,
             shim_bundle(tmp_path),
-            ["10.77.77.1:14833"],
+            ["192.0.2.10:14833"],
             refresh_loader=False,
         )
     assert injected
@@ -289,7 +289,7 @@ def test_detach_resumes_after_each_managed_removal_boundary(
     install(
         root,
         shim_bundle(tmp_path),
-        ["10.77.77.1:14833"],
+        ["192.0.2.10:14833"],
         refresh_loader=False,
     )
     real_remove = hostwide._remove_target

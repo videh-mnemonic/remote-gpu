@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, replace
+import getpass
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -12,6 +14,7 @@ import pwd
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -90,6 +93,18 @@ def expand_hosts(values: Sequence[str]) -> list[Host]:
     return hosts
 
 
+def expand_remote_hosts(values: Sequence[str]) -> list[Host]:
+    hosts = expand_hosts(values)
+    local = [host.ssh_target for host in hosts if host_points_to_local(host)]
+    if local:
+        raise RgpuError(
+            "refusing to use this machine as a remote GPU host: "
+            + ", ".join(local)
+            + "; run `rgpu discover` and pass the SSH target for another host"
+        )
+    return hosts
+
+
 def apply_transport_endpoints(
     hosts: Sequence[Host], values: Sequence[str] | None
 ) -> list[Host]:
@@ -152,6 +167,191 @@ def run_checked(
             exc.stdout or "",
             exc.stderr or f"timed out after {timeout:g}s",
         )
+
+
+def _safe_hostname(value: str) -> str:
+    return value.strip().rstrip(".").lower()
+
+
+def _host_address_from_ssh_target(value: str) -> str:
+    address = value.rsplit("@", 1)[-1]
+    if address.startswith("[") and "]" in address:
+        return address[1 : address.index("]")]
+    if address.count(":") == 1:
+        candidate, raw_port = address.rsplit(":", 1)
+        if raw_port.isdigit():
+            return candidate
+    return address
+
+
+def local_ip_addresses() -> set[str]:
+    addresses = {"127.0.0.1", "::1"}
+    result = run_checked(["ip", "-j", "address"], timeout=5)
+    if result.returncode == 0:
+        try:
+            interfaces = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            interfaces = []
+        for interface in interfaces:
+            for item in interface.get("addr_info", []):
+                local = item.get("local")
+                if isinstance(local, str):
+                    addresses.add(local)
+    for name in local_hostnames():
+        try:
+            infos = socket.getaddrinfo(name, None)
+        except socket.gaierror:
+            continue
+        for info in infos:
+            addresses.add(info[4][0])
+    return addresses
+
+
+def local_hostnames() -> set[str]:
+    names = {"localhost"}
+    for candidate in (socket.gethostname(), socket.getfqdn()):
+        if candidate:
+            names.add(_safe_hostname(candidate))
+            names.add(_safe_hostname(candidate.split(".", 1)[0]))
+    return {name for name in names if name}
+
+
+def host_points_to_local(host: Host) -> bool:
+    target = _safe_hostname(_host_address_from_ssh_target(host.ssh_target))
+    if target in local_hostnames():
+        return True
+    try:
+        parsed = ipaddress.ip_address(target)
+    except ValueError:
+        parsed = None
+    if parsed is not None and parsed.is_loopback:
+        return True
+    local_addresses = local_ip_addresses()
+    if target in local_addresses:
+        return True
+    try:
+        resolved = {info[4][0] for info in socket.getaddrinfo(target, None)}
+    except socket.gaierror:
+        resolved = set()
+    return bool(resolved & local_addresses)
+
+
+def local_address_records() -> list[dict[str, object]]:
+    result = run_checked(["ip", "-j", "address"], timeout=5)
+    if result.returncode != 0:
+        return []
+    try:
+        interfaces = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    records = []
+    for interface in interfaces:
+        name = interface.get("ifname")
+        for item in interface.get("addr_info", []):
+            if not isinstance(name, str) or not isinstance(item, dict):
+                continue
+            local = item.get("local")
+            family = item.get("family")
+            if isinstance(local, str) and isinstance(family, str):
+                records.append(
+                    {
+                        "interface": name,
+                        "family": family,
+                        "address": local,
+                        "prefixlen": item.get("prefixlen"),
+                        "scope": item.get("scope"),
+                    }
+                )
+    return records
+
+
+def local_source_address(host: Host) -> str | None:
+    result = run_checked(["ip", "-o", "route", "get", host.address], timeout=5)
+    if result.returncode != 0:
+        return None
+    fields = (result.stdout or "").split()
+    try:
+        return fields[fields.index("src") + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def configured_host_candidates(values: Sequence[str]) -> list[str]:
+    candidates: list[str] = []
+    for value in values:
+        candidates.extend(item.strip() for item in value.split(",") if item.strip())
+    for env_name in ("RGPU_HOSTS", "RGPU_HOST_CANDIDATES"):
+        value = os.environ.get(env_name, "")
+        candidates.extend(item.strip() for item in value.split(",") if item.strip())
+    return list(dict.fromkeys(candidates))
+
+
+def probe_discovery_candidate(value: str) -> dict[str, object]:
+    try:
+        host = parse_host(value)
+    except argparse.ArgumentTypeError as error:
+        return {"candidate": value, "valid": False, "error": str(error)}
+    route = run_checked(["ip", "-o", "route", "get", host.address], timeout=5)
+    record: dict[str, object] = {
+        "candidate": value,
+        "ssh_target": host.ssh_target,
+        "endpoint": host.endpoint,
+        "local_machine": host_points_to_local(host),
+        "route": {
+            "exit_code": route.returncode,
+            "stdout": (route.stdout or "").strip(),
+            "stderr": (route.stderr or "").strip(),
+        },
+    }
+    if record["local_machine"]:
+        record["usable_remote_gpu_host"] = False
+        record["error"] = "candidate resolves to this machine"
+        return record
+    remote = ssh(
+        host,
+        [
+            "sh",
+            "-lc",
+            (
+                "printf 'hostname='; hostname; "
+                "printf 'user='; whoami; "
+                "printf 'gpu='; nvidia-smi -L 2>/dev/null || true; "
+                "printf 'docker='; docker info --format '{{json .Runtimes}}' "
+                "2>/dev/null || true"
+            ),
+        ],
+        timeout=10,
+    )
+    record["ssh"] = {
+        "exit_code": remote.returncode,
+        "stdout": (remote.stdout or "").strip(),
+        "stderr": (remote.stderr or "").strip(),
+    }
+    record["usable_remote_gpu_host"] = remote.returncode == 0 and "gpu=GPU " in (
+        remote.stdout or ""
+    )
+    return record
+
+
+def command_discover(args: argparse.Namespace) -> int:
+    gpu = run_checked(["nvidia-smi", "-L"], timeout=15)
+    docker = run_checked(["docker", "info", "--format", "{{json .Runtimes}}"], timeout=15)
+    candidates = configured_host_candidates(args.candidate)
+    payload = {
+        "local": {
+            "hostname": socket.gethostname(),
+            "fqdn": socket.getfqdn(),
+            "user": getpass.getuser(),
+            "addresses": local_address_records(),
+            "gpus": (gpu.stdout or "").strip().splitlines(),
+            "gpu_error": (gpu.stderr or "").strip() if gpu.returncode else "",
+            "docker_runtimes": (docker.stdout or "").strip(),
+            "docker_error": (docker.stderr or "").strip() if docker.returncode else "",
+        },
+        "candidates": [probe_discovery_candidate(value) for value in candidates],
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
 
 
 def invoking_user_prefix() -> list[str]:
@@ -769,7 +969,7 @@ def client_command(
 
 
 def command_status(args: argparse.Namespace) -> int:
-    hosts = expand_hosts(args.host)
+    hosts = expand_remote_hosts(args.host)
     payload = []
     for host in hosts:
         gpu = require_success(
@@ -789,7 +989,7 @@ def command_status(args: argparse.Namespace) -> int:
 
 
 def command_deploy(args: argparse.Namespace) -> int:
-    for host in expand_hosts(args.host):
+    for host in expand_remote_hosts(args.host):
         deploy_image(host, args.server_image)
         print(f"deployed {args.server_image} to {host.ssh_target}")
     return 0
@@ -811,7 +1011,7 @@ def command_attach(args: argparse.Namespace) -> int:
                 "local GPU has active compute processes; refusing live attachment:\n"
                 + active
             )
-    hosts = apply_transport_endpoints(expand_hosts(args.host), args.endpoint)
+    hosts = apply_transport_endpoints(expand_remote_hosts(args.host), args.endpoint)
     before = local_gpu_identity()
     expected_uuids = gpu_uuids(before)
     shim_bundle = prepare_shim_bundle(args.shim_image)
@@ -950,7 +1150,7 @@ def command_gc(args: argparse.Namespace) -> int:
         raise RgpuError("--min-age must be at least 60 seconds")
     report = []
     now = int(time.time())
-    for host in expand_hosts(args.host):
+    for host in expand_remote_hosts(args.host):
         name = server_name(host)
         result = ssh(
             host,
@@ -1003,7 +1203,7 @@ def command_run(args: argparse.Namespace) -> int:
         raise RgpuError(
             "--allow-unsupported-library-fallback requires --cublas-rpc"
         )
-    hosts = apply_transport_endpoints(expand_hosts(args.host), args.endpoint)
+    hosts = apply_transport_endpoints(expand_remote_hosts(args.host), args.endpoint)
     nccl_interfaces = tuple(
         interface
         for host in hosts
@@ -1090,6 +1290,7 @@ def native_python_rank_command(
     world_size: int,
     master_addr: str,
     master_port: int,
+    nccl_interface: str | None,
     environment: Sequence[str],
     script_args: Sequence[str],
 ) -> list[str]:
@@ -1114,9 +1315,9 @@ def native_python_rank_command(
         f"WORLD_SIZE={world_size}",
         "-e",
         "LOCAL_RANK=0",
-        "-e",
-        "NCCL_SOCKET_IFNAME=eno2",
     ]
+    if nccl_interface is not None:
+        command.extend(["-e", f"NCCL_SOCKET_IFNAME={nccl_interface}"])
     for value in environment:
         if "=" not in value and value not in os.environ:
             raise RgpuError(f"environment variable is not set: {value}")
@@ -1127,7 +1328,7 @@ def native_python_rank_command(
 
 def command_native_python(args: argparse.Namespace) -> int:
     """Run native NCCL ranks locally and remotely from one Python script."""
-    hosts = expand_hosts(args.host)
+    hosts = expand_remote_hosts(args.host)
     script = Path(args.script).resolve()
     if not script.is_file():
         raise RgpuError(f"Python workload does not exist: {script}")
@@ -1150,6 +1351,12 @@ def command_native_python(args: argparse.Namespace) -> int:
             )
 
     world_size = len(hosts) + 1
+    master_addr = args.master_addr or local_source_address(hosts[0])
+    if master_addr is None:
+        raise RgpuError(
+            "could not infer --master-addr from the route to the first host"
+        )
+    nccl_interface = local_server_interface(hosts[0])
     children: list[subprocess.Popen[bytes]] = []
 
     def stop_children() -> None:
@@ -1170,8 +1377,9 @@ def command_native_python(args: argparse.Namespace) -> int:
                 args.image,
                 rank,
                 world_size,
-                args.master_addr,
+                master_addr,
                 args.master_port,
+                nccl_interface,
                 args.env,
                 script_args,
             )
@@ -1197,8 +1405,9 @@ def command_native_python(args: argparse.Namespace) -> int:
             args.image,
             0,
             world_size,
-            args.master_addr,
+            master_addr,
             args.master_port,
+            nccl_interface,
             args.env,
             script_args,
         )
@@ -1230,6 +1439,19 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="rgpu")
     root.add_argument("--version", action="version", version=f"rgpu {__version__}")
     commands = root.add_subparsers(dest="subcommand", required=True)
+
+    discover = commands.add_parser(
+        "discover",
+        help="identify the local machine and probe possible remote GPU hosts",
+    )
+    discover.add_argument(
+        "--candidate",
+        action="append",
+        default=[],
+        help=("SSH target to probe; repeat or use comma-separated values. "
+              "RGPU_HOSTS and RGPU_HOST_CANDIDATES are also considered."),
+    )
+    discover.set_defaults(func=command_discover)
 
     status = commands.add_parser("status", help="inspect remote GPUs without starting a server")
     status.add_argument("--host", action="append", required=True)
@@ -1334,7 +1556,10 @@ def parser() -> argparse.ArgumentParser:
     native_python.add_argument(
         "--image", default="remote-gpu-pytorch-native:2.12.0-cu130"
     )
-    native_python.add_argument("--master-addr", default="10.77.77.2")
+    native_python.add_argument(
+        "--master-addr",
+        help="address remote ranks use to reach the local rank; inferred from route by default",
+    )
     native_python.add_argument("--master-port", type=int, default=29681)
     native_python.add_argument("--timeout", type=float, default=300.0)
     native_python.add_argument("--env", action="append", default=[])

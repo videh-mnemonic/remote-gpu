@@ -5,7 +5,7 @@
 The final interface is:
 
 ```bash
-sudo rgpu attach --host mnemonic-1@10.77.77.1
+sudo rgpu attach --host user@192.0.2.10
 nvidia-smi
 python3 train.py
 sudo rgpu detach
@@ -16,7 +16,7 @@ same SSH lease host to a separately addressed, server-authenticated data path:
 
 ```bash
 sudo rgpu attach \
-  --host mnemonic-1@10.77.77.1 \
+  --host user@192.0.2.10 \
   --endpoint https://gpu.example
 ```
 
@@ -42,7 +42,7 @@ runs `ldconfig`, and records fingerprints and backups in
 Attach and detach are transactional for an explicitly supplied sandbox root:
 
 ```bash
-rgpu attach --host mnemonic-1@10.77.77.1 --root /path/to/disposable/root
+rgpu attach --host user@192.0.2.10 --root /path/to/disposable/root
 rgpu detach --root /path/to/disposable/root
 ```
 

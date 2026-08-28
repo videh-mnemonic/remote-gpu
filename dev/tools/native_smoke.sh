@@ -3,7 +3,7 @@ set -euo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 image_name=${REMOTE_GPU_IMAGE:-remote-gpu-pytorch:2.12.0-cu130}
-result_name=${1:-native-smoke-ws-5090-2}
+result_name=${1:-native-smoke-local}
 raw_dir="$project_root/dev/results/raw"
 
 mkdir -p "$raw_dir"

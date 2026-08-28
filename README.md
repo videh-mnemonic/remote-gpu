@@ -23,11 +23,18 @@ Python 3.10 or newer, and key-based SSH access to the host.
 From a source checkout on the client:
 
 ```bash
+rgpu discover --candidate USER@GPU_HOST
 ./rgpu-client/install.sh --host USER@GPU_HOST
 rgpu status --host USER@GPU_HOST
 rgpu run --host USER@GPU_HOST -- nvidia-smi -L
 rgpu run --host USER@GPU_HOST -- python3 your_training_script.py
 ```
+
+`rgpu discover` reports local host identity, interfaces, local GPUs, Docker
+state, and candidate remote GPU hosts without relying on checked-in machine
+names. Runtime commands reject a `--host` target that resolves back to the
+current machine, which catches accidentally reversed workstation commands
+before deployment.
 
 Use any compatible existing workload image without rebuilding it:
 

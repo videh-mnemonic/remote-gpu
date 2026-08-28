@@ -34,7 +34,14 @@ docker build \
   "$lupine_source"
 
 docker build \
+  --target common \
+  --tag remote-gpu-pytorch-native:2.12.0-cu130 \
+  --file "$project_root/dev/containers/common-pytorch/Dockerfile" \
+  "$project_root"
+
+docker build \
   --build-arg LUPINE_SHIM_IMAGE=remote-gpu-lupine-client:optimized \
+  --build-arg PYTORCH_IMAGE=remote-gpu-pytorch-native:2.12.0-cu130 \
   --tag remote-gpu-lupine-pytorch:optimized \
   --file "$project_root/rgpu-client/containers/lupine-overlay/Dockerfile" \
   "$project_root"
@@ -42,12 +49,6 @@ docker build \
 # Build the exact protocol-6 images consumed by the rgpu CLI defaults.  The
 # CUDA/NCCL workload is Debian-based, so both injected client and server
 # binaries are built on Ubuntu 22.04 to keep their glibc/libstdc++ ABI portable.
-docker build \
-  --target common \
-  --tag remote-gpu-pytorch-native:2.12.0-cu130 \
-  --file "$project_root/dev/containers/common-pytorch/Dockerfile" \
-  "$project_root"
-
 docker tag \
   remote-gpu-lupine-client:portable \
   remote-gpu-lupine-client:nccl-rpc-v6

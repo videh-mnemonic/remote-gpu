@@ -2,8 +2,8 @@
 
 Last updated: 2026-08-24
 
-“Native” is direct execution on the RTX 5090 in `ws-5090-1`. “Remote” is
-execution from `ws-5090-2` on that same GPU through the current optimized
+“Native” is direct execution on the RTX 5090 in `gpu-host`. “Remote” is
+execution from `client-host` on that same GPU through the current optimized
 runtime. Dependency installation and image build time are excluded. Tests are
 bounded below five minutes except the explicitly labeled real 1M-token runs.
 
@@ -14,8 +14,8 @@ so close results should be interpreted as ranges rather than absolute rankings.
 
 This comparison uses the private `ali` serving setup without modifying it:
 Qwen3.8 27B NVFP4 weights, INT8 KV cache, and three-token MTP. Native ran on
-the local RTX 5090 in `ws-5090-2`; remote ran unchanged from that machine on
-the RTX 5090 in `ws-5090-1` over direct 10 GbE. The current primary comparison
+the local RTX 5090 in `client-host`; remote ran unchanged from that machine on
+the RTX 5090 in `gpu-host` over direct 10 GbE. The current primary comparison
 uses NInfer's default CUDA Graph path with prefix reuse disabled. Five
 deterministic requests generated identical token sequences. A separate short
 run also hashed the complete streamed output and obtained the same SHA-256

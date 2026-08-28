@@ -114,16 +114,21 @@ The raw data port must be reachable only over a trusted network. On the host,
 `rgpu-host/check.sh` verifies these prerequisites and the loaded server image
 without starting a GPU workload.
 
-From this private repository:
+From this repository:
 
 ```bash
-./rgpu-client/install.sh --host mnemonic-1@10.77.77.1
-rgpu run --host mnemonic-1@10.77.77.1 -- nvidia-smi -L
-rgpu run --host mnemonic-1@10.77.77.1 -- python3 train.py
+rgpu discover --candidate user@192.0.2.10
+./rgpu-client/install.sh --host user@192.0.2.10
+rgpu run --host user@192.0.2.10 -- nvidia-smi -L
+rgpu run --host user@192.0.2.10 -- python3 train.py
 ```
 
-The installer builds the reproducible client, portable injection shim, server,
-and default PyTorch image; installs the Python launcher; and copies the exact
+`rgpu discover` identifies the local host, visible interfaces, local GPUs, and
+Docker state, then probes explicit candidate SSH targets. Deployment and run
+commands reject a target that resolves to the local machine, so checked-in
+examples cannot accidentally reverse the client/server direction. The
+installer builds the reproducible client, portable injection shim, server, and
+default PyTorch image; installs the Python launcher; and copies the exact
 server image to the selected host. A subsequent run verifies the remote image
 ID before opening a session. The client and server also negotiate an explicit
 wire-protocol revision and reject mismatches before dispatching a CUDA call.
@@ -134,7 +139,7 @@ loaded images:
 
 ```bash
 ./rgpu-client/install.sh \
-  --host mnemonic-1@10.77.77.1 \
+  --host user@192.0.2.10 \
   --skip-build \
   --wheel dev/releases/0.2.1/wheels/remote_gpu-0.2.1-py3-none-any.whl
 ```
@@ -165,7 +170,7 @@ collector can reclaim only a labeled ephemeral lease that is old enough and
 has no established client connection:
 
 ```bash
-rgpu gc --host mnemonic-1@10.77.77.1 --min-age 3600
+rgpu gc --host user@192.0.2.10 --min-age 3600
 ```
 
 Persistent host-wide attachments are never eligible for this collector.
@@ -176,7 +181,7 @@ bind-injects it at process launch:
 
 ```bash
 rgpu run \
-  --host mnemonic-1@10.77.77.1 \
+  --host user@192.0.2.10 \
   --image YOUR_EXISTING_PYTORCH_IMAGE \
   -- python3 train.py
 ```
@@ -189,7 +194,7 @@ To append remote devices after local devices, opt in explicitly:
 
 ```bash
 rgpu run \
-  --host mnemonic-1@10.77.77.1 \
+  --host user@192.0.2.10 \
   --include-local \
   --image YOUR_EXISTING_PYTORCH_IMAGE \
   -- python3 train.py
@@ -206,7 +211,7 @@ deployment/lease address and provide the corresponding HTTPS data endpoint:
 
 ```bash
 rgpu run \
-  --host mnemonic-1@10.77.77.1 \
+  --host user@192.0.2.10 \
   --endpoint https://gpu.example \
   -- python3 train.py
 ```
@@ -223,7 +228,7 @@ compatibility flag while its ABI surface is expanded:
 
 ```bash
 rgpu run \
-  --host mnemonic-1@10.77.77.1 \
+  --host user@192.0.2.10 \
   --include-local \
   --cublas-rpc \
   --cublas-async \
@@ -248,7 +253,7 @@ include-local session:
 
 ```bash
 rgpu run \
-  --host mnemonic-1@10.77.77.1 \
+  --host user@192.0.2.10 \
   --include-local \
   -- torchrun --standalone --nproc-per-node=2 train.py
 ```

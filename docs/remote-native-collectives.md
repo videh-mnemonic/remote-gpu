@@ -41,7 +41,7 @@ and injects `NCCL_SOCKET_IFNAME` into the server lease.
 ## Target flow
 
 ```text
-unmodified PyTorch rank on ws-5090-2
+unmodified PyTorch rank on client-host
         |
         | NCCL ABI interposer (only for a virtualized GPU route)
         v
@@ -49,7 +49,7 @@ LUPINE session RPC ====================================+
                                                        |
                                                        v
                                       native NCCL in the GPU-owning
-                                      session on ws-5090-1
+                                      session on gpu-host
                                                        |
                                       native CUDA stream and pointers
                                                        |
@@ -61,13 +61,13 @@ The CUDA allocation, stream, event, and module handles already returned by
 LUPINE are server-side handles represented as opaque client values. A
 server-side NCCL call can therefore consume the same buffer and stream values
 without copying tensor payloads through the client. NCCL creates its socket
-proxy and mapped control memory on `ws-5090-1`, beside the GPU, and communicates
-with the native rank on `ws-5090-2` over the direct Ethernet link.
+proxy and mapped control memory on `gpu-host`, beside the GPU, and communicates
+with the native rank on `client-host` over the direct Ethernet link.
 
 ## Why this preserves the product contract
 
 - The application process, Python control flow, files, and data loading remain
-  on `ws-5090-2`.
+  on `client-host`.
 - PyTorch source code is unchanged. Installation supplies a version-matched
   NCCL interposer alongside the existing CUDA/NVML shim.
 - Local ranks continue to bind directly to the workload's native NCCL.
@@ -77,7 +77,7 @@ with the native rank on `ws-5090-2` over the direct Ethernet link.
   the existing transparent behavior.
 
 This differs from `rgpu native-python`: that fallback moves the whole remote
-rank process to `ws-5090-1`. The target flow moves only NCCL execution while
+rank process to `gpu-host`. The target flow moves only NCCL execution while
 keeping the rank process on the initiating workstation.
 
 ## Prototype phases

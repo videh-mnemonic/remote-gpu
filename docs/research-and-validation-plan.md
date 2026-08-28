@@ -1,4 +1,4 @@
-# Remote PyTorch on ws-5090-1: research and validation plan
+# Remote PyTorch on gpu-host: research and validation plan
 
 Status: initial bake-off, optimization, and first upstream-breadth pass executed;
 see `docs/compatibility.md` and `docs/north-star.md`
@@ -10,9 +10,9 @@ Research date: 2026-08-19
 > 10 GbE link all passed. The measured candidate results are maintained in the
 > compatibility report and execution log.
 
-Client/application host: `ws-5090-2`
+Client/application host: `client-host`
 
-GPU server: `ws-5090-1` (`10.77.77.1`)
+GPU server: `gpu-host` (`192.0.2.10`)
 
 ## Executive recommendation (revised)
 
@@ -39,13 +39,13 @@ layer.
 The eventual user interface remains tentatively:
 
 ```text
-rgpu run --host ws-5090-1 -- python train.py
+rgpu run --host gpu-host -- python train.py
 ```
 
-The Python process and its CPU work remain on ws-5090-2. Calls that PyTorch
-makes to `libcuda.so.1` are intercepted, serialized, sent to ws-5090-1, and
+The Python process and its CPU work remain on client-host. Calls that PyTorch
+makes to `libcuda.so.1` are intercepted, serialized, sent to gpu-host, and
 executed against its physical RTX 5090. The application should need no source
-change. A second `rgpu exec` mode that runs the whole container on ws-5090-1
+change. A second `rgpu exec` mode that runs the whole container on gpu-host
 over SSH should be retained as a performance control and pragmatic fallback,
 but it is not the requested transparent GPU-over-IP mode.
 
@@ -79,7 +79,7 @@ architectural family proposed here.
 
 ## What was observed locally
 
-Read-only inspection of ws-5090-2 found:
+Read-only inspection of client-host found:
 
 | Item | Observation | Consequence |
 |---|---|---|
@@ -97,7 +97,7 @@ Read-only inspection of ws-5090-2 found:
 managed execution environment, even though the NVIDIA kernel modules and PCIe
 device are present. The
 same socket restriction prevented `ping` and SSH, so no claims are made about
-ws-5090-1, RTT, packet loss, or achieved throughput yet. Those are the first
+gpu-host, RTT, packet loss, or achieved throughput yet. Those are the first
 tests to run from an unrestricted shell.
 
 NVIDIA lists the RTX 5090 as PCIe Gen 5 with 32 GB GDDR7 and no NVLink. The
@@ -137,7 +137,7 @@ Sources:
 | GVirtuS | Open source but its public setup targets Ubuntu 18.04 and CUDA 10.2. | Attempt a bounded build/smoke screen. Run the common suite only if it reaches modern PyTorch without a substantial port. |
 | rCUDA | Strong historical research results and InfiniBand support, but not a straightforward current open-source base. | Record as non-runnable unless current source and a usable license can be obtained. |
 | Juice | Commercial GPU-over-IP with transparent CUDA support; public docs describe a narrower tested CUDA/PyTorch matrix. | Product comparator, not the repository foundation. |
-| Whole-process SSH/container execution | Near-native GPU behavior because CUDA remains local to ws-5090-1; requires code/data/environment staging and moves CPU work. | Keep as control and fallback, not primary mode. |
+| Whole-process SSH/container execution | Near-native GPU behavior because CUDA remains local to gpu-host; requires code/data/environment staging and moves CPU work. | Keep as control and fallback, not primary mode. |
 | PyTorch RPC or application service | Can perform well but requires application changes and is not a virtual CUDA device. | Out of scope for transparent mode. |
 | New remoting stack from scratch | Maximum control, but the API/ABI and semantic surface is large and changes with CUDA. | Decide only after the bake-off identifies shared gaps in the viable OSS candidates. |
 
@@ -152,7 +152,7 @@ Primary implementation sources:
 
 ### External-source and publication policy
 
-This is a private repository. Public dependencies and benchmark repositories
+This is a public repository. Public dependencies and benchmark repositories
 must be cloned locally; they must never be forked on GitHub or pushed to their
 public upstreams.
 
@@ -206,7 +206,7 @@ Sources:
 ## Bake-off architecture
 
 ```text
-ws-5090-2                                      ws-5090-1
+client-host                                      gpu-host
 ┌────────────────────────────┐                 ┌───────────────────────────┐
 │ rgpu CLI                   │  lease/status   │ lease guard               │
 │ pinned PyTorch container   │ ──────────────► │ candidate backend server  │
@@ -220,9 +220,9 @@ ws-5090-2                                      ws-5090-1
 For each candidate, use its intended driver/runtime interposition mechanism,
 not a Python monkey patch. PyTorch and native extensions should continue to
 discover CUDA through the normal dynamic-library ABI.
-Use the direct `10.77.77.x` interface and host networking to avoid bridge/NAT
+Use the direct `192.0.2.x` interface and host networking to avoid bridge/NAT
 overhead. Bind the server only to the point-to-point address and firewall it to
-ws-5090-2.
+client-host.
 
 Plain TCP is acceptable only because this is a trusted private cable. TLS
 termination adds operational complexity and some overhead without protecting
@@ -256,10 +256,10 @@ one compatibility profile.
 The CLI should support:
 
 ```text
-rgpu status ws-5090-1
-rgpu run --host ws-5090-1 -- python train.py
+rgpu status gpu-host
+rgpu run --host gpu-host -- python train.py
 rgpu run --local -- python train.py
-rgpu exec --host ws-5090-1 -- python train.py
+rgpu exec --host gpu-host -- python train.py
 rgpu doctor
 rgpu bench --suite smoke
 ```
@@ -267,7 +267,7 @@ rgpu bench --suite smoke
 `rgpu run` mounts the working tree read-only by default, uses an explicit
 writable output directory, forwards exit status and signals, labels all logs
 with a session ID, and prints the actual remote GPU UUID. It must detect that
-the shim loaded; accidental use of ws-5090-2's local `libcuda` is a test
+the shim loaded; accidental use of client-host's local `libcuda` is a test
 failure.
 
 ### Implemented repository shape
@@ -354,15 +354,15 @@ slowdown       = T_remote / T_native
 efficiency     = throughput_remote / throughput_native
 ```
 
-The primary native comparator is the same workload run directly on ws-5090-1,
-because it isolates remoting overhead. Run ws-5090-2 local as a second native
+The primary native comparator is the same workload run directly on gpu-host,
+because it isolates remoting overhead. Run client-host local as a second native
 comparator to answer the user's practical question and expose host variance.
 
 ## Iterative implementation plan
 
 ### Phase 0 — baseline, provenance, and common harness
 
-- From an unrestricted shell, inventory ws-5090-1 and confirm its GPU, driver,
+- From an unrestricted shell, inventory gpu-host and confirm its GPU, driver,
   OS, Docker, CPU, RAM, NIC, MTU, and active users.
 - Resolve `nvidia-smi` and a minimal CUDA container on both hosts before adding
   remoting.
@@ -376,7 +376,7 @@ comparator to answer the user's practical question and expose host variance.
   recorded result.
 - Clone and pin modded-nanogpt locally. Prepare its dataset once on shared/local
   storage outside timed runs and preserve dataset checksums.
-- Establish native baselines on ws-5090-1 and ws-5090-2 with identical
+- Establish native baselines on gpu-host and client-host with identical
   containers, commits, data, environment, and single-GPU configuration.
 
 Exit gate: reproducible native PyTorch and nanoGPT runs work on both hosts; the
@@ -410,14 +410,14 @@ least one short nanoGPT training segment with correct loss movement and cleanup.
 
 Run each viable candidate in four configurations:
 
-1. Native on ws-5090-1.
-2. Remote CUDA calls from ws-5090-2 to ws-5090-1.
-3. Whole-process SSH/container execution on ws-5090-1.
-4. Native on ws-5090-2.
+1. Native on gpu-host.
+2. Remote CUDA calls from client-host to gpu-host.
+3. Whole-process SSH/container execution on gpu-host.
+4. Native on client-host.
 
 Use two complementary comparisons:
 
-- **Fixed work:** calibrate a step count whose native ws-5090-1 steady-state
+- **Fixed work:** calibrate a step count whose native gpu-host steady-state
   training takes about 2 min, then run exactly those steps everywhere. Compare
   elapsed time, tokens/s, final loss, and loss trajectory.
 - **Fixed time:** after compilation and warm-up, train for exactly 3 min in
@@ -492,7 +492,7 @@ Collect machine-readable JSON plus raw command output for:
 
 - Host, kernel, CPU, memory, PCI topology, driver packages, and Docker runtime.
 - `ethtool` link/driver/offloads/ring sizes and MTU at both ends.
-- Route selection and neighbor state for `10.77.77.1`.
+- Route selection and neighbor state for `192.0.2.10`.
 - 1,000 ping samples after warm-up; report min, median, p95, p99, maximum, loss.
 - `iperf3` one-way A→B, B→A, and bidirectional trials, 1 and 4 streams, 30 s
   each; report throughput, retransmits, CPU, and variance.
@@ -512,7 +512,7 @@ Initial targets, to revise from observed hardware stability:
 - Vector add and matrix multiply with CPU-reference comparison.
 - Intentional invalid device, invalid pointer, and out-of-memory cases.
 - SIGINT during compute and client process death.
-- Assert the server GPU UUID is ws-5090-1's and ws-5090-2 utilization/VRAM do
+- Assert the server GPU UUID is gpu-host's and client-host utilization/VRAM do
   not increase beyond monitoring noise.
 
 ### Gate 2: required PyTorch compatibility matrix
@@ -556,10 +556,10 @@ Measure:
 
 Run four configurations in randomized order:
 
-1. Native on ws-5090-1.
-2. Remote CUDA API from ws-5090-2 to ws-5090-1.
-3. Whole-process remote execution on ws-5090-1.
-4. Native on ws-5090-2.
+1. Native on gpu-host.
+2. Remote CUDA API from client-host to gpu-host.
+3. Whole-process remote execution on gpu-host.
+4. Native on client-host.
 
 ### Gate 4: modded-nanoGPT comparison
 
@@ -575,13 +575,13 @@ For each of the four configurations and every viable backend, report:
   versions, seed, effective global batch, sequence length, and token order.
 - Cold initialization and compile time.
 - Initial model/optimizer transfer bytes and time.
-- Fixed-work elapsed time and slowdown relative to native ws-5090-1.
+- Fixed-work elapsed time and slowdown relative to native gpu-host.
 - Fixed-time completed optimizer steps, tokens, tokens/s, loss start/end, and
   sampled loss trajectory.
 - Evaluation/checkpoint time, RPC calls and bytes where exposed, client/server
   CPU, NIC throughput, GPU utilization, clocks, power, temperature, and peak
   VRAM.
-- Cleanup status and whether ws-5090-2's local GPU remained idle during remote
+- Cleanup status and whether client-host's local GPU remained idle during remote
   execution.
 
 No backend-specific optimization is allowed during the first comparison beyond
@@ -635,7 +635,7 @@ and reliability before optimization begins.
 During the bake-off, for each failed gate:
 
 1. Reproduce with the smallest CUDA or PyTorch case.
-2. Compare native ws-5090-1, remote mode, and whole-process control.
+2. Compare native gpu-host, remote mode, and whole-process control.
 3. Capture RPC count/bytes/blocking time and host/network/GPU counters.
 4. Classify the bottleneck or semantic mismatch.
 5. Minimize and document the failure before changing upstream source.
@@ -696,7 +696,7 @@ Before running the GPU bake-off, agree on:
    projects cannot enter a reproducible OSS bake-off.
 3. The initial curated PyTorch/TorchBench selectors after their collection is
    enumerated on the pinned software profile.
-4. Short windows when ws-5090-1 and then both GPUs may be used exclusively for
+4. Short windows when gpu-host and then both GPUs may be used exclusively for
    repeated native-vs-remote trials.
 
 Then execute the bake-off gate by gate. Select or modify an implementation only

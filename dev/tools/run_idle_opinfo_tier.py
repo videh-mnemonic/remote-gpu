@@ -120,7 +120,7 @@ def artifact_name(args: argparse.Namespace, side: str, round_number: int) -> str
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="mnemonic-1@10.77.77.1")
+    parser.add_argument("--host", default="user@192.0.2.10")
     parser.add_argument("--port", type=int, default=14837)
     parser.add_argument("--dtype-index", type=int, default=3)
     parser.add_argument("--sample-index", type=int, default=0)

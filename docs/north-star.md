@@ -26,15 +26,15 @@
 
 ## Product contract
 
-An unmodified PyTorch application started on `ws-5090-2` can use:
+An unmodified PyTorch application started on `client-host` can use:
 
 1. its local RTX 5090 only;
-2. the RTX 5090 on `ws-5090-1` only;
+2. the RTX 5090 on `gpu-host` only;
 3. one local and one remote RTX 5090 in the same job; and
 4. eventually, any mixture of leased local and remote GPUs.
 
 The application keeps its Python process, CPU preprocessing, filesystem view,
-and control flow on `ws-5090-2`. Selecting a remote GPU must require launcher
+and control flow on `client-host`. Selecting a remote GPU must require launcher
 configuration, not source edits. Unsupported behavior must fail explicitly;
 the launcher must never silently fall back to the local GPU.
 
@@ -59,8 +59,8 @@ generally usable are:
 ### M2 — one job, one local worker plus one remote worker
 
 The first mixed-GPU target is standard `torchrun`/DDP with two client workers on
-`ws-5090-2`. Rank 0 uses the local GPU. Rank 1 loads the remoting shim and owns
-one GPU context on `ws-5090-1`. Existing PyTorch DDP/FSDP code remains
+`client-host`. Rank 0 uses the local GPU. Rank 1 loads the remoting shim and owns
+one GPU context on `gpu-host`. Existing PyTorch DDP/FSDP code remains
 unchanged.
 
 This milestone requires remoting NCCL initialization and collectives, routing
@@ -118,7 +118,7 @@ Performance is classified by unavoidable data movement rather than summarized
 by one misleading number.
 
 - Compute-resident training: target median steady-state slowdown at or below
-  1.20× and p95 at or below 1.30× relative to the same GPU on `ws-5090-1`.
+  1.20× and p95 at or below 1.30× relative to the same GPU on `gpu-host`.
 - Launch/RPC-sensitive workloads: initially accept at most 1.50×, then use
   traces to remove repeated synchronous queries and safely batch asynchronous
   calls.

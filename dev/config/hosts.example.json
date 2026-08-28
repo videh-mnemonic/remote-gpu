@@ -1,12 +1,12 @@
 {
   "local": {
-    "name": "ws-5090-2",
+    "name": "client-host",
     "direct_interface": "eno2"
   },
   "remote": {
-    "name": "ws-5090-1",
-    "address": "10.77.77.1",
-    "ssh_user": "mnemonic-1",
+    "name": "gpu-host",
+    "address": "192.0.2.10",
+    "ssh_user": "user",
     "direct_interface": "eno2"
   },
   "network": {

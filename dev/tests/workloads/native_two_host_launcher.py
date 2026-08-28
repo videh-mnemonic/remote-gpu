@@ -61,7 +61,7 @@ def main() -> int:
     parser.add_argument(
         "--image", default="remote-gpu-pytorch-native:2.12.0-cu130"
     )
-    parser.add_argument("--master-addr", default="10.77.77.2")
+    parser.add_argument("--master-addr", default="192.0.2.20")
     parser.add_argument("--master-port", type=int, default=29681)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("workload", type=Path)

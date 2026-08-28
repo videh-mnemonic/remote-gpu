@@ -15,6 +15,8 @@ from remote_gpu.cli import (
     command_gc,
     deploy_image,
     expand_hosts,
+    expand_remote_hosts,
+    host_points_to_local,
     invoking_user_prefix,
     local_server_interface,
     native_python_rank_command,
@@ -31,19 +33,20 @@ from remote_gpu.cli import (
 
 def test_native_python_rank_uses_physical_gpu_and_distributed_identity():
     command = native_python_rank_command(
-        "torch:test", 2, 4, "10.0.0.1", 29681, ["TOKEN=abc"], ["--steps", "3"]
+        "torch:test", 2, 4, "192.0.2.1", 29681, "eth0", ["TOKEN=abc"], ["--steps", "3"]
     )
     assert command[command.index("--gpus") + 1] == "all"
     assert "RANK=2" in command
     assert "WORLD_SIZE=4" in command
-    assert "MASTER_ADDR=10.0.0.1" in command
+    assert "MASTER_ADDR=192.0.2.1" in command
+    assert "NCCL_SOCKET_IFNAME=eth0" in command
     assert command[-5:] == ["torch:test", "python3", "-", "--steps", "3"]
 
 
 def test_parse_host_with_ssh_user_and_port():
-    host = parse_host("mnemonic-1@10.77.77.1:14834")
-    assert host == Host("mnemonic-1@10.77.77.1", "10.77.77.1", 14834)
-    assert host.endpoint == "10.77.77.1:14834"
+    host = parse_host("user@192.0.2.10:14834")
+    assert host == Host("user@192.0.2.10", "192.0.2.10", 14834)
+    assert host.endpoint == "192.0.2.10:14834"
 
 
 def test_expand_hosts_supports_repeat_and_comma():
@@ -58,6 +61,14 @@ def test_expand_hosts_supports_repeat_and_comma():
 def test_expand_hosts_rejects_duplicate_endpoint():
     with pytest.raises(RgpuError, match="duplicate"):
         expand_hosts(["a@10.0.0.1", "b@10.0.0.1"])
+
+
+def test_expand_remote_hosts_rejects_local_machine(monkeypatch):
+    monkeypatch.setattr("remote_gpu.cli.local_hostnames", lambda: {"client-host"})
+    monkeypatch.setattr("remote_gpu.cli.local_ip_addresses", lambda: {"192.0.2.20"})
+    assert host_points_to_local(Host("user@client-host", "client-host"))
+    with pytest.raises(RgpuError, match="this machine"):
+        expand_remote_hosts(["user@192.0.2.20"])
 
 
 def test_authenticated_transport_endpoint_preserves_ssh_lease_identity():
@@ -82,7 +93,7 @@ def test_authenticated_transport_endpoint_preserves_ssh_lease_identity():
         "http://gpu.example",
         "https://user@gpu.example",
         "https://gpu.example/rpc",
-        "https://gpu.example?token=secret",
+        "https://gpu.example?debug=true",
         "https://gpu.example#fragment",
         "https://gpu.example:0",
     ],
@@ -106,18 +117,18 @@ def test_server_name_is_a_stable_per_port_lease():
 
 def test_remote_client_interface_uses_ssh_route(monkeypatch):
     result = subprocess.CompletedProcess(
-        [], 0, "10.77.77.2 dev eno2 src 10.77.77.1 uid 1000\n", ""
+        [], 0, "192.0.2.20 dev eth0 src 192.0.2.10 uid 1000\n", ""
     )
     monkeypatch.setattr("remote_gpu.cli.ssh", lambda *_args, **_kwargs: result)
-    assert remote_client_interface(Host("u@remote", "10.77.77.1")) == "eno2"
+    assert remote_client_interface(Host("u@remote", "192.0.2.20")) == "eth0"
 
 
 def test_local_server_interface_uses_ip_route(monkeypatch):
     result = subprocess.CompletedProcess(
-        [], 0, "10.77.77.1 dev eno2 src 10.77.77.2 uid 1000\n", ""
+        [], 0, "192.0.2.10 dev eth0 src 192.0.2.20 uid 1000\n", ""
     )
     monkeypatch.setattr("remote_gpu.cli.run_checked", lambda *_args, **_kwargs: result)
-    assert local_server_interface(Host("u@remote", "10.77.77.1")) == "eno2"
+    assert local_server_interface(Host("u@remote", "192.0.2.10")) == "eth0"
 
 
 def test_server_lease_survives_remote_reboot(monkeypatch):
@@ -399,12 +410,12 @@ def test_deploy_timeout_kills_both_pipeline_children(monkeypatch):
 
 def test_root_network_operations_drop_to_invoking_user(monkeypatch):
     monkeypatch.setattr("remote_gpu.cli.os.geteuid", lambda: 0)
-    monkeypatch.setenv("SUDO_USER", "mnemonic-2")
+    monkeypatch.setenv("SUDO_USER", "developer")
     monkeypatch.setattr(
         "remote_gpu.cli.pwd.getpwnam",
         lambda _name: type("Account", (), {"pw_uid": 1000})(),
     )
-    assert invoking_user_prefix() == ["sudo", "-u", "mnemonic-2", "-H", "--"]
+    assert invoking_user_prefix() == ["sudo", "-u", "developer", "-H", "--"]
 
 
 def test_unprivileged_network_operations_keep_current_identity(monkeypatch):

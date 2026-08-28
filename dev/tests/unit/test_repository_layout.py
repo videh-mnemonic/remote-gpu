@@ -27,7 +27,7 @@ def test_build_uses_canonical_lupine_without_patch_replay() -> None:
     assert "external/lupine-v1" not in build
 
     installer = (ROOT / "rgpu-client/install.sh").read_text(encoding="utf-8")
-    assert 'pipx install --force "$install_source"' in installer
+    assert 'app_venv="$project_root/.venv/remote-gpu-client"' in installer
     assert 'bash "$project_root/dev/tools/build_images.sh"' in installer
 
 
